@@ -145,4 +145,13 @@ tests/fixtures/            验收样本，M1 的分析器以它们为准
 
 ## 与项目文档的对应
 
-设计依据见仓库外层的 `React代码智能分析平台-项目文档-动态方案补充版.md`。当前处于 **P0（契约与骨架）** 完成、**M1（真实静态分析）** 进行中的状态。M1 已完成：module resolver、组件发现、renders 边、props 展开、hooks / state、API 链路、事件分析、二次封装映射（`ProTable → antd.Table`）、可见文案提取（`attrs.uiText`，需求检索的召回入口）。待完成：路由 / 页面节点（`NodeKind.route` 已预留但无分析器产出）、需求映射层（`AnalysisStart.requirement` 已预留但编排层未消费）。
+设计依据见仓库外层的 `React代码智能分析平台-项目文档-动态方案补充版.md`。当前处于 **M1（真实静态分析）完成** 的状态，代码已推送至 `github.com/MyVing/MyUiCodeAnalysis`。
+
+**M1 已完成**：module resolver、组件发现、renders 边、props 展开、hooks / state、API 链路、事件分析、二次封装映射（`ProTable → antd.Table`）、可见文案提取（`attrs.uiText`）；编排层（`AnalysisService` + `SubprocessWorkerRunner`，queued→running→succeeded/failed，错误码 `worker_timeout` / `worker_spawn_failed` / `worker_protocol_error` / `invalid_ir` 全部可见）；前端工作台（触发分析 + 轮询 + 图谱浏览 + 高级选项）。后端 36 个测试、前端 44 个测试、ruff/mypy 全绿，真实 worker E2E 已验证。
+
+**待完成**：
+- 路由 / 页面节点（`NodeKind.route` 已预留但无分析器产出）
+- 需求映射层（`AnalysisStart.requirement` 已预留但编排层未消费）
+- **持久化**：用户已确认放弃内存存储，采用 MySQL（拒绝 SQLite）；tasks/graphs 落库、重启恢复（boot 时 running→failed）；M3 LangGraph checkpointer 复用同一数据库
+- **M2 运行时采集**：新建 `workers/runtime-worker`（Node + Playwright），被动采集起步——启动 vite dev server、加载页面、经 React DevTools 协议抓组件树、记录网络请求（URL/方法/状态码），不自动点击遍历；运行时证据以 `evidence.source=runtime` 并入 IR
+- **M3 AI 语义层**：需求→组件映射、影响面解释、回归建议；LangGraph 编排，checkpointer 使用同一 MySQL/数据库；LLM provider 进 Settings
