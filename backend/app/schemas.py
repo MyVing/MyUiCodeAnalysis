@@ -15,7 +15,7 @@ class HealthStatus(ApiModel):
     status: Literal["ok"] = "ok"
     name: str
     version: str
-    storage: Literal["memory"] = "memory"
+    storage: Literal["memory", "mysql"]
     server_time: datetime
 
 
@@ -39,7 +39,7 @@ class Project(ApiModel):
     root_path: str
     framework: Literal["react", "next"]
     created_at: datetime
-    storage: Literal["memory"] = "memory"
+    storage: Literal["memory", "mysql"] = "memory"
 
 
 class PluginDependency(ApiModel):

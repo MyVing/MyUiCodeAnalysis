@@ -15,5 +15,6 @@ def health(settings: SettingsDep) -> HealthStatus:
     return HealthStatus(
         name=settings.name,
         version=settings.version,
+        storage=settings.storage_backend,
         server_time=datetime.now(UTC),
     )

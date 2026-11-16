@@ -2,6 +2,7 @@
 
 from functools import lru_cache
 from pathlib import Path
+from typing import Literal
 
 from pydantic import Field
 from pydantic_settings import BaseSettings, SettingsConfigDict
@@ -23,6 +24,17 @@ class Settings(BaseSettings):
     worker_entry_path: Path | None = None
     worker_timeout_seconds: float = 120.0
 
+    # 持久化。db_url 缺省（None）→ 内存存储，重启即清空；
+    # 配置后走 MySQL，例如：
+    #   APP_DB_URL=mysql+aiomysql://user:password@127.0.0.1:3306/uicodeanalysis?charset=utf8mb4
+    # 驱动用 aiomysql（纯 Python）而非 asyncmy：Windows 上无编译依赖。
+    db_url: str | None = None
+    db_pool_size: int = 5
+    db_max_overflow: int = 5
+    # MySQL 8 空闲 8 小时会断连；recycle + pre_ping 双保险防 "server has gone away"
+    db_pool_recycle_seconds: int = 1800
+    db_echo: bool = False
+
     # 需求定位的模型接入。
     # 默认关闭：关闭时接口仍可用，但只能 dry-run（只跑确定性召回，不调模型），
     # 这样召回质量可以独立验证，也不会因为没配 key 就整个功能不可用。
@@ -39,6 +51,10 @@ class Settings(BaseSettings):
     @property
     def llm_ready(self) -> bool:
         return self.llm_enabled and bool(self.llm_api_key)
+
+    @property
+    def storage_backend(self) -> Literal["memory", "mysql"]:
+        return "mysql" if self.db_url else "memory"
 
 
 def resolve_worker_entry(settings: Settings) -> Path:

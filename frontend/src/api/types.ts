@@ -1,10 +1,12 @@
 export type Framework = "react" | "next";
 
+export type StorageBackend = "memory" | "mysql";
+
 export interface HealthStatus {
   status: "ok";
   name: string;
   version: string;
-  storage: "memory";
+  storage: StorageBackend;
   serverTime: string;
 }
 
@@ -14,7 +16,7 @@ export interface Project {
   rootPath: string;
   framework: Framework;
   createdAt: string;
-  storage: "memory";
+  storage: StorageBackend;
 }
 
 export interface ProjectCreate {
