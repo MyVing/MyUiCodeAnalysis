@@ -1,0 +1,10 @@
+{
+  "name": "next-app-router-fixture",
+  "version": "1.0.0",
+  "private": true,
+  "description": "Next.js App Router 验收样本：只验证路由节点的文件约定推导，不涉及运行时",
+  "dependencies": {
+    "next": "^15.0.0",
+    "react": "^19.1.1"
+  }
+}

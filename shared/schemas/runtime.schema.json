@@ -1,0 +1,233 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://uicodeanalysis.local/schemas/runtime.schema.json",
+  "title": "RuntimeTrace",
+  "description": "浏览器运行时采集结果（A 模式）。与静态 IR 分开保存，通过 traceId / analysisId 关联。大体积 DOM、截图与 Trace 只保存 artifact:// 引用，不进 JSON。",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["schemaVersion", "traceId", "projectId", "mode", "page"],
+  "properties": {
+    "schemaVersion": {
+      "type": "string",
+      "pattern": "^\\d+\\.\\d+$",
+      "description": "运行时契约版本，独立于 IR schema 版本演进"
+    },
+    "traceId": {
+      "type": "string",
+      "minLength": 1,
+      "description": "一次采集记录的唯一标识；Evidence.traceId 反查至此"
+    },
+    "projectId": { "type": "string", "minLength": 1 },
+    "analysisId": {
+      "type": "string",
+      "description": "关联的静态分析产物标识；一次分析可对应多次采集"
+    },
+    "mode": {
+      "type": "string",
+      "enum": ["passive"],
+      "description": "一期仅 passive（A 模式）；二期追加 ai-exploration"
+    },
+    "page": { "$ref": "#/$defs/PageInfo" },
+    "domSnapshotRef": {
+      "type": "string",
+      "pattern": "^artifact://",
+      "description": "DOM 快照的 Artifact 引用，形如 artifact://trace_001/dom.json"
+    },
+    "screenshotRef": {
+      "type": "string",
+      "pattern": "^artifact://",
+      "description": "页面截图的 Artifact 引用"
+    },
+    "traceRef": {
+      "type": "string",
+      "pattern": "^artifact://",
+      "description": "Playwright Trace 的 Artifact 引用"
+    },
+    "networkEvents": {
+      "type": "array",
+      "items": { "$ref": "#/$defs/NetworkEvent" }
+    },
+    "consoleEvents": {
+      "type": "array",
+      "items": { "$ref": "#/$defs/ConsoleEvent" }
+    },
+    "pageErrors": {
+      "type": "array",
+      "items": { "$ref": "#/$defs/PageError" }
+    },
+    "interactions": {
+      "type": "array",
+      "items": { "$ref": "#/$defs/Interaction" }
+    },
+    "correlations": {
+      "type": "array",
+      "items": { "$ref": "#/$defs/Correlation" },
+      "description": "DOM 元素与静态节点的关联结果；无法关联时保留为 unmatched，不强行挂接"
+    }
+  },
+  "$defs": {
+    "PageInfo": {
+      "title": "PageInfo",
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["url"],
+      "properties": {
+        "url": { "type": "string", "minLength": 1, "description": "页面 URL 或路由路径" },
+        "title": { "type": "string" },
+        "route": { "type": "string", "description": "匹配到的前端路由模板" },
+        "timestamp": { "type": "integer", "minimum": 0, "description": "采集时间，Unix 秒" },
+        "viewport": { "$ref": "#/$defs/Viewport" }
+      }
+    },
+    "Viewport": {
+      "title": "Viewport",
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["width", "height"],
+      "properties": {
+        "width": { "type": "integer", "minimum": 1 },
+        "height": { "type": "integer", "minimum": 1 }
+      }
+    },
+    "NetworkEvent": {
+      "title": "NetworkEvent",
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["eventId", "method", "url"],
+      "properties": {
+        "eventId": { "type": "string", "minLength": 1 },
+        "method": { "type": "string", "minLength": 1 },
+        "url": { "type": "string", "minLength": 1 },
+        "status": { "type": "integer", "minimum": 0 },
+        "resourceType": { "type": "string" },
+        "initiator": { "type": "string" },
+        "durationMs": { "type": "number", "minimum": 0 },
+        "contentType": { "type": "string" },
+        "timestamp": { "type": "integer", "minimum": 0 },
+        "requestBodyRef": {
+          "type": "string",
+          "pattern": "^artifact://",
+          "description": "默认不采集请求体；需按项目白名单开放后才存在引用"
+        },
+        "responseBodyRef": {
+          "type": "string",
+          "pattern": "^artifact://",
+          "description": "经过脱敏与大小限制后才允许引用；默认缺省"
+        }
+      }
+    },
+    "ConsoleEvent": {
+      "title": "ConsoleEvent",
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["level", "message"],
+      "properties": {
+        "level": {
+          "type": "string",
+          "enum": ["log", "info", "warn", "error", "debug"]
+        },
+        "message": { "type": "string" },
+        "location": { "type": "string" },
+        "timestamp": { "type": "integer", "minimum": 0 }
+      }
+    },
+    "PageError": {
+      "title": "PageError",
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["message"],
+      "properties": {
+        "message": { "type": "string", "minLength": 1 },
+        "name": { "type": "string" },
+        "stack": { "type": "string" },
+        "sourceFile": { "type": "string" },
+        "loc": { "$ref": "#/$defs/Loc" },
+        "timestamp": { "type": "integer", "minimum": 0 }
+      }
+    },
+    "Loc": {
+      "title": "Loc",
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["line", "col"],
+      "properties": {
+        "line": { "type": "integer", "minimum": 1 },
+        "col": { "type": "integer", "minimum": 1 }
+      }
+    },
+    "Interaction": {
+      "title": "Interaction",
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["action", "target"],
+      "properties": {
+        "action": {
+          "type": "string",
+          "enum": ["click", "input", "select", "navigate", "submit", "other"]
+        },
+        "target": {
+          "type": "string",
+          "description": "目标元素摘要，如 button:has-text('提交') 或 dom 引用"
+        },
+        "inputType": { "type": "string" },
+        "valueSummary": {
+          "type": "string",
+          "description": "输入值摘要；敏感字段必须脱敏"
+        },
+        "timestamp": { "type": "integer", "minimum": 0 },
+        "triggeredEvents": {
+          "type": "array",
+          "items": { "type": "string" },
+          "description": "本次交互引发的 network / navigation 事件 id"
+        }
+      }
+    },
+    "Correlation": {
+      "title": "Correlation",
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["id", "status"],
+      "properties": {
+        "id": { "type": "string", "minLength": 1 },
+        "status": {
+          "type": "string",
+          "enum": ["matched", "candidate", "unmatched"],
+          "description": "matched：证据充分；candidate：多个可能来源待确认；unmatched：当前无法建立关联"
+        },
+        "domRef": {
+          "type": "string",
+          "description": "DOM 元素引用，指向 dom_snapshot 中的元素 id"
+        },
+        "staticNodeId": {
+          "type": "string",
+          "description": "IR 节点 id；unmatched 时缺省"
+        },
+        "apiNodeId": {
+          "type": "string",
+          "description": "网络请求关联到静态 API 节点时使用"
+        },
+        "networkEventId": {
+          "type": "string",
+          "description": "网络请求关联时指向 NetworkEvent.eventId"
+        },
+        "confidence": {
+          "type": "number",
+          "minimum": 0,
+          "maximum": 1,
+          "description": "关联置信度；不得因名称相同就直接取 1.0"
+        },
+        "method": {
+          "type": "string",
+          "enum": ["data-analysis-id", "source-map", "structural", "fiber"],
+          "description": "关联依据，按可靠性从高到低"
+        },
+        "reviewStatus": {
+          "type": "string",
+          "enum": ["pending", "confirmed", "rejected"],
+          "default": "pending",
+          "description": "人工确认结果；与系统判定的 status 分离，确认后可跨分析复用"
+        }
+      }
+    }
+  }
+}

@@ -1,0 +1,33 @@
+{
+  "name": "@uicodeanalysis/ast-worker",
+  "version": "0.1.0",
+  "private": true,
+  "description": "静态分析 Worker：TypeScript Compiler + ts-morph，AST → IR",
+  "type": "module",
+  "bin": {
+    "ast-worker": "dist/index.js"
+  },
+  "exports": {
+    ".": {
+      "types": "./dist/index.d.ts",
+      "default": "./dist/index.js"
+    }
+  },
+  "scripts": {
+    "build": "tsc -p tsconfig.json",
+    "start": "node dist/index.js",
+    "typecheck": "tsc --noEmit && tsc -p tsconfig.test.json",
+    "test": "vitest run"
+  },
+  "dependencies": {
+    "@uicodeanalysis/contracts": "*",
+    "ts-morph": "^28.0.0",
+    "typescript": "~5.9.2"
+  },
+  "devDependencies": {
+    "@types/node": "^22.20.4",
+    "ajv": "^8.17.1",
+    "ajv-formats": "^3.0.1",
+    "vitest": "^3.2.4"
+  }
+}

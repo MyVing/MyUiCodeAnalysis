@@ -1,0 +1,54 @@
+{
+  "version": 1,
+  "note": "需求召回的同义词表：概念名 → 该概念的表面形式。中文按子串扫描，英文（或其它 ASCII）按分词后整词匹配。这里只放语言层面的同义词，不含任何具体项目的业务名——加词是为了让通用词（筛选/列表/详情）能对上英文标识符（showFilter/List/Detail），不是为了迁就某个仓库。",
+  "concepts": {
+    "user": ["用户", "会员", "账号", "user", "users", "member", "account"],
+    "list": ["列表", "清单", "表格", "list", "lists", "table", "grid"],
+    "detail": ["详情", "明细", "详细", "detail", "details", "profile"],
+    "filter": ["筛选", "过滤", "过滤器", "filter", "filters", "filtering", "filterable"],
+    "search": ["搜索", "查找", "查询", "检索", "search", "query", "find"],
+    "create": ["新增", "新建", "创建", "添加", "增加", "create", "add", "new"],
+    "edit": ["编辑", "修改", "更新", "edit", "update", "modify"],
+    "delete": ["删除", "移除", "清除", "delete", "remove", "destroy"],
+    "status": ["状态", "审核状态", "审批状态", "status", "state"],
+    "submit": ["提交", "保存", "submit", "save"],
+    "approve": ["审核", "审批", "通过", "驳回", "approve", "review", "audit", "reject"],
+    "export": ["导出", "下载", "export", "download"],
+    "import": ["导入", "上传", "import", "upload"],
+    "pagination": ["分页", "页码", "翻页", "pagination", "pager", "page"],
+    "sort": ["排序", "升序", "降序", "sort", "order", "sorter"],
+    "loading": ["加载中", "加载", "loading", "spinner"],
+    "select": ["选中", "选择", "勾选", "select", "selection", "checked"],
+    "dialog": ["弹窗", "对话框", "抽屉", "dialog", "modal", "drawer"],
+    "form": ["表单", "form"],
+    "title": ["标题", "title"],
+    "name": ["姓名", "名称", "名字", "name"],
+    "email": ["邮箱", "邮件", "email", "mail"],
+    "phone": ["手机", "电话", "手机号", "phone", "mobile", "tel"],
+    "password": ["密码", "password"],
+    "id": ["编号", "标识", "id", "code"],
+    "date": ["日期", "时间", "date", "time", "datetime"],
+    "amount": ["金额", "价格", "总价", "amount", "price", "total"],
+    "order": ["订单", "order", "orders"],
+    "count": ["数量", "条数", "count"],
+    "role": ["角色", "权限", "role", "permission", "auth"],
+    "organization": ["组织", "部门", "机构", "org", "organization", "department"],
+    "employee": ["员工", "人员", "employee", "staff"],
+    "product": ["商品", "产品", "product", "goods"],
+    "description": ["描述", "备注", "说明", "description", "remark", "note"]
+  },
+  "stopwords": {
+    "en": [
+      "the", "and", "for", "with", "that", "this", "these", "those", "from", "into",
+      "when", "then", "should", "must", "can", "will", "would", "could", "all", "any",
+      "not", "but", "are", "was", "were", "has", "have", "had", "our", "their", "its",
+      "you", "your", "they", "them", "there", "here", "also", "such", "per", "each"
+    ],
+    "zh": [
+      "一个", "一些", "一种", "这个", "那个", "这些", "那些", "我们", "你们", "他们",
+      "以及", "并且", "或者", "但是", "因为", "所以", "如果", "然后", "同时", "需要",
+      "可以", "进行", "相关", "对应", "所有", "能够", "通过", "方式", "时候", "之后",
+      "之前", "目前", "现在", "已经", "还有", "另外", "部分", "情况", "问题", "内容"
+    ]
+  }
+}

@@ -1,0 +1,17 @@
+{
+  "name": "@uicodeanalysis/contracts",
+  "version": "0.1.0",
+  "private": true,
+  "description": "跨语言契约的 TypeScript 侧生成产物，由 shared/schemas 生成，禁止手写",
+  "type": "module",
+  "types": "./src/index.ts",
+  "exports": {
+    ".": {
+      "types": "./src/index.ts",
+      "default": "./src/index.ts"
+    }
+  },
+  "files": [
+    "src"
+  ]
+}

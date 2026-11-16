@@ -1,0 +1,16 @@
+{
+  "extends": "./tsconfig.json",
+  "compilerOptions": {
+    "noEmit": true,
+    "rootDir": ".",
+    "types": ["node", "vitest/globals"],
+    // 测试只由 vitest 运行（vite/esbuild 转译），模块解析是 bundler 语义。
+    // 若沿用 tsconfig.json 的 NodeNext，ajv / ajv-formats 这类 CJS 包的
+    // `export default` 会被按原生 Node 语义建模成整个 module.exports，
+    // 于是 `new Ajv2020()`、`addFormats(ajv)` 在 tsc 里报 not constructable /
+    // not callable——而 vitest 里跑得没问题。让类型检查对齐运行时解析方式。
+    "module": "ESNext",
+    "moduleResolution": "Bundler"
+  },
+  "include": ["src", "tests", "vitest.config.ts"]
+}

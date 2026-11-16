@@ -1,0 +1,329 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://uicodeanalysis.local/schemas/requirement.schema.json",
+  "title": "RequirementMap",
+  "description": "需求映射结果：把一段需求文本对应到 IR 中已有的页面节点。刻意不进 IRGraph —— IRGraph 是语法事实层（confidence 恒为 1.0），本契约是 AI 推断层（confidence 封顶 0.6），两者物理隔离，避免把推断混进事实。",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "schemaVersion",
+    "requirementId",
+    "projectId",
+    "requirement",
+    "createdAt",
+    "dryRun",
+    "features",
+    "matches"
+  ],
+  "properties": {
+    "schemaVersion": {
+      "type": "string",
+      "pattern": "^\\d+\\.\\d+$",
+      "description": "本文件格式版本，与 IR schema 版本解耦"
+    },
+    "requirementId": {
+      "type": "string",
+      "minLength": 1,
+      "description": "一次需求定位产物的唯一标识"
+    },
+    "projectId": {
+      "type": "string",
+      "minLength": 1
+    },
+    "analysisId": {
+      "type": "string",
+      "description": "本次定位所基于的图产物标识。与项目最新图不一致时说明结果已过期，前端应提示重新定位"
+    },
+    "requirement": {
+      "type": "string",
+      "minLength": 1,
+      "description": "原始需求文本，原样回显，便于复核结论针对的是哪段输入"
+    },
+    "createdAt": { "type": "string", "format": "date-time" },
+    "dryRun": {
+      "type": "boolean",
+      "description": "为 true 时只跑确定性召回，未调用模型；matches 必为空，结论看 candidates"
+    },
+    "features": {
+      "type": "array",
+      "description": "需求拆解出的功能点。模型只被允许产出文本与关键词，不得出现 nodeId / 文件名",
+      "items": { "$ref": "#/$defs/Feature" }
+    },
+    "matches": {
+      "type": "array",
+      "description": "通过全部服务端校验的匹配；未通过校验的模型输出进 dropped，不在此处",
+      "items": { "$ref": "#/$defs/Match" }
+    },
+    "unmatched": {
+      "type": "array",
+      "description": "未能定位的功能点。附召回前三的候选，让人能判断是需求超纲还是召回不足",
+      "items": { "$ref": "#/$defs/Unmatched" }
+    },
+    "candidates": {
+      "type": "array",
+      "description": "确定性召回的完整候选集（dry-run 的全部产出）。每个候选带命中信号，可解释",
+      "items": { "$ref": "#/$defs/Candidate" }
+    },
+    "dropped": {
+      "type": "array",
+      "description": "被服务端校验拒绝的模型输出。必须展示而非静默丢弃 —— 审核模型是否在幻想，只能靠这份记录",
+      "items": { "$ref": "#/$defs/Dropped" }
+    },
+    "warnings": {
+      "type": "array",
+      "description": "降级与缺口：无 route 节点、quote 校验失败、模型不可用等",
+      "items": { "$ref": "#/$defs/RequirementWarning" }
+    }
+  },
+  "$defs": {
+    "Severity": {
+      "title": "Severity",
+      "type": "string",
+      "enum": ["error", "warning", "info"]
+    },
+    "RequirementWarning": {
+      "title": "RequirementWarning",
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["code", "severity", "message"],
+      "properties": {
+        "code": {
+          "type": "string",
+          "minLength": 1,
+          "description": "机器可读告警码，如 no_route_nodes / quote_not_found / llm_unavailable"
+        },
+        "severity": { "$ref": "#/$defs/Severity" },
+        "message": { "type": "string", "minLength": 1 },
+        "featureId": {
+          "type": "string",
+          "description": "关联的功能点；与具体功能点无关时缺省"
+        }
+      }
+    },
+    "Feature": {
+      "title": "Feature",
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["id", "text"],
+      "properties": {
+        "id": {
+          "type": "string",
+          "minLength": 1,
+          "description": "本次产物内的功能点标识，如 f1"
+        },
+        "text": { "type": "string", "minLength": 1 },
+        "keywords": {
+          "type": "array",
+          "description": "用于召回的检索词，中英文都可",
+          "items": { "type": "string" }
+        }
+      }
+    },
+    "SignalKind": {
+      "title": "SignalKind",
+      "type": "string",
+      "enum": ["routePath", "componentName", "uiText", "apiUrl", "propName", "propDescription"],
+      "description": "召回信号来源。前端按此分类展示「为什么这个页面被选为候选」"
+    },
+    "Signal": {
+      "title": "Signal",
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["kind", "value", "score"],
+      "properties": {
+        "kind": { "$ref": "#/$defs/SignalKind" },
+        "value": {
+          "type": "string",
+          "minLength": 1,
+          "description": "命中的原文，如 /users、搜索用户、showFilter"
+        },
+        "score": {
+          "type": "number",
+          "minimum": 0,
+          "description": "该信号的加权得分；同一候选的 signals 之和即其总分"
+        }
+      }
+    },
+    "Candidate": {
+      "title": "Candidate",
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["nodeId", "name", "score", "signals"],
+      "properties": {
+        "nodeId": {
+          "type": "string",
+          "minLength": 1,
+          "description": "页面组件节点 id，必须是 IR 中真实存在的节点"
+        },
+        "routeId": {
+          "type": "string",
+          "description": "该页面命中的 route 节点 id；无 route 时缺省"
+        },
+        "name": { "type": "string", "minLength": 1 },
+        "file": {
+          "type": "string",
+          "description": "页面组件定义所在文件（相对项目根目录）"
+        },
+        "score": { "type": "number", "minimum": 0 },
+        "signals": {
+          "type": "array",
+          "items": { "$ref": "#/$defs/Signal" }
+        }
+      }
+    },
+    "SubgraphCounts": {
+      "title": "SubgraphCounts",
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["component", "hook", "state", "api", "event", "fn", "route", "element"],
+      "description": "子图里各类节点的数量；全部显式给出，缺省即 0，避免前端区分「没有」与「没算」",
+      "properties": {
+        "component": { "type": "integer", "minimum": 0 },
+        "hook": { "type": "integer", "minimum": 0 },
+        "state": { "type": "integer", "minimum": 0 },
+        "api": { "type": "integer", "minimum": 0 },
+        "event": { "type": "integer", "minimum": 0 },
+        "fn": { "type": "integer", "minimum": 0 },
+        "route": { "type": "integer", "minimum": 0 },
+        "element": { "type": "integer", "minimum": 0 }
+      }
+    },
+    "Subgraph": {
+      "title": "Subgraph",
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["nodeIds", "edgeIds", "counts"],
+      "description": "命中页面的两跳子图，由后端按边遍历得到。前端聚焦时直接喂给布局，不重新推导",
+      "properties": {
+        "nodeIds": {
+          "type": "array",
+          "items": { "type": "string" }
+        },
+        "edgeIds": {
+          "type": "array",
+          "items": { "type": "string" }
+        },
+        "counts": { "$ref": "#/$defs/SubgraphCounts" }
+      }
+    },
+    "VerifiedEvidence": {
+      "title": "VerifiedEvidence",
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["nodeId", "quote"],
+      "description": "服务端复核通过的证据。loc 取自 IR 节点而非模型输出 —— 模型给的坐标不可信",
+      "properties": {
+        "nodeId": { "type": "string", "minLength": 1 },
+        "quote": { "type": "string", "minLength": 1 },
+        "file": { "type": "string" },
+        "loc": { "$ref": "#/$defs/Location" },
+        "via": {
+          "type": "string",
+          "description": "命中的字段来源，如 uiText / prop / apiUrl"
+        }
+      }
+    },
+    "Location": {
+      "title": "Location",
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["line", "col"],
+      "properties": {
+        "line": { "type": "integer", "minimum": 1 },
+        "col": { "type": "integer", "minimum": 1 }
+      }
+    },
+    "Match": {
+      "title": "Match",
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["featureId", "pageNodeId", "confidence", "source", "subgraph"],
+      "properties": {
+        "featureId": { "type": "string", "minLength": 1 },
+        "pageNodeId": {
+          "type": "string",
+          "minLength": 1,
+          "description": "必须落在本次候选集内，否则整条 match 被丢弃"
+        },
+        "routeId": { "type": "string" },
+        "confidence": {
+          "type": "number",
+          "minimum": 0,
+          "maximum": 0.6,
+          "description": "AI 推断的落库置信度，硬上限 0.6；模型自报的更高值不得透传"
+        },
+        "modelConfidence": {
+          "type": "number",
+          "minimum": 0,
+          "maximum": 1,
+          "description": "模型自报的原始置信度，仅供比对封顶是否生效，不参与 UI 排序"
+        },
+        "quote": {
+          "type": "string",
+          "description": "模型声称的依据；必须能在该节点里逐字找到，否则整条 match 被丢弃"
+        },
+        "reason": {
+          "type": "string",
+          "description": "模型给出的判断理由，原样保留供人工复核"
+        },
+        "subgraph": { "$ref": "#/$defs/Subgraph" },
+        "verifiedEvidence": {
+          "type": "array",
+          "items": { "$ref": "#/$defs/VerifiedEvidence" }
+        },
+        "source": {
+          "type": "string",
+          "enum": ["ai"],
+          "description": "本条结论的来源。当前只有 AI 判定会产出 match，确定性召回只产候选"
+        }
+      }
+    },
+    "Unmatched": {
+      "title": "Unmatched",
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["featureId", "reason"],
+      "properties": {
+        "featureId": { "type": "string", "minLength": 1 },
+        "reason": {
+          "type": "string",
+          "minLength": 1,
+          "description": "模型给出的未命中理由，或降级时的说明"
+        },
+        "candidates": {
+          "type": "array",
+          "description": "该功能点召回的前几名，供人判断是需求超纲还是召回不足",
+          "items": { "$ref": "#/$defs/Candidate" }
+        }
+      }
+    },
+    "Dropped": {
+      "title": "Dropped",
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["reason"],
+      "properties": {
+        "reason": {
+          "type": "string",
+          "minLength": 1,
+          "enum": [
+            "node_not_in_candidates",
+            "quote_not_found",
+            "unknown_feature",
+            "invalid_shape"
+          ],
+          "description": "被拒原因。node_not_in_candidates：模型选了候选集外的节点；quote_not_found：引文在该节点里找不到；unknown_feature：featureId 不是本次拆解出的功能点；invalid_shape：字段类型不符"
+        },
+        "featureId": { "type": "string" },
+        "nodeId": {
+          "type": "string",
+          "description": "模型给出的原始 nodeId，原样记录以便审计"
+        },
+        "quote": {
+          "type": "string",
+          "description": "模型给出的原始引文，原样记录以便审计"
+        }
+      }
+    }
+  }
+}

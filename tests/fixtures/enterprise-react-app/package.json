@@ -1,0 +1,10 @@
+{
+  "name": "enterprise-react-app-fixture",
+  "version": "1.0.0",
+  "private": true,
+  "description": "M1 静态分析验收样本：模拟企业 React 项目特征，覆盖 ReactGraph 实测的 4 条结构性缺陷与二次封装场景",
+  "dependencies": {
+    "antd": "^5.21.0",
+    "react": "^19.1.1"
+  }
+}

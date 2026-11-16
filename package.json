@@ -1,0 +1,24 @@
+{
+  "name": "uicodeanalysis",
+  "version": "0.1.0",
+  "private": true,
+  "description": "React 代码智能分析平台 monorepo",
+  "workspaces": [
+    "frontend",
+    "workers/*",
+    "plugins/*",
+    "shared/contracts"
+  ],
+  "scripts": {
+    "dev": "npm run dev -w frontend",
+    "build": "npm run build -w frontend",
+    "typecheck": "npm run typecheck -w frontend && npm run typecheck -w @uicodeanalysis/ast-worker",
+    "test": "npm run test -w frontend && npm run test -w @uicodeanalysis/ast-worker",
+    "lint": "npm run lint -w frontend",
+    "gen:contracts": "python shared/scripts/generate_contracts.py",
+    "check:contracts": "python shared/scripts/generate_contracts.py --check"
+  },
+  "engines": {
+    "node": ">=20"
+  }
+}

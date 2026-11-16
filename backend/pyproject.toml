@@ -1,0 +1,54 @@
+[project]
+name = "uicodeanalysis-backend"
+version = "0.1.0"
+description = "React 代码智能分析平台 API 编排层"
+requires-python = ">=3.12"
+dependencies = [
+  "fastapi>=0.115",
+  "uvicorn[standard]>=0.32",
+  "pydantic>=2.9",
+  "pydantic-settings>=2.6",
+  # 需求定位编排：节点图负责流程与重试，模型本身通过 ChatModel 协议可插拔
+  "langgraph>=0.2",
+  "langchain-core>=0.3",
+  # 直接 POST 调 OpenAI 兼容端点，不引 openai SDK
+  "httpx>=0.27",
+]
+
+[dependency-groups]
+dev = [
+  "pytest>=8.3",
+  "pytest-asyncio>=0.24",
+  "httpx>=0.27",
+  "ruff>=0.8",
+  "mypy>=1.13",
+  "jsonschema>=4.23",
+  "datamodel-code-generator>=0.26",
+]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+pythonpath = ["."]
+asyncio_mode = "auto"
+asyncio_default_fixture_loop_scope = "function"
+
+[tool.ruff]
+target-version = "py312"
+line-length = 100
+
+[tool.ruff.lint]
+select = ["E", "F", "I", "UP", "B", "SIM"]
+
+[tool.mypy]
+python_version = "3.12"
+mypy_path = ["."]
+plugins = ["pydantic.mypy"]
+warn_unused_configs = true
+disallow_untyped_defs = true
+check_untyped_defs = true
+no_implicit_optional = true
+warn_redundant_casts = true
+
+[[tool.mypy.overrides]]
+module = "app.contracts.*"
+ignore_errors = true

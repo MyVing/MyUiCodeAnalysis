@@ -1,0 +1,32 @@
+# Python
+__pycache__/
+*.py[cod]
+.venv/
+.pytest_cache/
+.ruff_cache/
+.mypy_cache/
+.coverage
+htmlcov/
+
+# Node
+node_modules/
+dist/
+coverage/
+*.tsbuildinfo
+
+# 本地配置与数据
+.env
+.data/
+
+# 分析产物（大体积 Artifact 不进版本库）
+artifacts/
+_graph_dump.json
+
+# 编辑器与系统
+.idea/
+.vscode/
+.DS_Store
+Thumbs.db
+
+# 注意：参考项目 reactgraph/ 与 ReactION/ 位于本仓库的父目录，不属于本仓库，
+# 天然不会被提交。若将来把它们移入本目录，务必在此添加忽略规则。

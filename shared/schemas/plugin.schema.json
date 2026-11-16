@@ -1,0 +1,80 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://uicodeanalysis.local/schemas/plugin.schema.json",
+  "title": "PluginManifest",
+  "description": "插件清单：跨语言插件的唯一声明契约。UI Framework 与 Analyzer 插件为 TypeScript，Runtime 插件为 Python。",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["pluginId", "name", "type", "version", "schemaVersion"],
+  "properties": {
+    "pluginId": {
+      "type": "string",
+      "pattern": "^[a-z0-9]+(\\.[a-z0-9-]+)+$",
+      "description": "形如 ui.antd / runtime.playwright；点分段，全小写"
+    },
+    "name": { "type": "string", "minLength": 1 },
+    "type": {
+      "type": "string",
+      "enum": ["ui-framework", "runtime", "analyzer"],
+      "description": "插件类别，决定宿主语言与执行方式"
+    },
+    "version": {
+      "type": "string",
+      "pattern": "^\\d+\\.\\d+\\.\\d+$",
+      "description": "插件自身语义化版本"
+    },
+    "entrypoint": {
+      "type": "string",
+      "minLength": 1,
+      "description": "相对插件目录的入口文件，如 adapter.ts / main.py"
+    },
+    "dependencies": {
+      "type": "array",
+      "items": { "$ref": "#/$defs/PluginDependency" },
+      "description": "插件间依赖；加载前做存在性与版本检查"
+    },
+    "capabilities": {
+      "type": "array",
+      "items": { "$ref": "#/$defs/Capability" },
+      "uniqueItems": true,
+      "description": "插件声明的能力；执行层据此判断某能力是否可用"
+    },
+    "schemaVersion": {
+      "type": "string",
+      "pattern": "^\\d+\\.\\d+$",
+      "description": "插件产物所遵循的 IR schema 版本，加载时校验"
+    }
+  },
+  "$defs": {
+    "PluginDependency": {
+      "title": "PluginDependency",
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["pluginId"],
+      "properties": {
+        "pluginId": { "type": "string", "minLength": 1 },
+        "versionRange": {
+          "type": "string",
+          "minLength": 1,
+          "description": "语义化版本范围，如 >=1.0.0"
+        }
+      }
+    },
+    "Capability": {
+      "title": "Capability",
+      "type": "string",
+      "enum": [
+        "component_detection",
+        "props_analysis",
+        "event_analysis",
+        "composition_analysis",
+        "dom_collect",
+        "network_collect",
+        "console_collect",
+        "snapshot_collect",
+        "rule_analysis"
+      ],
+      "description": "受控枚举；新增取值必须升级 schema 版本"
+    }
+  }
+}

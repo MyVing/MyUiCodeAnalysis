@@ -1,0 +1,201 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://uicodeanalysis.local/schemas/ir.schema.json",
+  "title": "IRGraph",
+  "description": "统一 IR：静态、运行时与 AI 三路信号共享的唯一跨层契约。",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["version", "nodes", "edges"],
+  "properties": {
+    "version": {
+      "type": "string",
+      "pattern": "^\\d+\\.\\d+$",
+      "description": "schema 版本，插件产物需按版本校验"
+    },
+    "analysisId": {
+      "type": "string",
+      "minLength": 1,
+      "description": "一次分析产物的唯一标识；示例图不带此标识。图查询与增量重算据此定位产物版本"
+    },
+    "nodes": {
+      "type": "array",
+      "items": { "$ref": "#/$defs/IRNode" }
+    },
+    "edges": {
+      "type": "array",
+      "items": { "$ref": "#/$defs/IREdge" }
+    },
+    "warnings": {
+      "type": "array",
+      "description": "分析过程中的可见告警；单文件解析失败等必须记录于此，禁止静默降级",
+      "items": { "$ref": "#/$defs/Warning" }
+    },
+    "meta": { "$ref": "#/$defs/GraphMeta" }
+  },
+  "$defs": {
+    "Source": {
+      "title": "Source",
+      "type": "string",
+      "enum": ["static", "runtime", "ai"],
+      "description": "证据来源：运行时事实 > 静态事实 > AI 推断"
+    },
+    "NodeKind": {
+      "title": "NodeKind",
+      "type": "string",
+      "enum": [
+        "component",
+        "server-component",
+        "server-action",
+        "element",
+        "hook",
+        "state",
+        "fn",
+        "api",
+        "route"
+      ],
+      "description": "受控枚举；新增取值必须升级 schema 版本。server-component 与 server-action 用于 Next.js RSC。"
+    },
+    "EdgeKind": {
+      "title": "EdgeKind",
+      "type": "string",
+      "enum": ["renders", "calls", "reads", "writes", "requests", "uses", "boundary"],
+      "description": "受控枚举；boundary 表示 client/server 组件边界。"
+    },
+    "Severity": {
+      "title": "Severity",
+      "type": "string",
+      "enum": ["error", "warning", "info"],
+      "description": "error：该步骤失败且结果不可信；warning：结果可用但存在缺失；info：提示性信息"
+    },
+    "Stage": {
+      "title": "Stage",
+      "type": "string",
+      "enum": ["static", "runtime", "ai", "merge"],
+      "description": "告警产生的分析阶段"
+    },
+    "Location": {
+      "title": "Location",
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["line", "col"],
+      "properties": {
+        "line": { "type": "integer", "minimum": 1 },
+        "col": { "type": "integer", "minimum": 1 }
+      }
+    },
+    "Warning": {
+      "title": "Warning",
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["code", "severity", "message"],
+      "properties": {
+        "code": {
+          "type": "string",
+          "minLength": 1,
+          "description": "机器可读的告警码，如 parse_error / unresolved_import / plugin_timeout"
+        },
+        "severity": { "$ref": "#/$defs/Severity" },
+        "message": { "type": "string", "minLength": 1 },
+        "stage": { "$ref": "#/$defs/Stage" },
+        "file": {
+          "type": "string",
+          "description": "告警关联文件（相对项目根目录）"
+        },
+        "loc": { "$ref": "#/$defs/Location" },
+        "pluginId": {
+          "type": "string",
+          "description": "产生该告警的插件；为空表示核心分析流程"
+        }
+      }
+    },
+    "Evidence": {
+      "title": "Evidence",
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["source", "confidence"],
+      "properties": {
+        "source": { "$ref": "#/$defs/Source" },
+        "confidence": {
+          "type": "number",
+          "minimum": 0,
+          "maximum": 1,
+          "description": "0–1；AI 推断不得超过 0.6"
+        },
+        "file": {
+          "type": "string",
+          "description": "静态证据来源文件（相对项目根目录）"
+        },
+        "loc": { "$ref": "#/$defs/Location" },
+        "traceId": {
+          "type": "string",
+          "description": "运行时证据反查采集记录的标识"
+        }
+      }
+    },
+    "IRNode": {
+      "title": "IRNode",
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["id", "kind", "name", "attrs", "evidence"],
+      "properties": {
+        "id": {
+          "type": "string",
+          "minLength": 1,
+          "description": "必须由「文件路径 + 组件名」组合生成，同一文件多组件不得冲突"
+        },
+        "kind": { "$ref": "#/$defs/NodeKind" },
+        "name": { "type": "string", "minLength": 1 },
+        "file": {
+          "type": "string",
+          "description": "节点定义所在文件（相对项目根目录）；运行时节点与外部接口可缺省"
+        },
+        "loc": { "$ref": "#/$defs/Location" },
+        "attrs": {
+          "type": "object",
+          "additionalProperties": true,
+          "description": "由插件自由扩展的属性集合；不得用于存放 file / loc 等通用字段"
+        },
+        "evidence": {
+          "type": "array",
+          "minItems": 1,
+          "items": { "$ref": "#/$defs/Evidence" }
+        }
+      }
+    },
+    "IREdge": {
+      "title": "IREdge",
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["id", "from", "to", "kind", "evidence"],
+      "properties": {
+        "id": { "type": "string", "minLength": 1 },
+        "from": { "type": "string", "minLength": 1 },
+        "to": { "type": "string", "minLength": 1 },
+        "kind": { "$ref": "#/$defs/EdgeKind" },
+        "evidence": {
+          "type": "array",
+          "minItems": 1,
+          "items": { "$ref": "#/$defs/Evidence" }
+        }
+      }
+    },
+    "GraphMeta": {
+      "title": "GraphMeta",
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "projectId": { "type": "string" },
+        "framework": {
+          "type": "string",
+          "enum": ["react", "next"]
+        },
+        "sample": {
+          "type": "boolean",
+          "description": "为 true 时表示演示数据，不代表真实源码分析结果"
+        },
+        "generatedAt": { "type": "string", "format": "date-time" },
+        "note": { "type": "string" }
+      }
+    }
+  }
+}

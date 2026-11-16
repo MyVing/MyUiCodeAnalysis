@@ -1,0 +1,60 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://uicodeanalysis.local/schemas/mapping.schema.json",
+  "title": "WrapperMapping",
+  "description": "二次封装映射：声明项目内封装组件与 UI 库组件的对应关系。按项目文档 4.3，映射规则只存在于配置里，核心分析器不得内联业务名判断（禁止 if (tag === \"ProTable\")）。",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["schemaVersion", "pluginId", "package", "wrappers"],
+  "properties": {
+    "schemaVersion": {
+      "type": "string",
+      "pattern": "^\\d+\\.\\d+$",
+      "description": "映射文件格式版本，与 IR schema 版本解耦"
+    },
+    "pluginId": {
+      "type": "string",
+      "pattern": "^[a-z0-9]+(\\.[a-z0-9-]+)+$",
+      "description": "声明该映射的插件，与 plugin.schema.json 的 pluginId 一致"
+    },
+    "package": {
+      "type": "string",
+      "minLength": 1,
+      "description": "被封装组件所属的 npm 包名，如 antd；用于拼出外部组件节点 id（antd#Table）"
+    },
+    "wrappers": {
+      "type": "array",
+      "minItems": 1,
+      "items": { "$ref": "#/$defs/WrapperRule" }
+    }
+  },
+  "$defs": {
+    "WrapperRule": {
+      "title": "WrapperRule",
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["name", "target"],
+      "properties": {
+        "name": {
+          "type": "string",
+          "minLength": 1,
+          "description": "项目内封装组件的名字，按此与组件发现结果匹配"
+        },
+        "target": {
+          "type": "string",
+          "minLength": 1,
+          "description": "被封装的库组件名，如 Table"
+        },
+        "props": {
+          "type": "object",
+          "additionalProperties": { "type": "string" },
+          "description": "封装组件的 props 名 → 目标组件的 props 名，如 { \"request\": \"dataSource\" }"
+        },
+        "description": {
+          "type": "string",
+          "description": "给人看的说明，会原样带到 IR 的 attrs 里"
+        }
+      }
+    }
+  }
+}
