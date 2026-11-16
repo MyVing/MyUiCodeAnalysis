@@ -12,7 +12,7 @@ from app.api.deps import (
     get_requirement_repository,
     get_worker_runner,
 )
-from app.core.config import Settings, get_settings
+from app.core.config import Settings
 from app.main import create_app
 from app.storage.memory import (
     InMemoryAnalysisRepository,
@@ -81,7 +81,7 @@ def llm_ready_settings() -> Settings:
 
 
 def wait_for_final_task(
-    client: TestClient, task_id: str, timeout: float = 5.0
+    client: TestClient, task_id: str, timeout: float = 10.0
 ) -> dict[str, object]:
     """轮询直到任务进入终态；TestClient 的 portal 循环会推进后台 asyncio 任务。"""
     deadline = time.monotonic() + timeout

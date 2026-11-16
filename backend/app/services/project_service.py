@@ -11,13 +11,13 @@ class ProjectService:
     def __init__(self, repository: ProjectRepository) -> None:
         self._repository = repository
 
-    def list_projects(self) -> list[Project]:
-        return self._repository.list()
+    async def list_projects(self) -> list[Project]:
+        return await self._repository.list()
 
-    def get_project(self, project_id: str) -> Project | None:
-        return self._repository.get(project_id)
+    async def get_project(self, project_id: str) -> Project | None:
+        return await self._repository.get(project_id)
 
-    def create_project(self, payload: ProjectCreate) -> Project:
+    async def create_project(self, payload: ProjectCreate) -> Project:
         project = Project(
             id=f"prj_{uuid4().hex[:12]}",
             name=payload.name,
@@ -25,4 +25,4 @@ class ProjectService:
             framework=payload.framework,
             created_at=datetime.now(UTC),
         )
-        return self._repository.add(project)
+        return await self._repository.add(project)

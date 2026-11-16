@@ -45,7 +45,9 @@ class DecomposedFeature:
         ]
 
 
-def decompose(requirement: str, *, max_features: int = DEFAULT_MAX_FEATURES) -> list[DecomposedFeature]:
+def decompose(
+    requirement: str, *, max_features: int = DEFAULT_MAX_FEATURES
+) -> list[DecomposedFeature]:
     """把需求文本切成功能点。
 
     切不出可用片段时退化为「整段需求算一个功能点」——宁可粗，不可空：

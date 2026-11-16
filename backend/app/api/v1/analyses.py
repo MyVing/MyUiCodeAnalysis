@@ -22,9 +22,9 @@ async def start_analysis(
     analysis_service: AnalysisServiceDep,
     payload: AnalysisStart | None = None,
 ) -> AnalysisTask:
-    project = require_project(project_id, service)
+    project = await require_project(project_id, service)
     try:
-        return analysis_service.start(project, payload)
+        return await analysis_service.start(project, payload)
     except AnalysisConflictError:
         raise HTTPException(
             status_code=status.HTTP_409_CONFLICT,
@@ -33,10 +33,10 @@ async def start_analysis(
 
 
 @router.get("/projects/{project_id}/analyses", response_model=AnalysisTaskList)
-def list_analyses(
+async def list_analyses(
     project_id: str,
     service: ProjectServiceDep,
     analysis_service: AnalysisServiceDep,
 ) -> AnalysisTaskList:
-    require_project(project_id, service)
-    return AnalysisTaskList(items=analysis_service.list_tasks(project_id))
+    await require_project(project_id, service)
+    return AnalysisTaskList(items=await analysis_service.list_tasks(project_id))

@@ -83,14 +83,14 @@ def read_excerpt(project: Project, file: str, line: int | None, radius: int) -> 
         404: {"description": "文件不存在"},
     },
 )
-def get_source_excerpt(
+async def get_source_excerpt(
     project_id: str,
     service: ProjectServiceDep,
     file: str = Query(min_length=1),
     line: int | None = Query(default=None, ge=1),
     radius: int = Query(default=DEFAULT_RADIUS, ge=0, le=MAX_RADIUS),
 ) -> SourceExcerpt:
-    project = require_project(project_id, service)
+    project = await require_project(project_id, service)
     try:
         return read_excerpt(project, file, line, radius)
     except UnsafePathError as error:

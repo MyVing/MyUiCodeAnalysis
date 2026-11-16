@@ -35,10 +35,10 @@ class AnalysisService:
         # asyncio.Task 弱引用会被事件循环 GC，必须持有强引用直到完成
         self._background: set[asyncio.Task[None]] = set()
 
-    def list_tasks(self, project_id: str) -> list[AnalysisTask]:
-        return self._repository.list_by_project(project_id)
+    async def list_tasks(self, project_id: str) -> list[AnalysisTask]:
+        return await self._repository.list_by_project(project_id)
 
-    def start(self, project: Project, payload: AnalysisStart | None = None) -> AnalysisTask:
+    async def start(self, project: Project, payload: AnalysisStart | None = None) -> AnalysisTask:
         payload = payload or AnalysisStart()
         created = AnalysisTask(
             id=f"task_{uuid4().hex[:12]}",
@@ -50,12 +50,12 @@ class AnalysisService:
             base_commit=payload.base_commit,
             target_commit=payload.target_commit,
         )
-        task = self._repository.add_task(created)
+        task = await self._repository.add_task(created)
         if task is None:
             raise AnalysisConflictError(project.id)
 
         if not os.path.isdir(project.root_path):
-            return self._repository.update_task(
+            return await self._repository.update_task(
                 task.model_copy(
                     update={
                         "status": "failed",
@@ -72,7 +72,7 @@ class AnalysisService:
         return task
 
     async def _execute(self, project: Project, task: AnalysisTask) -> None:
-        self._repository.update_task(
+        await self._repository.update_task(
             task.model_copy(update={"status": "running", "started_at": datetime.now(UTC)})
         )
         request = WorkerRequest(
@@ -86,7 +86,7 @@ class AnalysisService:
         except Exception as error:
             # 编排自身的意外不能留下永远 running 的任务
             logger.exception("分析任务执行异常：%s", task.id)
-            self._repository.update_task(
+            await self._repository.update_task(
                 task.model_copy(
                     update={
                         "status": "failed",
@@ -99,8 +99,8 @@ class AnalysisService:
             return
 
         if outcome.ok and outcome.graph is not None:
-            self._repository.save_graph(project.id, outcome.graph)
-            self._repository.update_task(
+            await self._repository.save_graph(project.id, outcome.graph)
+            await self._repository.update_task(
                 task.model_copy(
                     update={
                         "status": "succeeded",
@@ -113,7 +113,7 @@ class AnalysisService:
             )
             return
 
-        self._repository.update_task(
+        await self._repository.update_task(
             task.model_copy(
                 update={
                     "status": "failed",

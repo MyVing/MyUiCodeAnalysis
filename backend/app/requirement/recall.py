@@ -7,6 +7,7 @@
 from __future__ import annotations
 
 from collections import defaultdict
+from collections.abc import Iterable
 from dataclasses import dataclass, field
 
 from app.contracts import (
@@ -19,6 +20,7 @@ from app.contracts import (
     Signal,
     SignalKind,
 )
+
 # RequirementWarning 的 severity 用 requirement 契约自己的枚举：IR 契约里也有同名
 # 的 Severity，但那是另一个类型，混用会让等值比较莫名其妙地失败。
 from app.contracts.requirement import Severity
@@ -46,6 +48,8 @@ _REPEAT_DECAY = 0.6
 DEFAULT_TOP_K = 30
 # 每个候选最多保留多少条信号 / 文案 / props，防止单候选撑爆模型上下文
 MAX_ITEMS_PER_CANDIDATE = 10
+# 每类信号最多保留几条：routePath / apiUrl 这类低频高价值的信号不被文案挤掉
+MAX_SIGNALS_PER_KIND = 3
 
 
 @dataclass
@@ -297,9 +301,7 @@ def _score_page(
         prop_names=_unique_preserving_order(
             item.text for item in evidences if item.kind is SignalKind.propName
         )[:MAX_ITEMS_PER_CANDIDATE],
-        api_urls=sorted(
-            {item.text for item in evidences if item.kind is SignalKind.apiUrl}
-        ),
+        api_urls=sorted({item.text for item in evidences if item.kind is SignalKind.apiUrl}),
     )
 
 
@@ -321,7 +323,7 @@ def _top_signals_per_kind(signals: list[Signal]) -> list[Signal]:
     return kept[:MAX_ITEMS_PER_CANDIDATE]
 
 
-def _unique_preserving_order(items) -> list[str]:
+def _unique_preserving_order(items: Iterable[str]) -> list[str]:
     seen: set[str] = set()
     result: list[str] = []
     for item in items:

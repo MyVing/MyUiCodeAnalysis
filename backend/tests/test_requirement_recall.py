@@ -15,10 +15,13 @@ from app.contracts import (
     IRNode,
     Location,
     NodeKind,
-    Severity,
     SignalKind,
     Source,
 )
+
+# Severity 必须取自 requirement 契约：app.contracts 顶层同名导出是 IR 契约的另一个
+# 枚举，混用会让 `warning.severity is Severity.info` 莫名其妙地失败。
+from app.contracts.requirement import Severity
 from app.requirement.features import decompose
 from app.requirement.lexicon import BIGRAM_TERM_WEIGHT, expand
 from app.requirement.recall import DEFAULT_TOP_K, recall
@@ -51,7 +54,13 @@ def _node(
 
 
 def _edge(source: str, target: str, kind: EdgeKind) -> IREdge:
-    return IREdge(id=f"{source}->{target}", from_=source, to=target, kind=kind, evidence=[_evidence("src/x.tsx")])
+    return IREdge(
+        id=f"{source}->{target}",
+        from_=source,
+        to=target,
+        kind=kind,
+        evidence=[_evidence("src/x.tsx")],
+    )
 
 
 def _page(
@@ -63,15 +72,27 @@ def _page(
 ) -> IRNode:
     attrs: dict = {}
     if texts is not None:
-        attrs["uiText"] = {"texts": [{"text": text, "kind": "text", "via": None, "loc": {"line": 1, "col": 1}} for text in texts]}
+        attrs["uiText"] = {
+            "texts": [
+                {"text": text, "kind": "text", "via": None, "loc": {"line": 1, "col": 1}}
+                for text in texts
+            ]
+        }
     if props is not None:
         attrs["props"] = {
             "typeName": None,
             "typeFile": None,
             "generic": False,
             "fields": [
-                {"name": prop, "type": "string", "optional": False, "defaultValue": None,
-                 "description": description, "file": "src/types.ts", "loc": {"line": 1, "col": 1}}
+                {
+                    "name": prop,
+                    "type": "string",
+                    "optional": False,
+                    "defaultValue": None,
+                    "description": description,
+                    "file": "src/types.ts",
+                    "loc": {"line": 1, "col": 1},
+                }
                 for prop, description in props
             ],
         }
@@ -89,7 +110,11 @@ def user_graph() -> IRGraph:
         "src/pages/UserList.tsx#UserList",
         "UserList",
         texts=["加载中…", "搜索用户", "姓名", "邮箱"],
-        props=[("title", "列表标题"), ("showFilter", "是否显示筛选栏"), ("onSelect", "选中回调，由页面注入")],
+        props=[
+            ("title", "列表标题"),
+            ("showFilter", "是否显示筛选栏"),
+            ("onSelect", "选中回调，由页面注入"),
+        ],
     )
     user_detail = _page(
         "src/pages/UserDetail.tsx#UserDetail",
@@ -98,12 +123,31 @@ def user_graph() -> IRGraph:
         props=[("userId", None)],
     )
     table_card = _page("src/components/TableCard.tsx#TableCard", "TableCard", texts=["查看"])
-    fetch_users = _node("src/pages/UserList.tsx#fetchUsers", NodeKind.fn, "fetchUsers", file="src/pages/UserList.tsx")
-    api = _node("api:GET:/api/users", NodeKind.api, "GET /api/users", attrs={"method": "GET", "url": "/api/users"})
-    route_list = _node("src/router.tsx#/users", NodeKind.route, "/users", file="src/router.tsx", attrs={"path": "/users"})
+    fetch_users = _node(
+        "src/pages/UserList.tsx#fetchUsers",
+        NodeKind.fn,
+        "fetchUsers",
+        file="src/pages/UserList.tsx",
+    )
+    api = _node(
+        "api:GET:/api/users",
+        NodeKind.api,
+        "GET /api/users",
+        attrs={"method": "GET", "url": "/api/users"},
+    )
+    route_list = _node(
+        "src/router.tsx#/users",
+        NodeKind.route,
+        "/users",
+        file="src/router.tsx",
+        attrs={"path": "/users"},
+    )
     route_detail = _node(
-        "src/router.tsx#/users/:userId", NodeKind.route, "/users/:userId",
-        file="src/router.tsx", attrs={"path": "/users/:userId", "params": ["userId"]},
+        "src/router.tsx#/users/:userId",
+        NodeKind.route,
+        "/users/:userId",
+        file="src/router.tsx",
+        attrs={"path": "/users/:userId", "params": ["userId"]},
     )
 
     return _graph(
@@ -193,7 +237,9 @@ def test_recall_explains_every_point_with_signals(user_graph: IRGraph) -> None:
     assert candidate.signals, "候选必须带信号，否则分数无法解释"
     assert all(signal.value and signal.score > 0 for signal in candidate.signals)
     # 信号得分之和就是总分（前端展示「为什么是它」依赖这一点）
-    assert candidate.score == pytest.approx(sum(signal.score for signal in candidate.signals), abs=1e-6)
+    assert candidate.score == pytest.approx(
+        sum(signal.score for signal in candidate.signals), abs=1e-6
+    )
     kinds = {signal.kind for signal in candidate.signals}
     assert SignalKind.routePath in kinds
     assert SignalKind.uiText in kinds
@@ -209,8 +255,11 @@ def test_recall_uses_props_description_as_evidence(user_graph: IRGraph) -> None:
 def test_recall_reaches_api_url_through_one_hop(user_graph: IRGraph) -> None:
     """页面 calls fetchUsers，fetchUsers requests /api/users：接口词要算到页面上。"""
     result = recall(user_graph, decompose("users 接口")[0].terms)
-    candidate = result.candidates[0].candidate
-    assert any(signal.kind is SignalKind.apiUrl for signal in candidate.signals)
+    # UserDetail 可能因路由参数命中更多词而排在前面；这里只关心 UserList 拿到了接口信号
+    user_list = next(
+        item for item in result.candidates if item.candidate.nodeId.endswith("#UserList")
+    )
+    assert any(signal.kind is SignalKind.apiUrl for signal in user_list.candidate.signals)
 
 
 def test_recall_does_not_inherit_children_texts(user_graph: IRGraph) -> None:

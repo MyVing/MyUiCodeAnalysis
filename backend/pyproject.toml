@@ -35,6 +35,8 @@ asyncio_default_fixture_loop_scope = "function"
 [tool.ruff]
 target-version = "py312"
 line-length = 100
+# app/contracts 是 generate_contracts.py 的生成产物（禁止手改），不参与 lint
+extend-exclude = ["app/contracts"]
 
 [tool.ruff.lint]
 select = ["E", "F", "I", "UP", "B", "SIM"]

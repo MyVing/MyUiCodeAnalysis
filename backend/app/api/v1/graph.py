@@ -11,22 +11,22 @@ router = APIRouter(prefix="/projects", tags=["graph"])
 
 
 @router.get("/{project_id}/graph", response_model=IRGraph, response_model_exclude_none=True)
-def get_project_graph(
+async def get_project_graph(
     project_id: str,
     service: ProjectServiceDep,
     repository: AnalysisRepositoryDep,
     analysis_id: str | None = Query(default=None, alias="analysisId"),
 ) -> IRGraph:
-    project = require_project(project_id, service)
+    project = await require_project(project_id, service)
     if analysis_id is not None:
-        graph = repository.get_graph(project_id, analysis_id)
+        graph = await repository.get_graph(project_id, analysis_id)
         if graph is None:
             raise HTTPException(
                 status_code=status.HTTP_404_NOT_FOUND,
                 detail="分析产物不存在",
             )
         return graph
-    latest = repository.get_latest_graph(project_id)
+    latest = await repository.get_latest_graph(project_id)
     if latest is not None:
         return latest
     return build_sample_graph(project)

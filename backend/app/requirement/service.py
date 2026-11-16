@@ -15,10 +15,14 @@ from uuid import uuid4
 from app.contracts import (
     Candidate,
     Feature,
+    IRGraph,
     RequirementMap,
     RequirementWarning,
-    Severity,
 )
+
+# Severity 用 requirement 契约自己的枚举：IR 契约里有同名但不同的类型，混用会让
+# 等值比较莫名其妙地失败。
+from app.contracts.requirement import Severity
 from app.core.config import Settings
 from app.requirement.features import decompose
 from app.requirement.recall import recall
@@ -53,21 +57,21 @@ class RequirementLocateService:
         # asyncio.Task 弱引用会被事件循环 GC，必须持有强引用直到完成
         self._background: set[asyncio.Task[None]] = set()
 
-    def list_tasks(self, project_id: str) -> list[RequirementTask]:
-        return self._repository.list_by_project(project_id)
+    async def list_tasks(self, project_id: str) -> list[RequirementTask]:
+        return await self._repository.list_by_project(project_id)
 
-    def get_task(self, task_id: str) -> RequirementTask | None:
-        return self._repository.get_task(task_id)
+    async def get_task(self, task_id: str) -> RequirementTask | None:
+        return await self._repository.get_task(task_id)
 
-    def get_map(self, requirement_id: str) -> RequirementMap | None:
-        return self._repository.get_map(requirement_id)
+    async def get_map(self, requirement_id: str) -> RequirementMap | None:
+        return await self._repository.get_map(requirement_id)
 
-    def get_map_by_task(self, task_id: str) -> RequirementMap | None:
-        return self._repository.get_map_by_task(task_id)
+    async def get_map_by_task(self, task_id: str) -> RequirementMap | None:
+        return await self._repository.get_map_by_task(task_id)
 
-    def start(self, project: Project, payload: RequirementLocateStart) -> RequirementTask:
+    async def start(self, project: Project, payload: RequirementLocateStart) -> RequirementTask:
         # 前置校验必须在建任务之前：否则用户要先等一个必然失败的任务
-        graph = self._require_graph(project, payload.analysis_id)
+        graph = await self._require_graph(project, payload.analysis_id)
         if payload.dry_run is False and not self._settings.llm_ready:
             raise RequirementPreconditionError(
                 "llm_unavailable",
@@ -85,23 +89,25 @@ class RequirementLocateService:
             analysis_id=graph.analysisId,
             created_at=datetime.now(UTC),
         )
-        self._repository.add_task(task)
+        await self._repository.add_task(task)
 
         background = asyncio.get_running_loop().create_task(self._execute(project, task, graph))
         self._background.add(background)
         background.add_done_callback(self._background.discard)
         return task
 
-    def _require_graph(self, project: Project, analysis_id: str | None):
+    async def _require_graph(
+        self, project: Project, analysis_id: str | None
+    ) -> IRGraph:
         if analysis_id is not None:
-            graph = self._analyses.get_graph(project.id, analysis_id)
+            graph = await self._analyses.get_graph(project.id, analysis_id)
             if graph is None:
                 raise RequirementPreconditionError(
                     "analysis_not_found",
                     f"分析产物 {analysis_id} 不存在，请先完成一次分析。",
                 )
         else:
-            graph = self._analyses.get_latest_graph(project.id)
+            graph = await self._analyses.get_latest_graph(project.id)
             if graph is None:
                 raise RequirementPreconditionError(
                     "graph_missing",
@@ -115,15 +121,17 @@ class RequirementLocateService:
             )
         return graph
 
-    async def _execute(self, project: Project, task: RequirementTask, graph) -> None:
-        self._repository.update_task(
+    async def _execute(
+        self, project: Project, task: RequirementTask, graph: IRGraph
+    ) -> None:
+        await self._repository.update_task(
             task.model_copy(update={"status": "running", "started_at": datetime.now(UTC)})
         )
         try:
             requirement_map = await self._locate(project, task, graph)
         except Exception as error:  # noqa: BLE001 - 任何异常都要落成可见的失败任务
             logger.exception("需求定位任务执行异常：%s", task.id)
-            self._repository.update_task(
+            await self._repository.update_task(
                 task.model_copy(
                     update={
                         "status": "failed",
@@ -135,9 +143,9 @@ class RequirementLocateService:
             )
             return
 
-        self._repository.save_map(requirement_map)
-        self._repository.link_task(task.id, requirement_map.requirementId)
-        self._repository.update_task(
+        await self._repository.save_map(requirement_map)
+        await self._repository.link_task(task.id, requirement_map.requirementId)
+        await self._repository.update_task(
             task.model_copy(
                 update={
                     "status": "succeeded",
@@ -149,7 +157,9 @@ class RequirementLocateService:
             )
         )
 
-    async def _locate(self, project: Project, task: RequirementTask, graph) -> RequirementMap:
+    async def _locate(
+        self, project: Project, task: RequirementTask, graph: IRGraph
+    ) -> RequirementMap:
         """dry-run 路径：纯确定性召回，不调模型。判定路径在阶段 3 接入。"""
         if not task.dry_run:
             raise RequirementPreconditionError(

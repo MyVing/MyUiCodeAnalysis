@@ -42,9 +42,9 @@ async def start_requirement_locate(
     service: ProjectServiceDep,
     locate_service: RequirementLocateServiceDep,
 ) -> RequirementTask:
-    project = require_project(project_id, service)
+    project = await require_project(project_id, service)
     try:
-        return locate_service.start(project, payload)
+        return await locate_service.start(project, payload)
     except RequirementPreconditionError as error:
         raise HTTPException(
             status_code=_PRECONDITION_STATUS.get(
@@ -55,13 +55,13 @@ async def start_requirement_locate(
 
 
 @router.get("/projects/{project_id}/requirements", response_model=RequirementTaskList)
-def list_requirement_tasks(
+async def list_requirement_tasks(
     project_id: str,
     service: ProjectServiceDep,
     locate_service: RequirementLocateServiceDep,
 ) -> RequirementTaskList:
-    require_project(project_id, service)
-    return RequirementTaskList(items=locate_service.list_tasks(project_id))
+    await require_project(project_id, service)
+    return RequirementTaskList(items=await locate_service.list_tasks(project_id))
 
 
 @router.get(
@@ -69,10 +69,10 @@ def list_requirement_tasks(
     response_model=RequirementTask,
     responses={404: {"description": "任务不存在"}},
 )
-def get_requirement_task(
+async def get_requirement_task(
     task_id: str, locate_service: RequirementLocateServiceDep
 ) -> RequirementTask:
-    task = locate_service.get_task(task_id)
+    task = await locate_service.get_task(task_id)
     if task is None:
         raise HTTPException(
             status_code=status.HTTP_404_NOT_FOUND, detail=f"需求定位任务 {task_id} 不存在"
@@ -89,10 +89,10 @@ def get_requirement_task(
         409: {"description": "任务未成功完成"},
     },
 )
-def get_requirement_map(
+async def get_requirement_map(
     task_id: str, locate_service: RequirementLocateServiceDep
 ) -> RequirementMap:
-    task = locate_service.get_task(task_id)
+    task = await locate_service.get_task(task_id)
     if task is None:
         raise HTTPException(
             status_code=status.HTTP_404_NOT_FOUND, detail=f"需求定位任务 {task_id} 不存在"
@@ -103,7 +103,7 @@ def get_requirement_map(
             detail=f"任务当前状态为 {task.status}，尚无可读取的定位产物。",
         )
 
-    requirement_map = locate_service.get_map_by_task(task_id)
+    requirement_map = await locate_service.get_map_by_task(task_id)
     if requirement_map is None:
         # 任务成功但产物已被有界淘汰：如实说明，而不是假装「还在准备」
         raise HTTPException(
