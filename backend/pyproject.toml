@@ -16,6 +16,9 @@ dependencies = [
   # 持久化：SQLAlchemy 仅用 Core 层（engine + text 查询），aiomysql 为纯 Python 异步驱动
   "sqlalchemy[asyncio]>=2.0",
   "aiomysql>=0.2",
+  # aiomysql 0.3 的 bytes 转义依赖 pymysql.converters.escape_bytes_prefixed，
+  # pymysql 1.2 起该符号变成弃用占位字符串（调用即 TypeError），必须钉住 1.1
+  "pymysql>=1.1,<1.2",
 ]
 
 [dependency-groups]

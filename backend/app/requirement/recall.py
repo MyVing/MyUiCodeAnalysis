@@ -54,12 +54,18 @@ MAX_SIGNALS_PER_KIND = 3
 
 @dataclass
 class CandidateDetail:
-    """候选的完整上下文：契约字段 + 下发给模型的结构化摘要。"""
+    """候选的完整上下文：契约字段 + 下发给模型的结构化摘要。
+
+    quote_corpus 是该页面全部可命中原文的并集（不截断）：判定阶段校验模型
+    引文时逐字比对，语料缺一段就可能冤枉一条真实的匹配。
+    """
 
     candidate: Candidate
     ui_texts: list[str] = field(default_factory=list)
     prop_names: list[str] = field(default_factory=list)
+    prop_descriptions: list[str] = field(default_factory=list)
     api_urls: list[str] = field(default_factory=list)
+    quote_corpus: list[str] = field(default_factory=list)
 
 
 @dataclass
@@ -301,7 +307,11 @@ def _score_page(
         prop_names=_unique_preserving_order(
             item.text for item in evidences if item.kind is SignalKind.propName
         )[:MAX_ITEMS_PER_CANDIDATE],
+        prop_descriptions=_unique_preserving_order(
+            item.text for item in evidences if item.kind is SignalKind.propDescription
+        )[:MAX_ITEMS_PER_CANDIDATE],
         api_urls=sorted({item.text for item in evidences if item.kind is SignalKind.apiUrl}),
+        quote_corpus=_unique_preserving_order(item.text for item in evidences),
     )
 
 

@@ -28,6 +28,8 @@ pytestmark = pytest.mark.skipif(
 )
 
 TABLES = (
+    "langgraph_checkpoint_writes",
+    "langgraph_checkpoints",
     "runtime_traces",
     "runtime_tasks",
     "requirement_maps",
@@ -100,6 +102,76 @@ async def test_project_roundtrip(engine) -> None:
     assert await repo.get("prj_missing") is None
     listed = await repo.list()
     assert [item.id for item in listed] == [project.id]
+
+
+# --- LangGraph checkpointer（P3：需求定位中间状态审计落盘） ------------------
+
+
+async def test_checkpoint_saver_roundtrip(engine) -> None:
+    from langchain_core.runnables import RunnableConfig
+    from langgraph.checkpoint.base import CheckpointMetadata
+
+    from app.storage.checkpoint import MySqlCheckpointSaver
+
+    saver = MySqlCheckpointSaver(engine)
+    thread: RunnableConfig = {"configurable": {"thread_id": "rtask_test000001"}}
+
+    metadata: CheckpointMetadata = {"source": "loop", "step": 1, "writes": {}, "parents": {}}
+    first_checkpoint = {
+        "v": 1,
+        "id": "cp-0001",
+        "ts": "2026-11-17T00:00:00+00:00",
+        "channel_values": {"requirement": "用户列表增加状态筛选"},
+        "channel_versions": {},
+        "versions_seen": {},
+    }
+    saved_config = await saver.aput(
+        thread, first_checkpoint, metadata, {}  # type: ignore[arg-type]
+    )
+    assert saved_config["configurable"]["checkpoint_id"] == "cp-0001"
+
+    second_checkpoint = {
+        "v": 1,
+        "id": "cp-0002",
+        "ts": "2026-11-17T00:00:01+00:00",
+        "channel_values": {"features": ["f1"]},
+        "channel_versions": {},
+        "versions_seen": {},
+    }
+    await saver.aput(
+        _child_config(thread, "cp-0001"),
+        second_checkpoint,  # type: ignore[arg-type]
+        metadata,
+        {},
+    )
+    await saver.aput_writes(
+        _child_config(thread, "cp-0002"),
+        [("judge", {"calls_used": 2})],
+        task_id="node-judge",
+    )
+
+    latest = await saver.aget_tuple(thread)
+    assert latest is not None
+    assert latest.config["configurable"]["checkpoint_id"] == "cp-0002"
+    checkpoint = latest.checkpoint
+    assert checkpoint["channel_values"]["features"] == ["f1"]
+    assert latest.parent_config is not None
+    assert latest.parent_config["configurable"]["checkpoint_id"] == "cp-0001"
+    assert latest.pending_writes == [("node-judge", "judge", {"calls_used": 2})]
+
+    listed = [item.config["configurable"]["checkpoint_id"] async for item in saver.alist(thread)]
+    assert listed == ["cp-0002", "cp-0001"]
+
+    await saver.adelete_thread("rtask_test000001")
+    assert await saver.aget_tuple(thread) is None
+
+
+def _child_config(thread, checkpoint_id: str):
+    from copy import deepcopy
+
+    config = deepcopy(thread)
+    config["configurable"]["checkpoint_id"] = checkpoint_id
+    return config
 
 
 async def test_add_task_conflict_returns_none(engine) -> None:

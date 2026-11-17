@@ -20,9 +20,32 @@ from app.contracts import (
     RuntimeTrace,
     Source,
 )
+from app.requirement.llm import LLMCallError
 from app.runtime.runner import RuntimeWorkerOutcome, RuntimeWorkerRequest
 
 _HANG_SECONDS = 5.0
+
+
+class FakeLLMClient:
+    """脚本化模型：按序返回响应，记录每次调用的 prompt 供断言。"""
+
+    def __init__(
+        self,
+        responses: list[str] | None = None,
+        *,
+        error: LLMCallError | None = None,
+    ) -> None:
+        self.responses = list(responses or [])
+        self.error = error
+        self.calls: list[tuple[str, str]] = []
+
+    async def chat(self, system: str, user: str) -> str:
+        self.calls.append((system, user))
+        if self.error is not None:
+            raise self.error
+        if not self.responses:
+            raise AssertionError("FakeLLMClient 的响应脚本已用尽")
+        return self.responses.pop(0)
 
 
 def _mini_graph(analysis_id: str) -> IRGraph:

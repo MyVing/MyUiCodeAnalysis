@@ -8,6 +8,8 @@ from functools import lru_cache
 from typing import Annotated
 
 from fastapi import Depends, Request
+from langgraph.checkpoint.base import BaseCheckpointSaver
+from langgraph.checkpoint.memory import MemorySaver
 
 from app.analysis.runner import SubprocessWorkerRunner, WorkerRunner
 from app.analysis.service import AnalysisService
@@ -18,10 +20,12 @@ from app.core.config import (
     resolve_worker_entry,
 )
 from app.plugin_manager.registry import PluginRegistry, create_plugin_registry
+from app.requirement.llm import LLMClient, build_llm_client
 from app.requirement.service import RequirementLocateService
 from app.runtime.runner import RuntimeWorkerRunner, SubprocessRuntimeRunner
 from app.runtime.service import RuntimeService
 from app.services.project_service import ProjectService
+from app.storage.checkpoint import MySqlCheckpointSaver
 from app.storage.factory import Storage
 from app.storage.repositories import AnalysisRepository, ProjectRepository
 from app.storage.requirement import RequirementRepository
@@ -84,12 +88,26 @@ def get_plugin_registry() -> PluginRegistry:
     return create_plugin_registry()
 
 
+def get_llm_client() -> LLMClient | None:
+    return build_llm_client(get_settings())
+
+
+def get_requirement_checkpointer(request: Request) -> BaseCheckpointSaver:
+    """MySQL 后端复用业务连接池；内存后端退到 MemorySaver（不落盘）。"""
+    engine = get_storage(request).engine
+    if engine is not None:
+        return MySqlCheckpointSaver(engine)
+    return MemorySaver()
+
+
 def get_requirement_locate_service(
     repository: Annotated[RequirementRepository, Depends(get_requirement_repository)],
     analyses: Annotated[AnalysisRepository, Depends(get_analysis_repository)],
+    llm: Annotated[LLMClient | None, Depends(get_llm_client)],
+    checkpointer: Annotated[BaseCheckpointSaver, Depends(get_requirement_checkpointer)],
     settings: SettingsDep,
 ) -> RequirementLocateService:
-    return RequirementLocateService(repository, analyses, settings)
+    return RequirementLocateService(repository, analyses, settings, llm, checkpointer)
 
 
 def get_runtime_worker_runner() -> RuntimeWorkerRunner:

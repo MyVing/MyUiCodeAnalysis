@@ -23,6 +23,7 @@ from sqlalchemy.ext.asyncio import AsyncEngine, create_async_engine
 from app.contracts import IRGraph, RequirementMap, RuntimeTrace
 from app.core.config import Settings
 from app.schemas import AnalysisTask, Project, RequirementTask, RuntimeTask
+from app.storage.checkpoint import CHECKPOINT_DDL_STATEMENTS
 
 logger = logging.getLogger(__name__)
 
@@ -143,6 +144,8 @@ DDL_STATEMENTS: tuple[str, ...] = (
       KEY idx_runtime_traces_project (project_id, created_at)
     ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4
     """,
+    # LangGraph checkpointer 的两张表：需求定位中间状态的审计落盘（P3 起）
+    *CHECKPOINT_DDL_STATEMENTS,
 )
 
 _RESTARTED_MESSAGE = "服务重启时任务仍在进行中，无法恢复子进程状态，已标记为失败。"

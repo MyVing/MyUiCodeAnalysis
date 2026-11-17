@@ -1,8 +1,8 @@
 """需求定位服务：任务生命周期 + 定位产物装配。
 
 任务流转与分析任务一致（queued → running → succeeded / failed），前端可复用同一套
-轮询逻辑。前置校验同步拒绝（无图 / 图是示例数据 / analysisId 不存在），这样用户
-立刻拿到可读的错误，而不是先看到任务、再等它失败。
+轮询逻辑。前置校验同步拒绝（无图 / 图是示例数据 / analysisId 不存在 / 模型未配置），
+这样用户立刻拿到可读的错误，而不是先看到任务、再等它失败。
 """
 
 from __future__ import annotations
@@ -12,31 +12,21 @@ import logging
 from datetime import UTC, datetime
 from uuid import uuid4
 
-from app.contracts import (
-    Candidate,
-    Feature,
-    IRGraph,
-    RequirementMap,
-    RequirementWarning,
-)
+from langgraph.checkpoint.base import BaseCheckpointSaver
 
-# Severity 用 requirement 契约自己的枚举：IR 契约里有同名但不同的类型，混用会让
-# 等值比较莫名其妙地失败。
-from app.contracts.requirement import Severity
+from app.contracts import IRGraph, RequirementMap
 from app.core.config import Settings
-from app.requirement.features import decompose
-from app.requirement.recall import recall
+from app.requirement.llm import LLMClient
+from app.requirement.orchestrator import RequirementOrchestrator
 from app.schemas import Project, RequirementLocateStart, RequirementTask
 from app.storage.repositories import AnalysisRepository
 from app.storage.requirement import RequirementRepository
 
 logger = logging.getLogger(__name__)
 
-SCHEMA_VERSION = "1.0"
-
 
 class RequirementPreconditionError(Exception):
-    """前置条件不满足：无图 / 图为示例数据 / 指定的图不存在。"""
+    """前置条件不满足：无图 / 图为示例数据 / 指定的图不存在 / 模型未配置。"""
 
     def __init__(self, code: str, message: str) -> None:
         super().__init__(message)
@@ -50,10 +40,14 @@ class RequirementLocateService:
         repository: RequirementRepository,
         analyses: AnalysisRepository,
         settings: Settings,
+        llm: LLMClient | None = None,
+        checkpointer: BaseCheckpointSaver | None = None,
     ) -> None:
         self._repository = repository
         self._analyses = analyses
         self._settings = settings
+        self._llm = llm
+        self._checkpointer = checkpointer
         # asyncio.Task 弱引用会被事件循环 GC，必须持有强引用直到完成
         self._background: set[asyncio.Task[None]] = set()
 
@@ -160,64 +154,10 @@ class RequirementLocateService:
     async def _locate(
         self, project: Project, task: RequirementTask, graph: IRGraph
     ) -> RequirementMap:
-        """dry-run 路径：纯确定性召回，不调模型。判定路径在阶段 3 接入。"""
-        if not task.dry_run:
-            raise RequirementPreconditionError(
-                "llm_unavailable",
-                "模型判定路径尚未接入（阶段 3），当前请使用 dryRun。",
-            )
+        """编排一次定位：dry-run 只跑确定性召回，非 dry-run 由图接模型判定。
 
-        features = decompose(task.requirement)
-        warnings: list[RequirementWarning] = []
-        top_k = self._settings.llm_max_candidates
-
-        # 按功能点分别召回再合并：先合并需求文本会让「详情」与「列表」互相稀释，
-        # 后排的页面被前一个功能点的高分挤掉。
-        merged: dict[str, Candidate] = {}
-        for feature in features:
-            result = recall(graph, feature.terms, top_k=top_k)
-            warnings.extend(result.warnings)
-            for detail in result.candidates:
-                existing = merged.get(detail.candidate.nodeId)
-                if existing is None or detail.candidate.score > existing.score:
-                    merged[detail.candidate.nodeId] = detail.candidate
-
-        candidates = sorted(merged.values(), key=lambda item: (-item.score, item.nodeId))[:top_k]
-
-        return RequirementMap(
-            schemaVersion=SCHEMA_VERSION,
-            requirementId=task.requirement_id,
-            projectId=project.id,
-            analysisId=graph.analysisId,
-            requirement=task.requirement,
-            createdAt=datetime.now(UTC),
-            dryRun=True,
-            features=[
-                Feature(id=feature.id, text=feature.text, keywords=feature.keywords())
-                for feature in features
-            ],
-            matches=[],
-            candidates=candidates,
-            warnings=_sorted_warnings(warnings),
-        )
-
-
-def _dedupe_warnings(warnings: list[RequirementWarning]) -> list[RequirementWarning]:
-    """同一告警在同一份产物里只保留一条：按功能点重复召回会产生完全相同的告警。"""
-    seen: set[tuple[str, str]] = set()
-    result: list[RequirementWarning] = []
-    for warning in warnings:
-        key = (warning.code, warning.message)
-        if key in seen:
-            continue
-        seen.add(key)
-        result.append(warning)
-    return result
-
-
-def _sorted_warnings(warnings: list[RequirementWarning]) -> list[RequirementWarning]:
-    order = {Severity.error: 0, Severity.warning: 1, Severity.info: 2}
-    return sorted(
-        _dedupe_warnings(warnings),
-        key=lambda warning: (order[warning.severity], warning.code, warning.message),
-    )
+        模型层失败（调用不通 / 输出无效）在图内降级为确定性结果 + 显式告警，
+        不炸任务；编排层自身的意外异常仍由 _execute 落成 failed。
+        """
+        orchestrator = RequirementOrchestrator(self._settings, self._llm, self._checkpointer)
+        return await orchestrator.run(project, task, graph)
