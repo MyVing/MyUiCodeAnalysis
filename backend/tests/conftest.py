@@ -12,7 +12,7 @@ from app.api.deps import (
     get_requirement_repository,
     get_worker_runner,
 )
-from app.core.config import Settings
+from app.core.config import Settings, get_settings
 from app.main import create_app
 from app.storage.memory import (
     InMemoryAnalysisRepository,
@@ -43,7 +43,10 @@ def client(
     requirement_repository: InMemoryRequirementRepository,
     fake_runner: FakeWorkerRunner,
 ) -> Iterator[TestClient]:
-    app = create_app()
+    # 测试必须与开发者本地 .env 隔离：显式传不读 .env 的配置，
+    # 并覆盖 get_settings，防止 DI 路径读到本地 APP_DB_URL（如 MySQL）
+    app = create_app(settings_with())
+    app.dependency_overrides[get_settings] = lambda: settings_with()
     repository = InMemoryProjectRepository()
     app.dependency_overrides[get_project_repository] = lambda: repository
     app.dependency_overrides[get_analysis_repository] = lambda: analysis_repository

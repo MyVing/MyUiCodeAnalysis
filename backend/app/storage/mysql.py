@@ -43,8 +43,11 @@ DDL_STATEMENTS: tuple[str, ...] = (
       project_id VARCHAR(32) NOT NULL,
       analysis_id VARCHAR(32) NOT NULL,
       status ENUM('queued','running','succeeded','failed') NOT NULL,
-      active_flag VARCHAR(32) GENERATED ALWAYS AS
-        (CASE WHEN status IN ('queued','running') THEN project_id END) STORED,
+      -- 「每项目至多一个活动任务」的载体：应用层维护——登记任务时写 project_id，
+      -- 任务进入终态时置 NULL（见 update_task 的 CASE 表达式）。
+      -- 不用 STORED 生成列的原因：InnoDB 8.0 下生成列表达式引用 ENUM 时，
+      -- 同表外键约束会以 1215 失败（实测 8.0.42），与唯一索引无关。
+      active_flag VARCHAR(32) NULL,
       created_at DATETIME(6) NOT NULL,
       started_at DATETIME(6) NULL,
       finished_at DATETIME(6) NULL,
@@ -109,6 +112,15 @@ DDL_STATEMENTS: tuple[str, ...] = (
 )
 
 _RESTARTED_MESSAGE = "服务重启时任务仍在进行中，无法恢复子进程状态，已标记为失败。"
+
+
+def _is_duplicate_key(error: IntegrityError) -> bool:
+    # pymysql 的 ER_DUP_ENTRY = 1062；外键等其他完整性违规必须如实抛出，
+    # 否则「项目不存在导致的 FK 失败」会被误判成并发冲突而静默丢任务。
+    args = getattr(getattr(error, "orig", None), "args", None)
+    if not args:
+        return False
+    return int(args[0]) == 1062
 
 
 def _to_db(value: datetime) -> datetime:
@@ -250,10 +262,10 @@ class MySqlAnalysisRepository:
         query = text(
             """
             INSERT INTO analysis_tasks
-              (id, project_id, analysis_id, status, created_at, requirement,
-               base_commit, target_commit)
+              (id, project_id, analysis_id, status, active_flag, created_at,
+               requirement, base_commit, target_commit)
             VALUES
-              (:id, :project_id, :analysis_id, 'queued', :created_at,
+              (:id, :project_id, :analysis_id, 'queued', :project_id, :created_at,
                :requirement, :base_commit, :target_commit)
             """
         )
@@ -269,9 +281,11 @@ class MySqlAnalysisRepository:
         async with self._engine.begin() as conn:
             try:
                 await conn.execute(query, params)
-            except IntegrityError:
+            except IntegrityError as error:
                 # uq_active_task：该项目已有 queued/running 任务
-                return None
+                if _is_duplicate_key(error):
+                    return None
+                raise
         return task
 
     async def get_task(self, task_id: str) -> AnalysisTask | None:
@@ -284,7 +298,10 @@ class MySqlAnalysisRepository:
         query = text(
             """
             UPDATE analysis_tasks
-            SET status = :status, started_at = :started_at,
+            SET status = :status,
+                active_flag = CASE WHEN :status IN ('queued','running')
+                                   THEN :project_id ELSE NULL END,
+                started_at = :started_at,
                 finished_at = :finished_at, error_code = :error_code,
                 error_message = :error_message, node_count = :node_count,
                 edge_count = :edge_count, warning_count = :warning_count,
@@ -299,6 +316,7 @@ class MySqlAnalysisRepository:
                 {
                     "id": task.id,
                     "status": task.status,
+                    "project_id": task.project_id,
                     "started_at": _to_db(task.started_at) if task.started_at else None,
                     "finished_at": _to_db(task.finished_at) if task.finished_at else None,
                     "error_code": task.error_code,
