@@ -26,6 +26,11 @@ export interface RuntimeTrace {
    * 一期仅 passive（A 模式）；二期追加 ai-exploration
    */
   mode: "passive";
+  devServer?: DevServer;
+  /**
+   * React fiber 树还原的组件挂载树（根组件数组）；file/line 与静态图合并时的关键运行时证据
+   */
+  componentTree?: ComponentNode[];
   page: PageInfo;
   /**
    * DOM 快照的 Artifact 引用，形如 artifact://trace_001/dom.json
@@ -47,6 +52,37 @@ export interface RuntimeTrace {
    * DOM 元素与静态节点的关联结果；无法关联时保留为 unmatched，不强行挂接
    */
   correlations?: Correlation[];
+}
+export interface DevServer {
+  /**
+   * dev server 实际监听端口（可能与配置值不同，以运行时探测为准）
+   */
+  port: number;
+  /**
+   * 监听地址，缺省 localhost
+   */
+  host?: string;
+  /**
+   * 被托管的启动命令，如 npm run dev -w app
+   */
+  command?: string;
+}
+export interface ComponentNode {
+  /**
+   * 组件名：displayName > 函数名 > 匿名占位
+   */
+  name: string;
+  /**
+   * 定义文件（相对被采集项目根目录）；来自 _debugSource 或 _debugTask，无法定位时缺省
+   */
+  file?: string;
+  line?: number;
+  col?: number;
+  /**
+   * 定位来源降级链：_debugSource（file+line）> _debugTask（仅名）> 仅 name，React 19 起逐步以 _debugTask 替代
+   */
+  source?: "debug-source" | "debug-task" | "name-only";
+  children?: ComponentNode[];
 }
 export interface PageInfo {
   /**

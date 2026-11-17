@@ -27,6 +27,12 @@
       "enum": ["passive"],
       "description": "一期仅 passive（A 模式）；二期追加 ai-exploration"
     },
+    "devServer": { "$ref": "#/$defs/DevServer" },
+    "componentTree": {
+      "type": "array",
+      "items": { "$ref": "#/$defs/ComponentNode" },
+      "description": "React fiber 树还原的组件挂载树（根组件数组）；file/line 与静态图合并时的关键运行时证据"
+    },
     "page": { "$ref": "#/$defs/PageInfo" },
     "domSnapshotRef": {
       "type": "string",
@@ -66,6 +72,56 @@
     }
   },
   "$defs": {
+    "DevServer": {
+      "title": "DevServer",
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["port"],
+      "properties": {
+        "port": {
+          "type": "integer",
+          "minimum": 1,
+          "maximum": 65535,
+          "description": "dev server 实际监听端口（可能与配置值不同，以运行时探测为准）"
+        },
+        "host": {
+          "type": "string",
+          "description": "监听地址，缺省 localhost"
+        },
+        "command": {
+          "type": "string",
+          "description": "被托管的启动命令，如 npm run dev -w app"
+        }
+      }
+    },
+    "ComponentNode": {
+      "title": "ComponentNode",
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["name"],
+      "properties": {
+        "name": {
+          "type": "string",
+          "minLength": 1,
+          "description": "组件名：displayName > 函数名 > 匿名占位"
+        },
+        "file": {
+          "type": "string",
+          "description": "定义文件（相对被采集项目根目录）；来自 _debugSource 或 _debugTask，无法定位时缺省"
+        },
+        "line": { "type": "integer", "minimum": 1 },
+        "col": { "type": "integer", "minimum": 1 },
+        "source": {
+          "type": "string",
+          "enum": ["debug-source", "debug-task", "name-only"],
+          "description": "定位来源降级链：_debugSource（file+line）> _debugTask（仅名）> 仅 name，React 19 起逐步以 _debugTask 替代"
+        },
+        "children": {
+          "type": "array",
+          "items": { "$ref": "#/$defs/ComponentNode" }
+        }
+      }
+    },
     "PageInfo": {
       "title": "PageInfo",
       "type": "object",

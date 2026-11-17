@@ -13,6 +13,56 @@ class Mode(StrEnum):
     passive = 'passive'
 
 
+class DevServer(BaseModel):
+    model_config = ConfigDict(
+        extra='forbid',
+        populate_by_name=True,
+    )
+    port: Annotated[
+        int,
+        Field(
+            description='dev server 实际监听端口（可能与配置值不同，以运行时探测为准）',
+            ge=1,
+            le=65535,
+        ),
+    ]
+    host: Annotated[str | None, Field(description='监听地址，缺省 localhost')] = None
+    command: Annotated[
+        str | None, Field(description='被托管的启动命令，如 npm run dev -w app')
+    ] = None
+
+
+class Source(StrEnum):
+    debug_source = 'debug-source'
+    debug_task = 'debug-task'
+    name_only = 'name-only'
+
+
+class ComponentNode(BaseModel):
+    model_config = ConfigDict(
+        extra='forbid',
+        populate_by_name=True,
+    )
+    name: Annotated[
+        str, Field(description='组件名：displayName > 函数名 > 匿名占位', min_length=1)
+    ]
+    file: Annotated[
+        str | None,
+        Field(
+            description='定义文件（相对被采集项目根目录）；来自 _debugSource 或 _debugTask，无法定位时缺省'
+        ),
+    ] = None
+    line: Annotated[int | None, Field(ge=1)] = None
+    col: Annotated[int | None, Field(ge=1)] = None
+    source: Annotated[
+        Source | None,
+        Field(
+            description='定位来源降级链：_debugSource（file+line）> _debugTask（仅名）> 仅 name，React 19 起逐步以 _debugTask 替代'
+        ),
+    ] = None
+    children: list[ComponentNode] | None = None
+
+
 class Viewport(BaseModel):
     model_config = ConfigDict(
         extra='forbid',
@@ -218,6 +268,13 @@ class RuntimeTrace(BaseModel):
     mode: Annotated[
         Mode, Field(description='一期仅 passive（A 模式）；二期追加 ai-exploration')
     ]
+    devServer: DevServer | None = None
+    componentTree: Annotated[
+        list[ComponentNode] | None,
+        Field(
+            description='React fiber 树还原的组件挂载树（根组件数组）；file/line 与静态图合并时的关键运行时证据'
+        ),
+    ] = None
     page: PageInfo
     domSnapshotRef: Annotated[
         str | None,
@@ -244,3 +301,6 @@ class RuntimeTrace(BaseModel):
             description='DOM 元素与静态节点的关联结果；无法关联时保留为 unmatched，不强行挂接'
         ),
     ] = None
+
+
+ComponentNode.model_rebuild()
