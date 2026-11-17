@@ -145,7 +145,7 @@ tests/fixtures/            验收样本，M1 的分析器以它们为准
 
 ## 与项目文档的对应
 
-设计依据见仓库外层的 `React代码智能分析平台-项目文档-动态方案补充版.md`。当前处于 **P2（运行时采集）完成、P3（AI 语义层）待开始** 的状态。
+设计依据见仓库外层的 `React代码智能分析平台-项目文档-动态方案补充版.md`。当前处于 **P3（AI 语义层）完成** 的状态：M1 静态分析 + P1 持久化 + P2 运行时采集 + P3 语义判定全部落地，详见文末各阶段记录。
 
 **M1 已完成**：module resolver、组件发现、renders 边、props 展开、hooks / state、API 链路、事件分析、二次封装映射（`ProTable → antd.Table`）、可见文案提取（`attrs.uiText`）；编排层（`AnalysisService` + `SubprocessWorkerRunner`，queued→running→succeeded/failed，错误码 `worker_timeout` / `worker_spawn_failed` / `worker_protocol_error` / `invalid_ir` 全部可见）；前端工作台（触发分析 + 轮询 + 图谱浏览 + 高级选项）。后端 36 个测试、前端 44 个测试、ruff/mypy 全绿，真实 worker E2E 已验证。
 
@@ -176,6 +176,17 @@ tests/fixtures/            验收样本，M1 的分析器以它们为准
 
 **待完成**：
 - 路由 / 页面节点（`NodeKind.route` 已预留但无分析器产出）
-- 需求映射层（`AnalysisStart.requirement` 已预留但编排层未消费）
-- **P3 AI 语义层**：需求→组件映射、影响面解释、回归建议；LangGraph 编排（checkpointer 使用同一 MySQL 3307 实例），LLM provider 进 Settings
 - 运行时增强（可选）：交互主动遍历、Console/网络与节点的关联深化
+- 语义层增强（可选，见 `docs/p3-semantic-layer-design.md`）：路由分析器补 `routePath` 信号、影响面解释、回归建议
+
+**P3 AI 语义层已完成**：设计文档（`b4aec47`）→ 后端判定编排（`a793ffa`）→ 前端面板（`957191b`）。
+
+- **LLM 接入刻意薄**：`LLMClient` 协议 + httpx 直连 OpenAI 兼容端点（`app/requirement/llm.py`），不引 openai SDK——判定路径只发单轮补全，协议抽象留给测试注入 Fake。`APP_LLM_ENABLED` / `APP_LLM_API_KEY` / `APP_LLM_BASE_URL` / `APP_LLM_MODEL` 进 Settings；未配置时非 dry-run 在建任务前同步拒绝（409 `llm_unavailable`），不让用户等一个必然失败的任务。
+- **信任模型的原因，校验模型的产出**（`app/requirement/judge.py`）：四道服务端校验——featureId 必须在拆解结果里（`unknown_feature`）、pageNodeId 必须落在候选集（`node_not_in_candidates`）、quote 必须在候选原文语料里逐字命中（`quote_not_found`）、字段形状必须合法（`invalid_shape`）；未通过的一律进 `dropped` 而非静默丢弃。**置信度硬上限 0.6**（AI 推断 ≠ 语法事实），模型自报值只记 `modelConfidence` 供比对封顶是否生效。
+- **引文语料不截断**：`recall.CandidateDetail` 新增 `quote_corpus`（该页面全部可命中原文的并集）与 `prop_descriptions`。召回展示用的 uiTexts/propNames 各截 10 条防上下文爆炸，但逐字校验的语料缺一段就可能冤枉真实匹配——两个用途分开。
+- **LangGraph 编排**（`app/requirement/orchestrator.py`）：`decompose → recall → judge → assemble` 线性图；judge 节点仅在配置模型且非 dry-run 时存在，dry-run 产物 `dryRun=true`、matches 恒空。图管「怎么算」，服务管「算之前和之后」——任务状态机仍由 `RequirementLocateService` 负责，两层职责不重叠。
+- **checkpointer 是审计不是恢复**（`app/storage/checkpoint.py`，自建双表）：需求定位是短事务（重试预算 ≤4 次调用），进程重启后 boot recovery 已把 running 置 failed，恢复无意义；落盘的每个 superstep 状态用于回答「模型为什么给这个结论」，按 `thread_id = task.id` 回放。实现协议最小闭环（aput/aget_tuple/alist/aput_writes/adelete_thread），同步方法显式 NotImplementedError 暴露误用。
+- **模型失败降级不炸任务**：调用不通 / 输出无效在重试预算内换措辞重试（prompt 附「上一次输出无效」与原因），预算耗尽降级为确定性召回 + `error` 级 `llm_unavailable` 告警 + 全部功能点进 unmatched——candidates 仍然有效（召回独立于模型）。这条与运行时合并「不编造节点」同一立场：降级必须显式。
+- **aiomysql × pymysql 1.2 不兼容是实测踩坑**：pymysql 1.2 起 `converters.escape_bytes_prefixed` 变成弃用占位字符串（访问返回 deprecation 文案，调用即 `TypeError: 'str' object is not callable`），aiomysql 0.3.2 落 LONGBLOB 必炸。已在 pyproject 钉住 `pymysql>=1.1,<1.2`。
+- 前端 `RequirementPanel`：默认勾选 dry-run（先验证召回质量再烧模型）；匹配项点击联动图节点选中；dropped 单独成块展示（amber 色）——审核模型是否在幻想，只能靠这份记录。
+- 验证：backend 105 单测全绿（judge 9 + 服务/API 12 新增）；MySQL 集成 9 passed（新增 checkpointer roundtrip）；真实模型集成测试就绪（`APP_LLM_INTEGRATION` 门控，需 `APP_LLM_API_KEY`，断言只锁契约不变量不锁模型结论）；前端 57、根仓库 typecheck/test 全绿。
