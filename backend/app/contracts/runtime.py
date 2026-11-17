@@ -34,7 +34,7 @@ class DevServer(BaseModel):
 
 class Source(StrEnum):
     debug_source = 'debug-source'
-    debug_task = 'debug-task'
+    debug_stack = 'debug-stack'
     name_only = 'name-only'
 
 
@@ -49,7 +49,7 @@ class ComponentNode(BaseModel):
     file: Annotated[
         str | None,
         Field(
-            description='定义文件（相对被采集项目根目录）；来自 _debugSource 或 _debugTask，无法定位时缺省'
+            description='位点文件（相对被采集项目根目录）；来自 _debugSource（定义位点）或 _debugStack（JSX 创建位点），无法定位时缺省'
         ),
     ] = None
     line: Annotated[int | None, Field(ge=1)] = None
@@ -57,7 +57,7 @@ class ComponentNode(BaseModel):
     source: Annotated[
         Source | None,
         Field(
-            description='定位来源降级链：_debugSource（file+line）> _debugTask（仅名）> 仅 name，React 19 起逐步以 _debugTask 替代'
+            description='定位来源降级链：debug-source（React≤18 _debugSource，组件定义位点 file+line）> debug-stack（React≥19 _debugStack 解析，JSX 创建位点）> name-only（React≥19 _debugTask 无名字可取，仅组件名）'
         ),
     ] = None
     children: list[ComponentNode] | None = None

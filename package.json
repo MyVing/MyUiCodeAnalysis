@@ -12,8 +12,8 @@
   "scripts": {
     "dev": "npm run dev -w frontend",
     "build": "npm run build -w frontend",
-    "typecheck": "npm run typecheck -w frontend && npm run typecheck -w @uicodeanalysis/ast-worker",
-    "test": "npm run test -w frontend && npm run test -w @uicodeanalysis/ast-worker",
+    "typecheck": "npm run typecheck -w frontend && npm run typecheck -w @uicodeanalysis/ast-worker && npm run typecheck -w @uicodeanalysis/runtime-worker",
+    "test": "npm run test -w frontend && npm run test -w @uicodeanalysis/ast-worker && npm run test -w @uicodeanalysis/runtime-worker",
     "lint": "npm run lint -w frontend",
     "gen:contracts": "python shared/scripts/generate_contracts.py",
     "check:contracts": "python shared/scripts/generate_contracts.py --check"

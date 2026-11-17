@@ -1,0 +1,13 @@
+{
+  "name": "runtime-demo-app-fixture",
+  "version": "1.0.0",
+  "private": true,
+  "description": "P2 运行时采集验收样本：可运行的 vite React 应用，供 runtime-worker 托管采集",
+  "scripts": {
+    "dev": "vite"
+  },
+  "dependencies": {
+    "react": "^19.1.1",
+    "react-dom": "^19.1.1"
+  }
+}
