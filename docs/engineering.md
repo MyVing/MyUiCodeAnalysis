@@ -145,9 +145,21 @@ tests/fixtures/            验收样本，M1 的分析器以它们为准
 
 ## 与项目文档的对应
 
-设计依据见仓库外层的 `React代码智能分析平台-项目文档-动态方案补充版.md`。当前处于 **M1（真实静态分析）完成** 的状态，代码已推送至 `github.com/MyVing/MyUiCodeAnalysis`。
+设计依据见仓库外层的 `React代码智能分析平台-项目文档-动态方案补充版.md`。当前处于 **P1（MySQL 持久化）完成、P2（运行时采集）待开始** 的状态。
 
 **M1 已完成**：module resolver、组件发现、renders 边、props 展开、hooks / state、API 链路、事件分析、二次封装映射（`ProTable → antd.Table`）、可见文案提取（`attrs.uiText`）；编排层（`AnalysisService` + `SubprocessWorkerRunner`，queued→running→succeeded/failed，错误码 `worker_timeout` / `worker_spawn_failed` / `worker_protocol_error` / `invalid_ir` 全部可见）；前端工作台（触发分析 + 轮询 + 图谱浏览 + 高级选项）。后端 36 个测试、前端 44 个测试、ruff/mypy 全绿，真实 worker E2E 已验证。
+
+**P1 持久化已完成**：仓储 Protocol 异步化（提交 `686eedc`）→ MySQL 实现（`1376f6a`）→ 集成测试（`b15e606`）。
+
+- 选型：SQLAlchemy 2.0 仅 Core 层 + **aiomysql**（纯 Python，Windows 免编译；不用 asyncmy，因其 Windows wheel 覆盖不全）。
+- 5 张表：`projects` / `analysis_tasks` / `graphs`（IR 整包 JSON 列）/ `requirement_tasks` / `requirement_maps`；`DATETIME(6)` 存 naive UTC。
+- 「每项目至多一个活动任务」用 `active_flag` 普通列 + 唯一索引表达（登记时写 project_id，终态置 NULL），单条 INSERT 撞 `1062` 判定冲突。**不要用 STORED 生成列**：表达式引用 ENUM 时 InnoDB 8.0 的外键约束会以 1215 失败（实测 8.0.42）。
+- lifespan（`app/main.py`）：`APP_DB_URL` 配置后建表（幂等 `CREATE TABLE IF NOT EXISTS`，无 alembic）+ boot recovery（queued/running → `failed/server_restarted`）；缺省走内存实现。
+- 测试隔离：conftest 显式传 `Settings(_env_file=None)` 并覆盖 `get_settings`，测试不受本地 `.env` 影响；MySQL 集成测试由 `APP_MYSQL_INTEGRATION=1` + `APP_TEST_DB_URL` 门控。
+- 本地开发库：MySQL 8.0.42 免安装版 `D:\mysql8`（端口 3307，root/123456，binlog 关闭），与既有 MySQL57(3306) 并存；凭据在 `backend/.env`（不入 git）。
+- 后端 64 测试全绿 + 9 个真实 MySQL 集成测试（env 门控）；`/health` 的 `storage` 字段如实反映 `memory | mysql`。
+
+下一阶段 **P2 运行时采集**：新建 `workers/runtime-worker`（Node + Playwright），被动采集起步——vite dev server 生命周期托管、React DevTools hook 抓组件树（`_debugSource` 直连 IR）、网络请求记录；产物以 `evidence.source=runtime` 与静态图合并（`kind='merged'`）。P3 语义层（LangGraph + AIOMySQLSaver）要求 MySQL ≥ 8.0.19，本地 3307 实例已满足。
 
 **待完成**：
 - 路由 / 页面节点（`NodeKind.route` 已预留但无分析器产出）
