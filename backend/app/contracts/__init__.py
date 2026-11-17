@@ -39,9 +39,17 @@ from app.contracts.requirement import (
     Unmatched,
     VerifiedEvidence,
 )
+from app.contracts.runtime import (
+    ComponentNode,
+    DevServer,
+    PageInfo,
+    RuntimeTrace,
+)
 
 __all__ = [
     "Candidate",
+    "ComponentNode",
+    "DevServer",
     "Dropped",
     "EdgeKind",
     "Evidence",
@@ -54,9 +62,11 @@ __all__ = [
     "Location",
     "Match",
     "NodeKind",
+    "PageInfo",
     "Reason",
     "RequirementMap",
     "RequirementWarning",
+    "RuntimeTrace",
     "Severity",
     "Signal",
     "SignalKind",

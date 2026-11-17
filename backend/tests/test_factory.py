@@ -6,11 +6,13 @@ from app.storage.memory import (
     InMemoryAnalysisRepository,
     InMemoryProjectRepository,
     InMemoryRequirementRepository,
+    InMemoryRuntimeRepository,
 )
 from app.storage.mysql import (
     MySqlAnalysisRepository,
     MySqlProjectRepository,
     MySqlRequirementRepository,
+    MySqlRuntimeRepository,
 )
 
 
@@ -25,6 +27,7 @@ def test_settings_without_db_url_uses_memory_backend() -> None:
     assert isinstance(storage.projects, InMemoryProjectRepository)
     assert isinstance(storage.analyses, InMemoryAnalysisRepository)
     assert isinstance(storage.requirements, InMemoryRequirementRepository)
+    assert isinstance(storage.runtimes, InMemoryRuntimeRepository)
     assert storage.engine is None
 
 
@@ -35,5 +38,6 @@ def test_settings_with_db_url_uses_mysql_backend() -> None:
     assert isinstance(storage.projects, MySqlProjectRepository)
     assert isinstance(storage.analyses, MySqlAnalysisRepository)
     assert isinstance(storage.requirements, MySqlRequirementRepository)
+    assert isinstance(storage.runtimes, MySqlRuntimeRepository)
     # 构建引擎不触发连接，无需真实实例
     assert storage.engine is not None

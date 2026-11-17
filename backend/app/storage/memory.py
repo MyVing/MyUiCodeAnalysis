@@ -7,11 +7,12 @@
 import asyncio
 from collections import deque
 
-from app.contracts import IRGraph, RequirementMap
-from app.schemas import AnalysisTask, Project, RequirementTask
+from app.contracts import IRGraph, RequirementMap, RuntimeTrace
+from app.schemas import AnalysisTask, Project, RequirementTask, RuntimeTask
 
 MAX_GRAPHS_PER_PROJECT = 5
 MAX_MAPS_PER_PROJECT = 20
+MAX_TRACES_PER_PROJECT = 20
 
 
 class InMemoryProjectRepository:
@@ -36,8 +37,9 @@ class InMemoryProjectRepository:
 class InMemoryAnalysisRepository:
     def __init__(self) -> None:
         self._tasks: dict[str, AnalysisTask] = {}
+        # 图产物按「kind:analysisId」复合键存放：P2 起同一分析可有 static 与 merged
+        # 两个版本，淘汰顺序按写入时间统一排序，get_latest_graph 因此天然 merged 优先
         self._graphs: dict[str, dict[str, IRGraph]] = {}
-        # 每项目的图产物保留顺序，用于 get_latest_graph 与有界淘汰
         self._graph_order: dict[str, deque[str]] = {}
         self._lock = asyncio.Lock()
 
@@ -67,23 +69,35 @@ class InMemoryAnalysisRepository:
             return sorted(items, key=lambda item: item.created_at, reverse=True)
 
     async def save_graph(self, project_id: str, graph: IRGraph) -> None:
+        await self._save_graph(project_id, "static", graph)
+
+    async def save_merged_graph(self, project_id: str, graph: IRGraph) -> None:
+        """合并图按 analysisId 覆盖：同一分析多次采集后只保留最新合并结果。"""
+        await self._save_graph(project_id, "merged", graph)
+
+    async def _save_graph(self, project_id: str, kind: str, graph: IRGraph) -> None:
         analysis_id = graph.analysisId
         if analysis_id is None:
             raise ValueError("分析产物缺少 analysisId，无法入库")
         async with self._lock:
+            key = f"{kind}:{analysis_id}"
             graphs = self._graphs.setdefault(project_id, {})
             order = self._graph_order.setdefault(project_id, deque())
-            if analysis_id in order:
-                order.remove(analysis_id)
-            graphs[analysis_id] = graph
-            order.append(analysis_id)
+            if key in order:
+                order.remove(key)
+            graphs[key] = graph
+            order.append(key)
             while len(order) > MAX_GRAPHS_PER_PROJECT:
                 oldest = order.popleft()
                 graphs.pop(oldest, None)
 
     async def get_graph(self, project_id: str, analysis_id: str) -> IRGraph | None:
         async with self._lock:
-            return self._graphs.get(project_id, {}).get(analysis_id)
+            return self._graphs.get(project_id, {}).get(f"static:{analysis_id}")
+
+    async def get_merged_graph(self, project_id: str, analysis_id: str) -> IRGraph | None:
+        async with self._lock:
+            return self._graphs.get(project_id, {}).get(f"merged:{analysis_id}")
 
     async def get_latest_graph(self, project_id: str) -> IRGraph | None:
         async with self._lock:
@@ -162,3 +176,65 @@ class InMemoryRequirementRepository:
 
 def create_requirement_repository() -> InMemoryRequirementRepository:
     return InMemoryRequirementRepository()
+
+
+class InMemoryRuntimeRepository:
+    def __init__(self) -> None:
+        self._tasks: dict[str, RuntimeTask] = {}
+        self._traces: dict[str, RuntimeTrace] = {}
+        self._trace_order: dict[str, deque[str]] = {}
+        self._lock = asyncio.Lock()
+
+    async def add_task(self, task: RuntimeTask) -> RuntimeTask:
+        async with self._lock:
+            self._tasks[task.id] = task
+        return task
+
+    async def get_task(self, task_id: str) -> RuntimeTask | None:
+        async with self._lock:
+            return self._tasks.get(task_id)
+
+    async def update_task(self, task: RuntimeTask) -> RuntimeTask:
+        async with self._lock:
+            self._tasks[task.id] = task
+            return task
+
+    async def list_by_project(self, project_id: str) -> list[RuntimeTask]:
+        async with self._lock:
+            items = [item for item in self._tasks.values() if item.project_id == project_id]
+        return sorted(items, key=lambda item: item.created_at, reverse=True)
+
+    async def save_trace(self, trace: RuntimeTrace) -> None:
+        async with self._lock:
+            project_id = trace.projectId
+            order = self._trace_order.setdefault(project_id, deque())
+            if trace.traceId in order:
+                order.remove(trace.traceId)
+            self._traces[trace.traceId] = trace
+            order.append(trace.traceId)
+            while len(order) > MAX_TRACES_PER_PROJECT:
+                oldest = order.popleft()
+                self._traces.pop(oldest, None)
+
+    async def get_trace(self, trace_id: str) -> RuntimeTrace | None:
+        async with self._lock:
+            return self._traces.get(trace_id)
+
+    async def get_trace_by_task(self, task_id: str) -> RuntimeTrace | None:
+        # 两跳：task → trace_id → trace；与 MySQL 实现的 JOIN 语义一致
+        async with self._lock:
+            task = self._tasks.get(task_id)
+            if task is None:
+                return None
+            return self._traces.get(task.trace_id)
+
+    async def get_latest_trace(self, project_id: str) -> RuntimeTrace | None:
+        async with self._lock:
+            order = self._trace_order.get(project_id)
+            if not order:
+                return None
+            return self._traces.get(order[-1])
+
+
+def create_runtime_repository() -> InMemoryRuntimeRepository:
+    return InMemoryRuntimeRepository()

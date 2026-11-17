@@ -148,6 +148,55 @@ class RequirementTaskList(ApiModel):
     items: list[RequirementTask] = Field(default_factory=list)
 
 
+class RuntimeStart(ApiModel):
+    """一次运行时采集的输入。url 与 command 至少给一个：
+
+    - `command`（如 "npm run dev"）：Worker 在项目根目录托管启动 dev server，
+      采集完成后杀掉进程树；
+    - `url`：直接访问已在运行的页面，不托管 dev server。
+    """
+
+    command: str | None = Field(default=None, max_length=500)
+    url: str | None = Field(default=None, max_length=2048)
+    analysis_id: str | None = Field(default=None, max_length=128)
+    settle_ms: int | None = Field(default=None, ge=100, le=120_000)
+
+    @field_validator("command", "url")
+    @classmethod
+    def strip_text(cls, value: str | None) -> str | None:
+        if value is None:
+            return None
+        stripped = value.strip()
+        return stripped or None
+
+
+class RuntimeTask(ApiModel):
+    """运行时采集任务的状态。字段形状与 AnalysisTask / RequirementTask 对齐，
+    前端可复用同一套轮询逻辑。"""
+
+    id: str
+    project_id: str
+    trace_id: str
+    status: TaskStatus
+    command: str | None = None
+    url: str | None = None
+    analysis_id: str | None = None
+    settle_ms: int | None = None
+    created_at: datetime
+    started_at: datetime | None = None
+    finished_at: datetime | None = None
+    error_code: str | None = None
+    error_message: str | None = None
+    component_count: int | None = None
+    network_count: int | None = None
+    console_count: int | None = None
+    interaction_count: int | None = None
+
+
+class RuntimeTaskList(ApiModel):
+    items: list[RuntimeTask] = Field(default_factory=list)
+
+
 class SourceExcerpt(ApiModel):
     """源码片段：前端点开「文件:行」时读这一段。"""
 

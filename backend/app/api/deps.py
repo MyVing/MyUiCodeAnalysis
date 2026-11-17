@@ -11,13 +11,21 @@ from fastapi import Depends, Request
 
 from app.analysis.runner import SubprocessWorkerRunner, WorkerRunner
 from app.analysis.service import AnalysisService
-from app.core.config import Settings, get_settings, resolve_worker_entry
+from app.core.config import (
+    Settings,
+    get_settings,
+    resolve_runtime_worker_entry,
+    resolve_worker_entry,
+)
 from app.plugin_manager.registry import PluginRegistry, create_plugin_registry
 from app.requirement.service import RequirementLocateService
+from app.runtime.runner import RuntimeWorkerRunner, SubprocessRuntimeRunner
+from app.runtime.service import RuntimeService
 from app.services.project_service import ProjectService
 from app.storage.factory import Storage
 from app.storage.repositories import AnalysisRepository, ProjectRepository
 from app.storage.requirement import RequirementRepository
+from app.storage.runtime import RuntimeRepository
 
 SettingsDep = Annotated[Settings, Depends(get_settings)]
 
@@ -43,6 +51,10 @@ def get_analysis_repository(request: Request) -> AnalysisRepository:
 
 def get_requirement_repository(request: Request) -> RequirementRepository:
     return get_storage(request).requirements
+
+
+def get_runtime_repository(request: Request) -> RuntimeRepository:
+    return get_storage(request).runtimes
 
 
 def get_project_service(
@@ -80,6 +92,23 @@ def get_requirement_locate_service(
     return RequirementLocateService(repository, analyses, settings)
 
 
+def get_runtime_worker_runner() -> RuntimeWorkerRunner:
+    settings = get_settings()
+    return SubprocessRuntimeRunner(
+        node_command=settings.worker_node_command,
+        entry_path=str(resolve_runtime_worker_entry(settings)),
+    )
+
+
+def get_runtime_service(
+    repository: Annotated[RuntimeRepository, Depends(get_runtime_repository)],
+    analyses: Annotated[AnalysisRepository, Depends(get_analysis_repository)],
+    runner: Annotated[RuntimeWorkerRunner, Depends(get_runtime_worker_runner)],
+    settings: SettingsDep,
+) -> RuntimeService:
+    return RuntimeService(repository, analyses, runner, settings)
+
+
 ProjectServiceDep = Annotated[ProjectService, Depends(get_project_service)]
 AnalysisRepositoryDep = Annotated[AnalysisRepository, Depends(get_analysis_repository)]
 AnalysisServiceDep = Annotated[AnalysisService, Depends(get_analysis_service)]
@@ -87,3 +116,4 @@ PluginRegistryDep = Annotated[PluginRegistry, Depends(get_plugin_registry)]
 RequirementLocateServiceDep = Annotated[
     RequirementLocateService, Depends(get_requirement_locate_service)
 ]
+RuntimeServiceDep = Annotated[RuntimeService, Depends(get_runtime_service)]

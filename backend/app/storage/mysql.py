@@ -20,9 +20,9 @@ from sqlalchemy import Row, text
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncEngine, create_async_engine
 
-from app.contracts import IRGraph, RequirementMap
+from app.contracts import IRGraph, RequirementMap, RuntimeTrace
 from app.core.config import Settings
-from app.schemas import AnalysisTask, Project, RequirementTask
+from app.schemas import AnalysisTask, Project, RequirementTask, RuntimeTask
 
 logger = logging.getLogger(__name__)
 
@@ -109,6 +109,40 @@ DDL_STATEMENTS: tuple[str, ...] = (
       KEY idx_rmaps_project (project_id, created_at)
     ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4
     """,
+    """
+    CREATE TABLE IF NOT EXISTS runtime_tasks (
+      id VARCHAR(32) PRIMARY KEY,
+      project_id VARCHAR(32) NOT NULL,
+      trace_id VARCHAR(32) NOT NULL,
+      status ENUM('queued','running','succeeded','failed') NOT NULL,
+      command VARCHAR(500) NULL,
+      url VARCHAR(2048) NULL,
+      analysis_id VARCHAR(32) NULL,
+      settle_ms INT NULL,
+      created_at DATETIME(6) NOT NULL,
+      started_at DATETIME(6) NULL,
+      finished_at DATETIME(6) NULL,
+      error_code VARCHAR(64) NULL,
+      error_message TEXT NULL,
+      component_count INT NULL,
+      network_count INT NULL,
+      console_count INT NULL,
+      interaction_count INT NULL,
+      CONSTRAINT fk_runtimes_project FOREIGN KEY (project_id)
+        REFERENCES projects(id) ON DELETE CASCADE,
+      KEY idx_runtime_tasks_project (project_id, created_at)
+    ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4
+    """,
+    """
+    CREATE TABLE IF NOT EXISTS runtime_traces (
+      trace_id VARCHAR(32) PRIMARY KEY,
+      project_id VARCHAR(32) NOT NULL,
+      analysis_id VARCHAR(32) NULL,
+      payload JSON NOT NULL,
+      created_at DATETIME(6) NOT NULL,
+      KEY idx_runtime_traces_project (project_id, created_at)
+    ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4
+    """,
 )
 
 _RESTARTED_MESSAGE = "服务重启时任务仍在进行中，无法恢复子进程状态，已标记为失败。"
@@ -160,29 +194,20 @@ async def run_boot_recovery(engine: AsyncEngine) -> int:
     状态显式化，而不是留一个永远 running 的任务。
     """
     async with engine.begin() as conn:
-        result = await conn.execute(
-            text(
-                """
-                UPDATE analysis_tasks
-                SET status = 'failed', error_code = 'server_restarted',
-                    error_message = :message, finished_at = NOW(6)
-                WHERE status IN ('queued','running')
-                """
-            ),
-            {"message": _RESTARTED_MESSAGE},
-        )
-        updated = result.rowcount
-        await conn.execute(
-            text(
-                """
-                UPDATE requirement_tasks
-                SET status = 'failed', error_code = 'server_restarted',
-                    error_message = :message, finished_at = NOW(6)
-                WHERE status IN ('queued','running')
-                """
-            ),
-            {"message": _RESTARTED_MESSAGE},
-        )
+        updated = 0
+        for table in ("analysis_tasks", "requirement_tasks", "runtime_tasks"):
+            result = await conn.execute(
+                text(
+                    f"""
+                    UPDATE {table}
+                    SET status = 'failed', error_code = 'server_restarted',
+                        error_message = :message, finished_at = NOW(6)
+                    WHERE status IN ('queued','running')
+                    """
+                ),
+                {"message": _RESTARTED_MESSAGE},
+            )
+            updated += result.rowcount
     if updated:
         logger.warning("启动恢复：将 %d 个中断任务标记为 failed（server_restarted）", updated)
     return updated
@@ -361,16 +386,55 @@ class MySqlAnalysisRepository:
                 },
             )
 
-    async def get_graph(self, project_id: str, analysis_id: str) -> IRGraph | None:
+    async def save_merged_graph(self, project_id: str, graph: IRGraph) -> None:
+        """合并图沿用 graphs 表（kind='merged'），同一分析多次采集后覆盖为最新结果。"""
+        analysis_id = graph.analysisId
+        if analysis_id is None:
+            raise ValueError("合并产物缺少 analysisId，无法入库")
         query = text(
-            "SELECT payload FROM graphs WHERE project_id = :pid AND analysis_id = :aid"
+            """
+            INSERT INTO graphs (project_id, analysis_id, kind, payload, created_at)
+            VALUES (:pid, :aid, 'merged', :payload, :created_at)
+            ON DUPLICATE KEY UPDATE payload = VALUES(payload), created_at = VALUES(created_at)
+            """
+        )
+        async with self._engine.begin() as conn:
+            await conn.execute(
+                query,
+                {
+                    "pid": project_id,
+                    "aid": analysis_id,
+                    "payload": graph.model_dump_json(exclude_none=True),
+                    "created_at": _to_db(datetime.now(UTC)),
+                },
+            )
+
+    async def get_graph(self, project_id: str, analysis_id: str) -> IRGraph | None:
+        # 同一 analysisId 可能有 static 与 merged 两行：这里只取静态图
+        query = text(
+            """
+            SELECT payload FROM graphs
+            WHERE project_id = :pid AND analysis_id = :aid AND kind = 'static'
+            """
+        )
+        async with self._engine.connect() as conn:
+            row = (await conn.execute(query, {"pid": project_id, "aid": analysis_id})).first()
+        return IRGraph.model_validate_json(row.payload) if row else None
+
+    async def get_merged_graph(self, project_id: str, analysis_id: str) -> IRGraph | None:
+        query = text(
+            """
+            SELECT payload FROM graphs
+            WHERE project_id = :pid AND analysis_id = :aid AND kind = 'merged'
+            """
         )
         async with self._engine.connect() as conn:
             row = (await conn.execute(query, {"pid": project_id, "aid": analysis_id})).first()
         return IRGraph.model_validate_json(row.payload) if row else None
 
     async def get_latest_graph(self, project_id: str) -> IRGraph | None:
-        # P2 起会有 kind='merged' 的合并图；当前只有 static，先按 id 取最新
+        # merged 按写入时间排在对应 static 之后；若之后又跑了新分析，static 的
+        # id 更大、自然重新成为最新——按 id 排序就是正确的时序语义
         query = text(
             """
             SELECT payload FROM graphs WHERE project_id = :pid
@@ -523,3 +587,148 @@ class MySqlRequirementRepository:
         async with self._engine.connect() as conn:
             row = (await conn.execute(query, {"id": task_id})).first()
         return RequirementMap.model_validate_json(row.payload) if row else None
+
+
+class MySqlRuntimeRepository:
+    def __init__(self, engine: AsyncEngine) -> None:
+        self._engine = engine
+
+    def _task(self, row: Row[Any]) -> RuntimeTask:
+        return RuntimeTask(
+            id=row.id,
+            project_id=row.project_id,
+            trace_id=row.trace_id,
+            status=row.status,
+            command=row.command,
+            url=row.url,
+            analysis_id=row.analysis_id,
+            settle_ms=row.settle_ms,
+            created_at=_from_db(row.created_at),
+            started_at=_from_db(row.started_at),
+            finished_at=_from_db(row.finished_at),
+            error_code=row.error_code,
+            error_message=row.error_message,
+            component_count=row.component_count,
+            network_count=row.network_count,
+            console_count=row.console_count,
+            interaction_count=row.interaction_count,
+        )
+
+    async def add_task(self, task: RuntimeTask) -> RuntimeTask:
+        query = text(
+            """
+            INSERT INTO runtime_tasks
+              (id, project_id, trace_id, status, command, url, analysis_id, settle_ms, created_at)
+            VALUES
+              (:id, :pid, :tid, 'queued', :command, :url, :aid, :settle_ms, :created_at)
+            """
+        )
+        async with self._engine.begin() as conn:
+            await conn.execute(
+                query,
+                {
+                    "id": task.id,
+                    "pid": task.project_id,
+                    "tid": task.trace_id,
+                    "command": task.command,
+                    "url": task.url,
+                    "aid": task.analysis_id,
+                    "settle_ms": task.settle_ms,
+                    "created_at": _to_db(task.created_at),
+                },
+            )
+        return task
+
+    async def get_task(self, task_id: str) -> RuntimeTask | None:
+        query = text("SELECT * FROM runtime_tasks WHERE id = :id")
+        async with self._engine.connect() as conn:
+            row = (await conn.execute(query, {"id": task_id})).first()
+        return self._task(row) if row else None
+
+    async def update_task(self, task: RuntimeTask) -> RuntimeTask:
+        query = text(
+            """
+            UPDATE runtime_tasks
+            SET status = :status, started_at = :started_at, finished_at = :finished_at,
+                error_code = :error_code, error_message = :error_message,
+                component_count = :component_count, network_count = :network_count,
+                console_count = :console_count, interaction_count = :interaction_count
+            WHERE id = :id
+            """
+        )
+        async with self._engine.begin() as conn:
+            await conn.execute(
+                query,
+                {
+                    "id": task.id,
+                    "status": task.status,
+                    "started_at": _to_db(task.started_at) if task.started_at else None,
+                    "finished_at": _to_db(task.finished_at) if task.finished_at else None,
+                    "error_code": task.error_code,
+                    "error_message": task.error_message,
+                    "component_count": task.component_count,
+                    "network_count": task.network_count,
+                    "console_count": task.console_count,
+                    "interaction_count": task.interaction_count,
+                },
+            )
+        return task
+
+    async def list_by_project(self, project_id: str) -> list[RuntimeTask]:
+        query = text(
+            "SELECT * FROM runtime_tasks WHERE project_id = :pid ORDER BY created_at DESC"
+        )
+        async with self._engine.connect() as conn:
+            rows = (await conn.execute(query, {"pid": project_id})).all()
+        return [self._task(row) for row in rows]
+
+    async def save_trace(self, trace: RuntimeTrace) -> None:
+        query = text(
+            """
+            INSERT INTO runtime_traces (trace_id, project_id, analysis_id, payload, created_at)
+            VALUES (:tid, :pid, :aid, :payload, :created_at)
+            ON DUPLICATE KEY UPDATE payload = VALUES(payload),
+              analysis_id = VALUES(analysis_id)
+            """
+        )
+        async with self._engine.begin() as conn:
+            await conn.execute(
+                query,
+                {
+                    "tid": trace.traceId,
+                    "pid": trace.projectId,
+                    "aid": trace.analysisId,
+                    "payload": trace.model_dump_json(exclude_none=True),
+                    "created_at": _to_db(datetime.now(UTC)),
+                },
+            )
+
+    async def get_trace(self, trace_id: str) -> RuntimeTrace | None:
+        query = text("SELECT payload FROM runtime_traces WHERE trace_id = :tid")
+        async with self._engine.connect() as conn:
+            row = (await conn.execute(query, {"tid": trace_id})).first()
+        return RuntimeTrace.model_validate_json(row.payload) if row else None
+
+    async def get_trace_by_task(self, task_id: str) -> RuntimeTrace | None:
+        # 两跳：task → trace_id → trace；task 行在建任务时就携带 trace_id
+        query = text(
+            """
+            SELECT t.payload FROM runtime_tasks k
+            JOIN runtime_traces t ON t.trace_id = k.trace_id
+            WHERE k.id = :id
+            """
+        )
+        async with self._engine.connect() as conn:
+            row = (await conn.execute(query, {"id": task_id})).first()
+        return RuntimeTrace.model_validate_json(row.payload) if row else None
+
+    async def get_latest_trace(self, project_id: str) -> RuntimeTrace | None:
+        query = text(
+            """
+            SELECT payload FROM runtime_traces WHERE project_id = :pid
+            ORDER BY created_at DESC LIMIT 1
+            """
+        )
+        async with self._engine.connect() as conn:
+            row = (await conn.execute(query, {"pid": project_id})).first()
+        return RuntimeTrace.model_validate_json(row.payload) if row else None

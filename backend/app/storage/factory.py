@@ -10,17 +10,20 @@ from app.storage.memory import (
     create_analysis_repository,
     create_project_repository,
     create_requirement_repository,
+    create_runtime_repository,
 )
 from app.storage.mysql import (
     MySqlAnalysisRepository,
     MySqlProjectRepository,
     MySqlRequirementRepository,
+    MySqlRuntimeRepository,
     create_engine_from_url,
     init_schema,
     run_boot_recovery,
 )
 from app.storage.repositories import AnalysisRepository, ProjectRepository
 from app.storage.requirement import RequirementRepository
+from app.storage.runtime import RuntimeRepository
 
 logger = logging.getLogger(__name__)
 
@@ -30,6 +33,7 @@ class Storage:
     projects: ProjectRepository
     analyses: AnalysisRepository
     requirements: RequirementRepository
+    runtimes: RuntimeRepository
     engine: AsyncEngine | None = None  # memory 分支为 None
 
 
@@ -40,12 +44,14 @@ def create_storage(settings: Settings) -> Storage:
             projects=create_project_repository(),
             analyses=create_analysis_repository(),
             requirements=create_requirement_repository(),
+            runtimes=create_runtime_repository(),
         )
     engine = create_engine_from_url(settings)
     return Storage(
         projects=MySqlProjectRepository(engine),
         analyses=MySqlAnalysisRepository(engine),
         requirements=MySqlRequirementRepository(engine),
+        runtimes=MySqlRuntimeRepository(engine),
         engine=engine,
     )
 

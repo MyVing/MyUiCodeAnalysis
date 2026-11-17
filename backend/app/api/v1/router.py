@@ -9,6 +9,7 @@ from app.api.v1 import (
     plugins,
     projects,
     requirements,
+    runtime,
     source,
     tasks,
 )
@@ -21,4 +22,5 @@ api_router.include_router(analyses.router)
 api_router.include_router(tasks.router)
 api_router.include_router(plugins.router)
 api_router.include_router(requirements.router)
+api_router.include_router(runtime.router)
 api_router.include_router(source.router)

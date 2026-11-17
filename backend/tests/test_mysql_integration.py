@@ -17,6 +17,7 @@ from app.storage.mysql import (
     MySqlAnalysisRepository,
     MySqlProjectRepository,
     MySqlRequirementRepository,
+    MySqlRuntimeRepository,
     init_schema,
     run_boot_recovery,
 )
@@ -26,7 +27,15 @@ pytestmark = pytest.mark.skipif(
     reason="MySQL 集成测试需设置 APP_MYSQL_INTEGRATION=1 与 APP_TEST_DB_URL",
 )
 
-TABLES = ("requirement_maps", "requirement_tasks", "graphs", "analysis_tasks", "projects")
+TABLES = (
+    "runtime_traces",
+    "runtime_tasks",
+    "requirement_maps",
+    "requirement_tasks",
+    "graphs",
+    "analysis_tasks",
+    "projects",
+)
 
 
 @pytest.fixture
@@ -201,6 +210,55 @@ async def test_requirement_task_and_map(engine) -> None:
     assert by_task is not None
     assert by_task.requirementId == "req_test000001"
     assert await requirements.get_map_by_task("rtask_missing") is None
+
+
+async def test_runtime_task_and_trace(engine) -> None:
+    from app.schemas import RuntimeTask
+    from tests.fakes import mini_trace
+
+    projects = MySqlProjectRepository(engine)
+    runtimes = MySqlRuntimeRepository(engine)
+    await projects.add(_project())
+
+    task = RuntimeTask(
+        id="collect_test0001",
+        project_id="prj_test000001",
+        trace_id="trace_test0001",
+        status="queued",
+        command="npm run dev",
+        analysis_id="an_test000001",
+        settle_ms=1500,
+        created_at=datetime.now(UTC),
+    )
+    await runtimes.add_task(task)
+
+    running = task.model_copy(update={"status": "running", "started_at": datetime.now(UTC)})
+    await runtimes.update_task(running)
+    trace = mini_trace("trace_test0001", "prj_test000001", "an_test000001")
+    await runtimes.save_trace(trace)
+    done = running.model_copy(
+        update={"status": "succeeded", "finished_at": datetime.now(UTC), "component_count": 1}
+    )
+    await runtimes.update_task(done)
+
+    fetched = await runtimes.get_task("collect_test0001")
+    assert fetched is not None
+    assert fetched.status == "succeeded"
+    assert fetched.settle_ms == 1500
+    assert fetched.component_count == 1
+
+    by_id = await runtimes.get_trace("trace_test0001")
+    assert by_id is not None
+    assert by_id.traceId == "trace_test0001"
+
+    by_task = await runtimes.get_trace_by_task("collect_test0001")
+    assert by_task is not None
+    assert by_task.traceId == "trace_test0001"
+
+    latest = await runtimes.get_latest_trace("prj_test000001")
+    assert latest is not None
+    assert latest.traceId == "trace_test0001"
+    assert await runtimes.get_latest_trace("prj_missing") is None
 
 
 async def test_boot_recovery_marks_running_tasks_failed(engine) -> None:

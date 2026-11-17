@@ -30,6 +30,12 @@ class AnalysisRepository(Protocol):
 
     async def save_graph(self, project_id: str, graph: IRGraph) -> None: ...
 
+    async def save_merged_graph(self, project_id: str, graph: IRGraph) -> None:
+        """保存静态图 + 运行时证据的合并版本；同一 analysisId 多次采集后覆盖。"""
+
     async def get_graph(self, project_id: str, analysis_id: str) -> IRGraph | None: ...
 
-    async def get_latest_graph(self, project_id: str) -> IRGraph | None: ...
+    async def get_merged_graph(self, project_id: str, analysis_id: str) -> IRGraph | None: ...
+
+    async def get_latest_graph(self, project_id: str) -> IRGraph | None:
+        """最新图产物：merged 存在且晚于最新 static 时优先返回 merged。"""

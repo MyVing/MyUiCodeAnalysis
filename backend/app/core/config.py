@@ -24,6 +24,12 @@ class Settings(BaseSettings):
     worker_entry_path: Path | None = None
     worker_timeout_seconds: float = 120.0
 
+    # runtime-worker 子进程：采集要托管 dev server + 浏览器，整体超时更宽松
+    runtime_worker_entry_path: Path | None = None
+    runtime_worker_timeout_seconds: float = 300.0
+    # 页面加载后的静默观察窗口（毫秒）：等待被动网络请求落定
+    runtime_settle_ms: int = 3000
+
     # 持久化。db_url 缺省（None）→ 内存存储，重启即清空；
     # 配置后走 MySQL，例如：
     #   APP_DB_URL=mysql+aiomysql://user:password@127.0.0.1:3306/uicodeanalysis?charset=utf8mb4
@@ -63,6 +69,14 @@ def resolve_worker_entry(settings: Settings) -> Path:
         return Path(settings.worker_entry_path)
     repo_root = Path(__file__).resolve().parents[3]
     return repo_root / "workers" / "ast-worker" / "dist" / "index.js"
+
+
+def resolve_runtime_worker_entry(settings: Settings) -> Path:
+    """解析 runtime-worker 入口；锚定规则与 ast-worker 一致。"""
+    if settings.runtime_worker_entry_path is not None:
+        return Path(settings.runtime_worker_entry_path)
+    repo_root = Path(__file__).resolve().parents[3]
+    return repo_root / "workers" / "runtime-worker" / "dist" / "index.js"
 
 
 @lru_cache
