@@ -79,3 +79,35 @@ export interface AnalysisTask {
 export interface AnalysisTaskList {
   items: AnalysisTask[];
 }
+
+/** 运行时采集的输入：command（托管启动 dev server）与 url（已运行页面）二选一 */
+export interface RuntimeStart {
+  command?: string;
+  url?: string;
+  analysisId?: string;
+  settleMs?: number;
+}
+
+export interface RuntimeTask {
+  id: string;
+  projectId: string;
+  traceId: string;
+  status: TaskStatus;
+  command?: string | null;
+  url?: string | null;
+  analysisId?: string | null;
+  settleMs?: number | null;
+  createdAt: string;
+  startedAt?: string | null;
+  finishedAt?: string | null;
+  errorCode?: string | null;
+  errorMessage?: string | null;
+  componentCount?: number | null;
+  networkCount?: number | null;
+  consoleCount?: number | null;
+  interactionCount?: number | null;
+}
+
+export interface RuntimeTaskList {
+  items: RuntimeTask[];
+}

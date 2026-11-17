@@ -40,3 +40,15 @@ export const useAnalysisTask = (taskId: string | null) =>
       return status === "queued" || status === "running" ? 1000 : false;
     },
   });
+
+/** 轮询运行时采集任务：与分析任务同一节奏（托管 dev server + 浏览器，采集更慢） */
+export const useRuntimeTask = (taskId: string | null) =>
+  useQuery({
+    queryKey: ["runtime-tasks", taskId],
+    queryFn: () => api.getRuntimeTask(taskId as string),
+    enabled: taskId !== null,
+    refetchInterval: (query) => {
+      const status = query.state.data?.status;
+      return status === "queued" || status === "running" ? 1000 : false;
+    },
+  });

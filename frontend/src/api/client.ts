@@ -1,4 +1,4 @@
-import type { IRGraph } from "@uicodeanalysis/contracts";
+import type { IRGraph, RuntimeTrace } from "@uicodeanalysis/contracts";
 import type {
   AnalysisStart,
   AnalysisTask,
@@ -7,6 +7,9 @@ import type {
   PluginList,
   Project,
   ProjectCreate,
+  RuntimeStart,
+  RuntimeTask,
+  RuntimeTaskList,
 } from "@/api/types";
 
 const API_BASE_URL = import.meta.env.VITE_API_BASE_URL ?? "/api/v1";
@@ -74,6 +77,20 @@ export const api = {
 
   listAnalyses: (projectId: string) =>
     request<AnalysisTaskList>(`/projects/${projectId}/analyses`),
+
+  startRuntimeCollect: (projectId: string, payload: RuntimeStart) =>
+    request<RuntimeTask>(`/projects/${projectId}/runtime-traces`, {
+      method: "POST",
+      body: JSON.stringify(payload),
+    }),
+
+  listRuntimeTasks: (projectId: string) =>
+    request<RuntimeTaskList>(`/projects/${projectId}/runtime-traces`),
+
+  getRuntimeTask: (taskId: string) => request<RuntimeTask>(`/runtime-tasks/${taskId}`),
+
+  getRuntimeTrace: (taskId: string) =>
+    request<RuntimeTrace>(`/runtime-tasks/${taskId}/trace`),
 
   listPlugins: (projectId: string) =>
     request<PluginList>(`/projects/${projectId}/plugins`),

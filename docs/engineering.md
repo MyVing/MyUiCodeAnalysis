@@ -145,7 +145,7 @@ tests/fixtures/            验收样本，M1 的分析器以它们为准
 
 ## 与项目文档的对应
 
-设计依据见仓库外层的 `React代码智能分析平台-项目文档-动态方案补充版.md`。当前处于 **P1（MySQL 持久化）完成、P2（运行时采集）待开始** 的状态。
+设计依据见仓库外层的 `React代码智能分析平台-项目文档-动态方案补充版.md`。当前处于 **P2（运行时采集）完成、P3（AI 语义层）待开始** 的状态。
 
 **M1 已完成**：module resolver、组件发现、renders 边、props 展开、hooks / state、API 链路、事件分析、二次封装映射（`ProTable → antd.Table`）、可见文案提取（`attrs.uiText`）；编排层（`AnalysisService` + `SubprocessWorkerRunner`，queued→running→succeeded/failed，错误码 `worker_timeout` / `worker_spawn_failed` / `worker_protocol_error` / `invalid_ir` 全部可见）；前端工作台（触发分析 + 轮询 + 图谱浏览 + 高级选项）。后端 36 个测试、前端 44 个测试、ruff/mypy 全绿，真实 worker E2E 已验证。
 
@@ -161,9 +161,21 @@ tests/fixtures/            验收样本，M1 的分析器以它们为准
 
 下一阶段 **P2 运行时采集**：新建 `workers/runtime-worker`（Node + Playwright），被动采集起步——vite dev server 生命周期托管、React DevTools hook 抓组件树（`_debugSource` 直连 IR）、网络请求记录；产物以 `evidence.source=runtime` 与静态图合并（`kind='merged'`）。P3 语义层（LangGraph + AIOMySQLSaver）要求 MySQL ≥ 8.0.19，本地 3307 实例已满足。
 
+**P2 运行时采集已完成**：契约（`db3fc37`）→ runtime-worker（`221af60`）→ 后端服务与合并图（`b0fa0f2`）→ 前端入口与集成测试（本次提交）。
+
+- **React≥19 的位点降级链是实测结论，不是文档假设**：React 19.1 的 fiber **没有 `_debugSource`**；`_debugTask` 只有 `run()` 没有 `name`（不可用）；`_debugStack` 是 Error 实例，stack 首个应用帧即 JSX 创建位点（`at App (http://localhost:5199/src/App.tsx:23:21)`）。降级链定为 `debug-source`（React≤18 定义位点）→ `debug-stack`（React≥19，跳过 node_modules 帧取第一个应用帧）→ `name-only`，schema enum 三态固定。
+- **Playwright 注入脚本必须用函数形式**：`addInitScript`/`evaluate` 的字符串形式不可靠；被序列化的函数必须自包含（所有 helper 嵌在函数体内），页面上下文里没有闭包变量。
+- **vite 7 的 stdout 端口被 ANSI 粗体码隔开**（`localhost:\e[1m5199`），解析端口前先剥 ANSI 码；`strictPort` 保证「启动失败」显式可见而不是静默换端口。
+- **esbuild/V8 会给对象字面量匿名函数做属性名推断**：`type: function(){}` 的 `name` 是 `"type"`。测试真匿名组件要 `Object.defineProperty(anon, "name", {value:""})`。
+- **合并图是证据增量，不是新节点**（`app/runtime/merge.py` 纯函数）：运行时组件树按「文件+组件名」对上静态节点后追加 `evidence.source=runtime`；置信度 file+name 双证 0.9 / 仅 file 0.8 / 仅 name 0.7；对不上号的记 `runtime_component_unmatched` info 告警。**不编造节点与边**——与静态分析同一立场。
+- 图产物支持 `kind='merged'`（复合键 `kind:analysisId` + 覆盖写）：合并图按写入时序排在对应 static 之后，`get_latest_graph` 按 id 排序天然 merged 优先；之后若又跑新分析，static 自然重新成为最新。
+- 后端任务编排与 requirement 同构（`RuntimeService`，queued→running→succeeded/failed，前置校验同步拒绝：缺启动来源 409 / 根路径缺失 409 / 指定分析产物不存在 404）；`SubprocessRuntimeRunner` 与 ast-worker 同一套 stdin/stdout JSON 协议，失败区分 worker 自报错 / 超时 / 协议错误 / 产物不符契约。
+- MySQL 新增 `runtime_tasks` / `runtime_traces` 双表；boot recovery 覆盖全部三类任务表（统一循环 UPDATE）。
+- 前端工作台新增「运行时采集」入口（启动命令 / 页面地址 / 静默观察窗口），采集完成自动刷新合并图，节点详情可见 runtime 证据。
+- 验证：backend 84 单测全绿；MySQL 集成 8 passed（`APP_MYSQL_INTEGRATION` 门控）；**真实 Playwright 采集集成 3 passed**（`APP_RUNTIME_INTEGRATION` 门控，url 与 command 托管两条路径 + 真实 trace 合并，约 24s）；前端 53、ast-worker 175、runtime-worker 33 测试全绿。
+
 **待完成**：
 - 路由 / 页面节点（`NodeKind.route` 已预留但无分析器产出）
 - 需求映射层（`AnalysisStart.requirement` 已预留但编排层未消费）
-- **持久化**：用户已确认放弃内存存储，采用 MySQL（拒绝 SQLite）；tasks/graphs 落库、重启恢复（boot 时 running→failed）；M3 LangGraph checkpointer 复用同一数据库
-- **M2 运行时采集**：新建 `workers/runtime-worker`（Node + Playwright），被动采集起步——启动 vite dev server、加载页面、经 React DevTools 协议抓组件树、记录网络请求（URL/方法/状态码），不自动点击遍历；运行时证据以 `evidence.source=runtime` 并入 IR
-- **M3 AI 语义层**：需求→组件映射、影响面解释、回归建议；LangGraph 编排，checkpointer 使用同一 MySQL/数据库；LLM provider 进 Settings
+- **P3 AI 语义层**：需求→组件映射、影响面解释、回归建议；LangGraph 编排（checkpointer 使用同一 MySQL 3307 实例），LLM provider 进 Settings
+- 运行时增强（可选）：交互主动遍历、Console/网络与节点的关联深化

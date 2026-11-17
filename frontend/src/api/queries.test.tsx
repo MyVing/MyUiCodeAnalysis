@@ -4,12 +4,13 @@ import { createElement, type ReactNode } from "react";
 import { afterEach, describe, expect, it, vi } from "vitest";
 
 import { api } from "@/api/client";
-import { useAnalysisTask } from "@/api/queries";
-import type { AnalysisTask } from "@/api/types";
+import { useAnalysisTask, useRuntimeTask } from "@/api/queries";
+import type { AnalysisTask, RuntimeTask } from "@/api/types";
 
 vi.mock("@/api/client", () => ({
   api: {
     getTask: vi.fn(),
+    getRuntimeTask: vi.fn(),
   },
 }));
 
@@ -71,5 +72,50 @@ describe("useAnalysisTask", () => {
     renderHook(() => useAnalysisTask(null), { wrapper: makeWrapper() });
 
     expect(api.getTask).not.toHaveBeenCalled();
+  });
+});
+
+function makeRuntimeTask(status: RuntimeTask["status"]): RuntimeTask {
+  return {
+    id: "collect_1",
+    projectId: "prj_1",
+    traceId: "trace_1",
+    status,
+    createdAt: new Date().toISOString(),
+  };
+}
+
+describe("useRuntimeTask", () => {
+  afterEach(() => {
+    vi.clearAllMocks();
+  });
+
+  it("polls while collecting and stops at a terminal state", async () => {
+    vi.mocked(api.getRuntimeTask)
+      .mockResolvedValueOnce(makeRuntimeTask("queued"))
+      .mockResolvedValue(makeRuntimeTask("succeeded"));
+
+    const { result } = renderHook(() => useRuntimeTask("collect_1"), {
+      wrapper: makeWrapper(),
+    });
+
+    await waitFor(() => expect(result.current.data?.status).toBe("queued"));
+    expect(api.getRuntimeTask).toHaveBeenCalledTimes(1);
+
+    await waitFor(
+      () => expect(result.current.data?.status).toBe("succeeded"),
+      { timeout: 3000 },
+    );
+    const callsAfterFinal = vi.mocked(api.getRuntimeTask).mock.calls.length;
+
+    // 终态后不再轮询
+    await new Promise((resolve) => setTimeout(resolve, 1200));
+    expect(api.getRuntimeTask).toHaveBeenCalledTimes(callsAfterFinal);
+  }, 15000);
+
+  it("does not fetch when taskId is null", () => {
+    renderHook(() => useRuntimeTask(null), { wrapper: makeWrapper() });
+
+    expect(api.getRuntimeTask).not.toHaveBeenCalled();
   });
 });
