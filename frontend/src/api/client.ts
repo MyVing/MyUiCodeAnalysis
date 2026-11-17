@@ -1,4 +1,4 @@
-import type { IRGraph, RuntimeTrace } from "@uicodeanalysis/contracts";
+import type { IRGraph, RequirementMap, RuntimeTrace } from "@uicodeanalysis/contracts";
 import type {
   AnalysisStart,
   AnalysisTask,
@@ -7,6 +7,9 @@ import type {
   PluginList,
   Project,
   ProjectCreate,
+  RequirementLocateStart,
+  RequirementTask,
+  RequirementTaskList,
   RuntimeStart,
   RuntimeTask,
   RuntimeTaskList,
@@ -94,4 +97,18 @@ export const api = {
 
   listPlugins: (projectId: string) =>
     request<PluginList>(`/projects/${projectId}/plugins`),
+
+  startRequirementLocate: (projectId: string, payload: RequirementLocateStart) =>
+    request<RequirementTask>(`/projects/${projectId}/requirements`, {
+      method: "POST",
+      body: JSON.stringify(payload),
+    }),
+
+  listRequirementTasks: (projectId: string) =>
+    request<RequirementTaskList>(`/projects/${projectId}/requirements`),
+
+  getRequirementTask: (taskId: string) => request<RequirementTask>(`/requirements/${taskId}`),
+
+  getRequirementMap: (taskId: string) =>
+    request<RequirementMap>(`/requirements/${taskId}/map`),
 };

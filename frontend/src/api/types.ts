@@ -1,3 +1,5 @@
+import type { RequirementMap } from "@uicodeanalysis/contracts";
+
 export type Framework = "react" | "next";
 
 export type StorageBackend = "memory" | "mysql";
@@ -111,3 +113,34 @@ export interface RuntimeTask {
 export interface RuntimeTaskList {
   items: RuntimeTask[];
 }
+
+/** 需求定位输入：dryRun=true 只跑确定性召回（不调模型） */
+export interface RequirementLocateStart {
+  requirement: string;
+  dryRun: boolean;
+  analysisId?: string;
+}
+
+export interface RequirementTask {
+  id: string;
+  projectId: string;
+  requirementId: string;
+  status: TaskStatus;
+  dryRun: boolean;
+  requirement: string;
+  analysisId?: string | null;
+  createdAt: string;
+  startedAt?: string | null;
+  finishedAt?: string | null;
+  errorCode?: string | null;
+  errorMessage?: string | null;
+  candidateCount?: number | null;
+  matchCount?: number | null;
+  warningCount?: number | null;
+}
+
+export interface RequirementTaskList {
+  items: RequirementTask[];
+}
+
+export type RequirementMapArtifact = RequirementMap;

@@ -52,3 +52,15 @@ export const useRuntimeTask = (taskId: string | null) =>
       return status === "queued" || status === "running" ? 1000 : false;
     },
   });
+
+/** 轮询需求定位任务：模型判定比确定性召回慢，同样按秒轮询 */
+export const useRequirementTask = (taskId: string | null) =>
+  useQuery({
+    queryKey: ["requirement-tasks", taskId],
+    queryFn: () => api.getRequirementTask(taskId as string),
+    enabled: taskId !== null,
+    refetchInterval: (query) => {
+      const status = query.state.data?.status;
+      return status === "queued" || status === "running" ? 1000 : false;
+    },
+  });

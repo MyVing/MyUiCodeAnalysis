@@ -18,6 +18,7 @@ import { useAnalysisTask, useProject, useProjectGraph, useRuntimeTask } from "@/
 import type { AnalysisStart, Framework, RuntimeStart } from "@/api/types";
 import { GraphSidebar } from "@/components/GraphSidebar";
 import { NodeInspector } from "@/components/NodeInspector";
+import { RequirementPanel } from "@/components/RequirementPanel";
 import { WarningsBanner } from "@/components/WarningsBanner";
 import { GraphCanvas } from "@/graph/GraphCanvas";
 import type { NodeKind } from "@uicodeanalysis/contracts";
@@ -455,6 +456,14 @@ export default function WorkbenchPage() {
 
       {/* sample 横幅说明"这是假数据"，warnings 说明"分析过程出了问题"，两者独立 */}
       <WarningsBanner warnings={graph?.warnings ?? []} />
+
+      {graph && !graph.meta?.sample && (
+        <RequirementPanel
+          projectId={projectId}
+          analysisId={graph.analysisId}
+          onSelectNode={setSelectedNodeId}
+        />
+      )}
 
       <div className="flex min-h-0 flex-1">
         <aside className="hidden w-64 shrink-0 flex-col border-r border-slate-200 bg-white lg:flex">
