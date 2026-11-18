@@ -315,9 +315,9 @@ class Match(BaseModel):
     confidence: Annotated[
         float,
         Field(
-            description='AI 推断的落库置信度，硬上限 0.6；模型自报的更高值不得透传',
+            description='结论置信度。AI 推断（source=ai）硬上限 0.6，模型自报的更高值不得透传；锚点直连（source=static，6.13）不受 0.6 约束：精确命中 0.95、模糊命中 0.85',
             ge=0.0,
-            le=0.6,
+            le=1.0,
         ),
     ]
     modelConfidence: Annotated[
@@ -342,7 +342,7 @@ class Match(BaseModel):
     source: Annotated[
         Source,
         Field(
-            description='结论来源。当前 AI 判定结果为 ai；确定性证据的真实来源记录在 verifiedEvidence.source'
+            description='结论来源。锚点直连（6.13）为 static；AI 判定为 ai；确定性证据的真实来源记录在 verifiedEvidence.source'
         ),
     ]
 

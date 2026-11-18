@@ -1,0 +1,447 @@
+"""锚点抽取与直连（技术设计 6.13 第二、三步）：先结构化，再语义。
+
+需求文档里的路由、接口、组件名、字段名是最可靠的定位信息，不该被当成普通
+中文词交给模型猜。本模块在拆解之后、召回之前做两件事：
+
+1. **锚点抽取**（零模型、纯规则）：从功能点文本里按确定性规则抽出结构化锚点，
+   每个锚点记录 kind / raw / normalized / 字符偏移。抽取宁缺毋滥——把文件路径
+   误当路由、把普通英文单词误当字段，都会制造高置信度误匹配，因此：
+   - 接口锚点要求显式 method（`GET /api/users`），裸 URL 不认；
+   - 路由锚点只认引号 / 反引号包裹的 `/xxx`，且排除文件扩展名结尾；
+   - 组件锚点只认 `<X />` 形态与引号内的 PascalCase；
+   - 字段锚点只认引号内的 camelCase / snake_case，单个小写词（`id`）不认。
+2. **锚点直连**：精确命中图上的节点即产出 `Match`（source=static），
+   置信度按 6.13 分档：精确 0.95、模糊（URL 后缀）0.85。找不到对应节点时记
+   `anchor_unresolved` 降级为普通文本，不硬凑。
+
+直连结果进产物后，**被锚点覆盖的功能点不再进模型**（第四步语义残差）：模型
+只能补充锚点未覆盖的功能点。这样大量带接口 / 页面路径的需求根本不需要模型。
+
+置信度复用 `app.ir.api_usage` 的反向索引：接口锚点沿 `requests`/`calls`/… 反向
+走到页面，置信度沿路径取最小值再乘锚点系数——跨节点路径不是语法事实，每多
+一跳多一分符号推断成分，「静态恒为 1.0」的说法不适用于这条链路。
+"""
+
+from __future__ import annotations
+
+import re
+from collections import defaultdict
+from collections.abc import Sequence
+from dataclasses import dataclass
+from enum import StrEnum
+
+from app.contracts import (
+    EdgeKind,
+    IRGraph,
+    IRNode,
+    NodeKind,
+    Source,
+    VerifiedEvidence,
+)
+from app.contracts.requirement import Location, Match, RequirementWarning, Severity
+from app.ir.api_usage import ApiUsageIndex, normalize_url
+from app.requirement.features import DecomposedFeature
+from app.requirement.recall import collect_page_evidences, page_nodes
+from app.requirement.subgraph import build_subgraph
+
+# 精确锚点（6.13 第三步）：method + path 都对上，或路由 / 组件 / 字段唯一命中
+_ANCHOR_EXACT = 0.95
+
+# 锚点可信度依赖「图上的节点确实对得上」，静态证据恒为 1.0 的档位语义在这里
+# 不适用：直连是跨节点结论，统一给 0.95 而不是 1.0。
+
+# URL 归一化里占位段统一成 :param；路由锚点与接口锚点共用同一套规则，
+# 与 ast-worker 的 normalizeUrlText 保持一致（见 api_usage.py 的说明）。
+
+# 接口锚点：method + 紧随的路径或完整 URL。字符类排除空白、引号与中英文标点，
+# 让 `GET /api/users，` 这类行尾标点不被吃进路径。lookbehind 只挡 ASCII 字母
+# （「budget」里不含 GET），不挡中文——「调用GET /api/users」这种紧邻写法必须认。
+_API_RE = re.compile(
+    r"(?<![A-Za-z])(GET|POST|PUT|PATCH|DELETE|HEAD|OPTIONS)\s+"
+    r"([^\s`'\"“”「」『』，。；、！？：（）()]+)",
+    re.IGNORECASE,
+)
+
+# 引号 / 反引号包裹的内容：路由、组件、文件、字段都只从这里认，裸文本不认
+_QUOTED_RE = re.compile(r"`([^`\n]+)`|「([^」\n]+)」|“([^”\n]+)”|«([^»\n]+)»")
+
+# JSX 组件：`<UserList ` / `<UserList>` / `<UserList />`
+_JSX_RE = re.compile(r"<([A-Z][A-Za-z0-9]*)[\s/>]")
+
+# 路由形态：/ 开头，只含路径常见字符；文件结尾（.tsx 等）排除
+_ROUTE_SHAPE_RE = re.compile(r"^/[A-Za-z0-9_\-./:*$\[\]{}]+$")
+_FILE_TAIL_RE = re.compile(r"\.[A-Za-z]{1,5}$")
+
+# 文件锚点：以 .ts/.tsx/.js/.jsx 结尾的相对路径
+_FILE_RE = re.compile(r"^[A-Za-z0-9_][A-Za-z0-9_./\\-]*\.(?:tsx|jsx|ts|js)$")
+
+# 组件锚点：PascalCase 整词
+_PASCAL_RE = re.compile(r"^[A-Z][A-Za-z0-9]*$")
+
+# 字段锚点：camelCase（至少一个驼峰）或 snake_case（至少一个下划线）
+_CAMEL_RE = re.compile(r"^[a-z]+(?:[A-Z][a-z0-9]+)+$")
+_SNAKE_RE = re.compile(r"^[a-z][a-z0-9]*(?:_[a-z0-9]+)+$")
+
+
+class AnchorKind(StrEnum):
+    api = "api"
+    route = "route"
+    component = "component"
+    file = "file"
+    field = "field"
+
+
+@dataclass(frozen=True)
+class Anchor:
+    """一个结构化锚点。charRange 相对所属功能点文本，供证据回跳需求原文。"""
+
+    kind: AnchorKind
+    raw: str
+    normalized: str
+    start: int
+    end: int
+
+
+@dataclass
+class AnchorOutcome:
+    """直连结果：锚点产出的 matches + 告警 + 已覆盖的功能点 id。"""
+
+    matches: list[Match]
+    warnings: list[RequirementWarning]
+    covered: frozenset[str]
+
+    @classmethod
+    def empty(cls) -> AnchorOutcome:
+        return cls(matches=[], warnings=[], covered=frozenset())
+
+
+def extract_anchors(text: str) -> list[Anchor]:
+    """从功能点文本抽出确定性锚点，按 (kind, normalized) 去重、按出现位置排序。"""
+    anchors: list[Anchor] = []
+    seen: set[tuple[AnchorKind, str]] = set()
+
+    def add(kind: AnchorKind, raw: str, normalized: str, start: int, end: int) -> None:
+        key = (kind, normalized)
+        if key in seen:
+            return
+        seen.add(key)
+        anchors.append(Anchor(kind=kind, raw=raw, normalized=normalized, start=start, end=end))
+
+    for match in _API_RE.finditer(text):
+        method = match.group(1).upper()
+        token = match.group(2).rstrip(".,;:")
+        # 只认路径（/api/users）或带 origin 的完整 URL（https://x.com/api/users）；
+        # `GET users` 这种缺斜杠的写法不是接口引用，不硬凑
+        if not token.startswith("/") and "://" not in token:
+            continue
+        normalized = normalize_url(token)
+        if normalized is None:
+            continue
+        raw = f"{method} {token}"
+        add(AnchorKind.api, raw, f"{method} {normalized}", match.start(), match.start() + len(raw))
+
+    for match in _QUOTED_RE.finditer(text):
+        content = next((group for group in match.groups() if group is not None), None)
+        if content is None:
+            continue
+        quoted = content.strip()
+        start = match.start()
+        if quoted.startswith("#"):
+            quoted = quoted[1:].lstrip("/")
+            quoted = f"/{quoted}" if quoted else ""
+        if quoted.startswith("/"):
+            # 排除文件名：`/src/pages/UserList.tsx` 是文件路径不是路由
+            if _FILE_TAIL_RE.search(quoted) or not _ROUTE_SHAPE_RE.match(quoted):
+                continue
+            normalized = normalize_url(quoted)
+            if normalized is not None:
+                add(AnchorKind.route, quoted, normalized, start, match.end())
+            continue
+        if _FILE_RE.match(quoted):
+            normalized = quoted.replace("\\", "/").lstrip("./")
+            add(AnchorKind.file, quoted, normalized, start, match.end())
+            continue
+        if _PASCAL_RE.match(quoted):
+            add(AnchorKind.component, quoted, quoted, start, match.end())
+            continue
+        if _CAMEL_RE.match(quoted) or _SNAKE_RE.match(quoted):
+            add(AnchorKind.field, quoted, quoted, start, match.end())
+
+    for match in _JSX_RE.finditer(text):
+        name = match.group(1)
+        add(AnchorKind.component, name, name, match.start(), match.end())
+
+    anchors.sort(key=lambda anchor: (anchor.start, anchor.end))
+    return anchors
+
+
+def anchor_direct_connect(
+    graph: IRGraph, features: Sequence[DecomposedFeature]
+) -> AnchorOutcome:
+    """把功能点里的锚点直连到图上节点，产出 source=static 的确定性匹配。
+
+    纯函数、零模型：dry-run 与模型不可用时它照常工作——这正是 6.13「先结构化，
+    再语义」的意义，锚点结论不依赖任何模型可用性。
+    """
+    anchors_by_feature = {feature.id: extract_anchors(feature.text) for feature in features}
+    if not any(anchors_by_feature.values()):
+        return AnchorOutcome.empty()
+
+    index = ApiUsageIndex(graph)
+    pages, route_by_page, layout_ids = page_nodes(graph)
+    page_ids = {page.id for page in pages}
+    nodes_by_id = {node.id: node for node in graph.nodes}
+
+    routes_by_path = _route_index(graph, nodes_by_id)
+    pages_by_route = _route_pages(graph, nodes_by_id)
+    components_by_name, components_by_file = _component_index(graph)
+    field_pages = _field_index(graph, pages, layout_ids)
+
+    matches: list[Match] = []
+    warnings: list[RequirementWarning] = []
+
+    def emit(feature_id: str, anchor: Anchor, page_id: str, route_id: str | None) -> None:
+        matches.append(
+            _match(
+                graph,
+                nodes_by_id,
+                feature_id,
+                anchor,
+                page_id=page_id,
+                route_id=route_id,
+                confidence=_ANCHOR_EXACT,
+            )
+        )
+
+    for feature in features:
+        for anchor in anchors_by_feature.get(feature.id, []):
+            if anchor.kind is AnchorKind.api:
+                method, _, path = anchor.normalized.partition(" ")
+                # 先精确（method + path 对上，0.95）；精确没有再试后缀（0.85 档，
+                # 由 ApiUsageIndex 的锚点系数落到置信度里）
+                lookup = index.lookup(method=method, url=path, match="exact")
+                if not lookup.pages:
+                    lookup = index.lookup(method=method, url=path, match="suffix")
+                if not lookup.pages:
+                    warnings.append(_unresolved(feature.id, anchor))
+                    continue
+                warnings.extend(lookup.warnings)
+                for hit in lookup.pages:
+                    matches.append(
+                        _match(
+                            graph,
+                            nodes_by_id,
+                            feature.id,
+                            anchor,
+                            page_id=hit.page_node_id,
+                            route_id=hit.route_node_id,
+                            # 置信度由反向索引给出：沿路径最小值 × 锚点系数
+                            # （精确 0.95 / 后缀 0.85），不在这一层重复加工
+                            confidence=hit.confidence,
+                            path_node_ids=hit.path,
+                        )
+                    )
+            elif anchor.kind is AnchorKind.route:
+                route_id = routes_by_path.get(anchor.normalized)
+                page_ids_of_route = pages_by_route.get(route_id or "", []) if route_id else []
+                if not page_ids_of_route:
+                    warnings.append(_unresolved(feature.id, anchor))
+                    continue
+                for page_id in page_ids_of_route:
+                    emit(feature.id, anchor, page_id, route_id)
+            elif anchor.kind in (AnchorKind.component, AnchorKind.file):
+                node_id = (
+                    components_by_file.get(anchor.normalized)
+                    if anchor.kind is AnchorKind.file
+                    else components_by_name.get(anchor.normalized)
+                )
+                if node_id is None or node_id not in page_ids:
+                    warnings.append(_unresolved(feature.id, anchor))
+                    continue
+                emit(feature.id, anchor, node_id, route_by_page.get(node_id))
+            elif anchor.kind is AnchorKind.field:
+                hits = field_pages.get(anchor.normalized, set())
+                if len(hits) > 1:
+                    warnings.append(
+                        RequirementWarning(
+                            code="anchor_ambiguous",
+                            severity=Severity.info,
+                            message=(
+                                f"字段 {anchor.normalized} 出现在 {len(hits)} 个页面的 "
+                                f"props / 文案里，无法唯一归属，已降级为普通检索词"
+                            ),
+                            featureId=feature.id,
+                        )
+                    )
+                elif hits:
+                    page_id = next(iter(hits))
+                    emit(feature.id, anchor, page_id, route_by_page.get(page_id))
+                # 一个页面都没命中时不告警：字段是 best-effort 识别，
+                # 未命中只能说明它不是 props / 文案层面的标识，保持沉默
+
+    deduped = _dedupe_matches(matches)
+    covered = frozenset(match.featureId for match in deduped)
+    return AnchorOutcome(matches=deduped, warnings=warnings, covered=covered)
+
+
+def _route_index(graph: IRGraph, nodes_by_id: dict[str, IRNode]) -> dict[str, str]:
+    """归一化路径 → route 节点 id。attrs.path 缺省时退回节点名（即路径）。"""
+    routes: dict[str, str] = {}
+    for node in graph.nodes:
+        if node.kind is not NodeKind.route:
+            continue
+        path = node.attrs.get("path") or node.name
+        if isinstance(path, str) and (normalized := normalize_url(path)):
+            routes.setdefault(normalized, node.id)
+    return routes
+
+
+def _route_pages(graph: IRGraph, nodes_by_id: dict[str, IRNode]) -> dict[str, list[str]]:
+    """route → 渲染的页面组件（布局复用时一个路由可挂多个页面）。"""
+    by_route: dict[str, list[str]] = defaultdict(list)
+    for edge in graph.edges:
+        if edge.kind is not EdgeKind.renders:
+            continue
+        source = nodes_by_id.get(edge.from_)
+        target = nodes_by_id.get(edge.to)
+        if (
+            source is not None
+            and source.kind is NodeKind.route
+            and target is not None
+            and target.kind in (NodeKind.component, NodeKind.server_component)
+        ):
+            by_route[source.id].append(target.id)
+    return dict(by_route)
+
+
+def _component_index(graph: IRGraph) -> tuple[dict[str, str], dict[str, str]]:
+    """组件名 / 文件 → 组件节点 id。外部组件（第三方）不参与直连。"""
+    by_name: dict[str, str] = {}
+    by_file: dict[str, str] = {}
+    for node in graph.nodes:
+        if node.kind not in (NodeKind.component, NodeKind.server_component):
+            continue
+        if node.attrs.get("external") is True:
+            continue
+        by_name.setdefault(node.name, node.id)
+        if node.file:
+            by_file.setdefault(node.file.replace("\\", "/"), node.id)
+    return by_name, by_file
+
+
+def _field_index(
+    graph: IRGraph, pages: Sequence[IRNode], layout_ids: set[str]
+) -> dict[str, set[str]]:
+    """字段名 → 出现该字段（props / 文案逐字相等）的页面集合。"""
+    hits: dict[str, set[str]] = defaultdict(set)
+    evidences = collect_page_evidences(graph, list(pages), layout_ids)
+    for page_id, items in evidences.items():
+        for item in items:
+            if item.kind.value in ("propName", "uiText") and item.text:
+                hits[item.text].add(page_id)
+    return dict(hits)
+
+
+def _unresolved(feature_id: str, anchor: Anchor) -> RequirementWarning:
+    return RequirementWarning(
+        code="anchor_unresolved",
+        severity=Severity.info,
+        message=(
+            f"需求里的{anchor.kind.value}锚点「{anchor.raw}」在图中没有找到对应节点，"
+            "已降级为普通检索词继续走语义定位"
+        ),
+        featureId=feature_id,
+    )
+
+
+def _match(
+    graph: IRGraph,
+    nodes_by_id: dict[str, IRNode],
+    feature_id: str,
+    anchor: Anchor,
+    *,
+    page_id: str,
+    route_id: str | None,
+    confidence: float,
+    path_node_ids: Sequence[str] = (),
+) -> Match:
+    reason = _REASONS[anchor.kind].format(raw=anchor.raw)
+    evidence_ids = path_node_ids or (
+        (route_id, page_id) if route_id else (page_id,)
+    )
+    evidence = [
+        verified
+        for node_id in evidence_ids[-_MAX_EVIDENCE_NODES:]
+        if (verified := _node_verified(nodes_by_id.get(node_id), anchor.raw)) is not None
+    ]
+    return Match(
+        featureId=feature_id,
+        pageNodeId=page_id,
+        routeId=route_id,
+        confidence=confidence,
+        quote=anchor.raw,
+        reason=reason,
+        subgraph=build_subgraph(graph, page_id, route_id),
+        verifiedEvidence=evidence or None,
+        source=Source.static,
+    )
+
+
+_MAX_EVIDENCE_NODES = 4
+
+_REASONS: dict[AnchorKind, str] = {
+    AnchorKind.api: "锚点直连：需求提到接口 {raw}，沿图中调用链反查到该页面",
+    AnchorKind.route: "锚点直连：需求提到路由 {raw}，图中该路由渲染此页面",
+    AnchorKind.component: "锚点直连：需求提到组件 {raw}，图中它就是该页面",
+    AnchorKind.file: "锚点直连：需求提到文件 {raw}，图中它定义了该页面",
+    AnchorKind.field: "锚点直连：需求提到字段 {raw}，唯一出现在该页面的 props / 文案里",
+}
+
+
+def _node_verified(node: IRNode | None, quote: str) -> VerifiedEvidence | None:
+    """锚点命中节点的可复核坐标：文件、行列、来源都取自 IR，不取规则输出。"""
+    if node is None:
+        return None
+    source = Source.static
+    confidence = 1.0
+    file = node.file
+    loc = node.loc
+    if node.evidence:
+        best = sorted(
+            node.evidence,
+            key=lambda item: (-item.confidence, item.file or "", item.loc.line if item.loc else 0),
+        )[0]
+        source = best.source
+        confidence = best.confidence
+        file = file or best.file
+        loc = loc or best.loc
+    return VerifiedEvidence(
+        nodeId=node.id,
+        quote=quote,
+        file=file,
+        loc=Location(line=loc.line, col=loc.col) if loc is not None else None,
+        via=_via_of(node),
+        source=source,
+        confidence=confidence,
+    )
+
+
+def _via_of(node: IRNode) -> str:
+    if node.kind is NodeKind.element:
+        return "uiText"
+    if node.kind is NodeKind.api:
+        return "apiUrl"
+    return node.kind.value
+
+
+def _dedupe_matches(matches: list[Match]) -> list[Match]:
+    """同一 (功能点, 页面, 路由) 只留一条：置信度最高者优先，平手取先出现者。"""
+    best: dict[tuple[str, str, str | None], Match] = {}
+    for match in matches:
+        key = (match.featureId, match.pageNodeId, match.routeId)
+        current = best.get(key)
+        if current is None or match.confidence > current.confidence:
+            best[key] = match
+    return sorted(
+        best.values(), key=lambda item: (item.featureId, -item.confidence, item.pageNodeId)
+    )

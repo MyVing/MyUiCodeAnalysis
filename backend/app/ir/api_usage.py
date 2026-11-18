@@ -370,13 +370,15 @@ class ApiUsageIndex:
 
 
 def _is_suffix_match(node_url: str, query_url: str) -> bool:
-    """query 是否为 node 的段对齐后缀：/orders 匹配 /api/orders，不匹配 /myorders。"""
+    """query 是否为 node 的段对齐后缀：/orders 匹配 /api/orders，不匹配 /myorders。
+
+    归一化后的 node 恒以 `/` 开头，因此 `endswith` 命中即意味着后缀落在段边界上
+    （/myusers 不以 /orders 结尾）；再单独检查前一个字符反而要求 query 里出现
+    `//`——归一化已折叠双斜杠，那个检查永不成立，会让 0.85 档变成死代码。
+    """
     if len(query_url) <= len(node_url):
         return False
-    if not query_url.endswith(node_url):
-        return False
-    boundary = query_url[len(query_url) - len(node_url) - 1]
-    return boundary == "/"
+    return query_url.endswith(node_url)
 
 
 def _dedupe(pages: list[ApiUsageHit]) -> list[ApiUsageHit]:

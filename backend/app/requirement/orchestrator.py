@@ -1,19 +1,21 @@
-"""LangGraph 编排：decompose → recall → locate → assemble。
+"""LangGraph 编排：decompose → anchor → recall → locate → assemble。
 
 两种模式共用同一张图：
 
-| 模式 | recall | locate |
-| --- | --- | --- |
-| dry-run | 词法召回，产出 candidates | 跳过（模型不参与） |
-| 非 dry-run | 词法召回，产出 candidates + 预筛依据 | 模型从「页面 + 链路」全集里挑 |
+| 模式 | anchor | recall | locate |
+| --- | --- | --- | --- |
+| dry-run | 锚点直连（零模型） | 词法召回，产出 candidates | 跳过（模型不参与） |
+| 非 dry-run | 锚点直连（零模型） | 词法召回 + 预筛依据 | 模型从「页面 + 链路」全集里挑 |
 
-dry-run 的语义不能变：**不调模型，结论只看 candidates**。因此它不是「降级路径」
-而是独立的模式，`dry_run` 一路传到产物里。
+锚点直连（6.13）是零模型的确定性步骤，dry-run 照常产出：锚点覆盖的功能点直接
+落 `matches`（source=static），不再进模型——第四步语义残差只针对未覆盖的功能点。
+dry-run 的「不调模型」语义不变，但结论不再只看 candidates：确定性锚点本来就是
+零模型的，把它排除反而让 dry-run 低估可用结论。
 
-locate 失败（模型不可用 / 输出无效）时 `LocateOutcome.degraded` 为真，产物退化成
-「词法候选 + 显式告警」，任务仍然成功——一次模型抖动不该把用户的分析结果打没。
+locate 失败（模型不可用 / 输出无效）时 `LocateOutcome.degraded` 为真，未覆盖功能点
+退化成「词法候选 + 显式告警」，任务仍然成功——一次模型抖动不该把用户的分析结果打没。
 
-图本身不引入新逻辑：decompose / recall / derive_chains 都是纯确定性函数；
+图本身不引入新逻辑：decompose / anchor / recall / derive_chains 都是纯确定性函数；
 locate 的每次模型调用都有预算上限（`llm_max_calls_per_request`）。任务状态机
 仍由 RequirementLocateService 负责——图管「怎么算」，服务管「算之前和之后」。
 
@@ -35,6 +37,7 @@ from langgraph.graph.state import CompiledStateGraph
 from app.contracts import Feature, IRGraph, RequirementMap, RequirementWarning
 from app.contracts.requirement import Dropped, Match, Severity, Unmatched
 from app.core.config import Settings
+from app.requirement.anchors import AnchorOutcome, anchor_direct_connect
 from app.requirement.chains import derive_chains
 from app.requirement.features import DecomposedFeature, decompose_with_report
 from app.requirement.judge import JudgeOutcome, judge
@@ -52,8 +55,9 @@ from app.requirement.recall import CandidateDetail, RecallResult, recall
 from app.schemas import Project, RequirementTask
 
 # 产物格式版本。1.1 起新增 interactionChains 与 Match.chainId/targets（均可选），
-# 因此旧消费方按 1.0 解析不会崩，但新消费方需要版本号判断是否呈现链路视图。
-SCHEMA_VERSION = "1.1"
+# 1.2 起 matches 可含锚点直连产物（source=static，置信度 0.95/0.85，不受 AI 0.6
+# 封顶约束）。旧消费方按 1.0/1.1 解析不会崩；锚点结论只在 source 字段上与 AI 区分。
+SCHEMA_VERSION = "1.2"
 
 
 class LocateState(TypedDict, total=False):
@@ -65,6 +69,7 @@ class LocateState(TypedDict, total=False):
 
     requirement: str
     features: list[DecomposedFeature]
+    anchor: AnchorOutcome
     decompose_warnings: list[RequirementWarning]
     candidates: list[CandidateDetail]
     recall_warnings: list[RequirementWarning]
@@ -125,6 +130,11 @@ class RequirementOrchestrator:
             result = decompose_with_report(state["requirement"])
             return {"features": result.features, "decompose_warnings": result.warnings}
 
+        async def anchor_node(state: LocateState) -> dict:
+            # 锚点直连（6.13 第三步）：零模型、纯确定性。dry-run 与模型不可用
+            # 时照常工作——这是它区别于 locate 的根本属性。
+            return {"anchor": anchor_direct_connect(graph, state["features"])}
+
         async def recall_node(state: LocateState) -> dict:
             top_k = settings.llm_max_candidates
             results = [recall(graph, feature.terms, top_k=top_k) for feature in state["features"]]
@@ -137,6 +147,13 @@ class RequirementOrchestrator:
         async def locate_node(state: LocateState) -> dict:
             if llm is None:
                 return {}
+            # 语义残差（6.13 第四步）：锚点已覆盖的功能点不再进模型——锚点结论
+            # 是图上事实（0.95/0.85），模型只能补充锚点未覆盖的功能点。
+            anchor = state.get("anchor")
+            covered = anchor.covered if anchor is not None else frozenset()
+            features = [item for item in state["features"] if item.id not in covered]
+            if not features:
+                return {}
             # 链路必须由确定性遍历产出（见 chains.py）：模型只负责「选」。
             # 这里重新推导一次而不缓存，因为推导是纯函数且成本远低于一次模型调用。
             chains = derive_chains(graph)
@@ -146,7 +163,7 @@ class RequirementOrchestrator:
                 # 带 props / 接口等更细的证据，候选也收窄到词法 Top-N。
                 # 这不是降级——页面本来就是合法落点。
                 outcome = await judge(
-                    state["features"],
+                    features,
                     state["candidates"],
                     graph,
                     llm,
@@ -167,7 +184,7 @@ class RequirementOrchestrator:
                 max_pages=settings.llm_max_pages or None,
             )
             locate_outcome = await locate(
-                state["features"],
+                features,
                 index,
                 chains,
                 graph,
@@ -183,16 +200,21 @@ class RequirementOrchestrator:
                 *(state.get("recall_warnings") or []),
             ]
             candidates = list(state.get("candidates") or [])
-            matches: list[Match] = []
+            anchor_outcome = state.get("anchor")
+            # 锚点直连的结论先落 matches（6.13 第五步：锚点结果先落 matches）；
+            # 模型结论只针对未覆盖功能点，两者天然不重叠，不存在抢一个功能点的问题。
+            matches: list[Match] = list(anchor_outcome.matches) if anchor_outcome else []
             dropped: list[Dropped] = []
             unmatched: list[Unmatched] = []
             interaction_chains = None
 
             locate_outcome = state.get("locate")
             judge_outcome = state.get("judge")
+            if anchor_outcome:
+                warnings.extend(anchor_outcome.warnings)
             if locate_outcome is not None:
                 warnings.extend(locate_outcome.warnings)
-                matches = locate_outcome.matches
+                matches.extend(locate_outcome.matches)
                 dropped = locate_outcome.dropped
                 unmatched = locate_outcome.unmatched
                 if locate_outcome.chain_ids:
@@ -203,7 +225,7 @@ class RequirementOrchestrator:
                 semantic_signals(candidates, matches)
             elif judge_outcome is not None:
                 warnings.extend(judge_outcome.warnings)
-                matches = judge_outcome.matches
+                matches.extend(judge_outcome.matches)
                 dropped = judge_outcome.dropped
                 unmatched = judge_outcome.unmatched
                 semantic_signals(candidates, matches)
@@ -223,11 +245,13 @@ class RequirementOrchestrator:
 
         builder = StateGraph(LocateState)
         builder.add_node("decompose", decompose_node)
+        builder.add_node("anchor", anchor_node)
         builder.add_node("recall", recall_node)
         builder.add_node("locate", locate_node)
         builder.add_node("assemble", assemble_node)
         builder.add_edge(START, "decompose")
-        builder.add_edge("decompose", "recall")
+        builder.add_edge("decompose", "anchor")
+        builder.add_edge("anchor", "recall")
         builder.add_edge("recall", "locate")
         builder.add_edge("locate", "assemble")
         builder.add_edge("assemble", END)
