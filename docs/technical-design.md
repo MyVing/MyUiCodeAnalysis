@@ -411,7 +411,7 @@ project.ts（构建一次 ts.Program）
 | `state` | 顶层 `useState` 调用 + 数组解构 | `setter` / `typeText` / `initial` | `reads` / `writes` | 1.0（调用）；0.9（引用） | 非解构写法不产 state；不解析 `useReducer` 的 action 语义 |
 | `fn` | 只收录**处在请求链路上**的模块级函数：函数体内直接或间接调用 HTTP 客户端 | `role = request_chain` | `calls` / `requests` | 1.0 | 不为任意工具函数建节点；不解析 `obj.method()` 的接收者语义 |
 | `api` | 双重判定：符号名（`fetch` / `axios` / `api`）+ 符号来源在项目外；封装器按 `mapping.json` 做不动点穿透 | `method` / `url` | `requests` | 字面量 1.0；经封装器 0.9；经局部变量 0.8 | 不做运行时 baseURL 拼接；不解析 GraphQL；URL 来自函数返回值 / 跨模块常量时只告警 |
-| `route` | 受控 API 名单：`createBrowserRouter` 配置对象、`<Route path element>`、`createHashRouter`；Next 项目按 `app/**/page.tsx`、`pages/**/*.tsx` 文件约定 | `path` / `params` / `framework` / `index` | `renders`（route → 页面组件） | 节点 1.0；页面归属 0.9 | 动态 path 只告警；不猜约定式路由（Next 除外）；**不区分 layout / page，也不提取菜单名**（缺口，见 4.1.6） |
+| `route` | 受控 API 名单：`createBrowserRouter` 配置对象、`<Route path element>`、`createHashRouter`；Next 项目按 `app/**/page.tsx`、`pages/**/*.tsx` 文件约定 | `path` / `params` / `framework` / `index` / `title` / `pageComponentId` / `layoutComponentIds` | `renders`（route → 页面组件 / 布局组件） | 节点 1.0；页面归属 0.9 | 动态 path 只告警；不猜约定式路由（Next 除外）；layout / page 按 `<Outlet>` / 嵌套路由层级区分（见 4.1.6）；菜单配置提取（`menuFiles` 白名单）仍待做 |
 | `props` | 组件第一个参数的类型节点；解构默认值；JSDoc 首行 | `name` / `type` / `optional` / `defaultValue` / `description` / `file` / `loc` | 不产边 | 1.0 | 不展开命名类型别名；不展开泛型实例；不取运行时默认值 |
 | `uiText` | 六种来源：JSX 文本 / 白名单属性 `placeholder,title,label` / 对象字面量的 `title,label` / i18n 取词键 / 数组收紧 / 动态标记 | `texts[{text,kind,via,loc}]` / `dynamic` / `truncated` | 不产边 | 1.0 | 不跨文件求值；不翻译 i18n；不猜组件外常量的归属 |
 | `wrapper` | 项目根 `mapping.json` 显式声明 | `attrs.wrapper`（底层组件、props 改名、折叠默认值） | 不新增边（renders 已表达） | 1.0（配置事实） | 核心分析器不硬编码任何业务组件名 |
@@ -476,7 +476,7 @@ element（有 viewText / columns / tag）
 | `route.title` | react-router `handle.title` / `meta.title`；Next `metadata.title` / `generateMetadata` | **已提取**（路由表 `title` / `label` / `name` 字面量与 `handle.title`；JSX 收 `title` 属性） | 加入 `route.attrs.title`，作为需求召回的高权重信号（`routeTitle`，0.9）；Next 的 `metadata` 提取仍待做 |
 | 菜单名 | 项目菜单配置（antd `Menu items`、`menu.json` 等） | **未提取** | 通过 `mapping.json` 的 `menuFiles` 白名单声明后提取 `label → path`，补「菜单名 ↔ 路由」映射 |
 | 页面标题 | 首个 `<h1>`、`<title>`、`document.title = ...` | `view.ts` 已收 `<h1>` 元素 | 聚合为 `component.attrs.pageTitle` |
-| layout / page | 路由 element 是否含 `<Outlet>`；嵌套路由层级 | **未区分** | route 增加 `pageComponentId` 与 `layoutComponentIds`；优先取不含 `Outlet` 的叶子路由组件 |
+| layout / page | 路由 element 是否含 `<Outlet>`；嵌套路由层级 | **已区分**（`routes.ts`：`<Outlet>`（内联 JSX 或组件声明子树）→ layout；有子路由 → layout；叶子路由 → page；index 优先；Next `layout.tsx` 按目录前缀归属） | 结论写入 `route.attrs.pageComponentId` 与 `layoutComponentIds`；多页面候选记 `route_page_ambiguous`，不静默取第一个 |
 
 没有这些信号时，`route → 页面` 的 0.9 置信度在「同一 path 同时挂 layout 和 page」的场景下会选错组件。这是当前实现的真实风险，不是理论问题。
 
@@ -1192,12 +1192,16 @@ import { saveOrder } from "@/services/order";
 3. 路径未命中时，用 `route.title` / 菜单名 / 页面标题做中文匹配；
 4. 仍未命中，才回落到组件名与文案召回。
 
-**layout / page 歧义必须显式处理**：同一 `path` 下可能同时挂布局组件和页面组件。设计上 `route` 节点增加 `pageComponentId` 与 `layoutComponentIds`，判定规则：
+**layout / page 歧义必须显式处理**（**已实现**（`workers/ast-worker/src/routes.ts`））：同一 `path` 下可能同时挂布局组件和页面组件。route 节点的 `attrs.pageComponentId` 与 `attrs.layoutComponentIds` 由 ast-worker 按以下规则判定：
 
-- 路由 element 内出现 `<Outlet>` → layout；
+- 路由 element 内出现 react-router 的 `<Outlet>`（内联 JSX 或组件声明子树里）→ layout；
 - 叶子路由（无子路由）的 element → page；
+- 有子路由的 element → layout（React Router 语义：子路由渲染在 Outlet 里）；
 - index route 优先于父路由；
+- Next.js 的 `layout.tsx` 按目录前缀归属到子树内所有页面路由；
 - 无法判定时记 `route_page_ambiguous`，召回结果同时给出两个候选，不静默取第一个。
+
+消费侧：`recall.page_nodes` 的布局集合同时吃显式标注与「被多条路径复用」的兜底启发式；`anchors._route_pages` 的直连候选以显式标注为准，布局组件不再冒充页面。
 
 **查询接口**：
 
@@ -1589,7 +1593,7 @@ dry-run 默认开启：模型产出的计划先给用户审阅，再决定是否
 | 2 | ~~没有锚点抽取~~ | **已修**：`app/requirement/anchors.py` 在拆解后、召回前做零模型的锚点抽取与直连——接口锚点（method + path / 完整 URL，与 `normalize_url` 同规则）、路由锚点（引号 / 反引号内的 `/xxx`，排除文件扩展名，`:param` 通配）、组件锚点（`<X />` 与引号内 PascalCase）、文件锚点（引号内 ts/tsx/js/jsx）、字段锚点（引号内 camelCase / snake_case）；精确命中即产出 `Match`（source=static）：接口沿 6.11 反向索引（精确 0.95 / 后缀 0.85），路由 / 组件 / 文件 / 唯一字段命中 0.95；找不到对应节点记 `anchor_unresolved` 降级为普通检索词，字段多页命中记 `anchor_ambiguous`；被锚点覆盖的功能点不再进模型（6.13 第四步语义残差），dry-run 下照常产出 | — | 6.13 |
 | 3 | ~~没有接口反向索引~~ | **已修**：新增 `GET /projects/{id}/api-usage`（只读零模型）——`app/ir/api_usage.py` 构建反向索引（api 键 = method + 归一化 url，按 analysisId 内存缓存），沿 `requests`/`calls`/`contains`/`renders`/`uses` 反向 DFS 收集完整 nodeIds + edgeIds 路径，置信度沿路径取最小值 × 锚点（精确 0.95 / 后缀或无 method 0.85 并标 `urlSuffixMatch`）；超 3 页面记 `api_usage_ambiguous`，无页面可达记 `api_no_page_reachable`（死接口线索）；最新 trace 的请求 URL + 页面 URL 双证命中时抬到 0.95 并标 `runtimeBacked` | — | 6.11 |
 | 4 | ~~route.title~~ / 菜单名未提取 | **已修（route.title）**：`routes.ts` 从路由表提取 `title` / `label` / `name` 字面量与 react-router `handle.title`（JSX 形态收 `title` 属性），写入 `route.attrs.title`；召回新增 `routeTitle` 信号（0.9）并进引文语料，「订单管理页」可命中带标题的路由。菜单配置提取（`mapping.json` 的 `menuFiles` 白名单）仍待做 | 4.1.6 |
-| 5 | layout / page 未区分 | 同一 path 下按遍历顺序取页面组件 | 可能把布局组件当成页面，0.9 置信度也救不回来 | 4.1.6 / 6.12 |
+| 5 | ~~layout / page 未区分~~ | **已修**：`routes.ts` 按「element 内出现 react-router `<Outlet>`（内联 JSX 或组件声明子树）→ layout；有子路由 → layout；叶子路由 → page；index 优先」分类，写入 `route.attrs.pageComponentId` 与 `layoutComponentIds`；Next 的 `layout.tsx` 按目录前缀归属到子树页面路由；同一路径多个页面候选记 `route_page_ambiguous` 不静默取第一个。后端 `recall.page_nodes` 布局集合吃显式标注（覆盖「只挂一条路径」的场景），`anchors._route_pages` 直连候选以标注为准，布局组件不再冒充页面 | — | 4.1.6 / 6.12 |
 | 6 | ~~没有 `navigates` 边~~ | **已修**：`navigate.ts` 产出 `navigates` 边 | — | 4.1.5 / 6.14 |
 | 7 | 元素级匹配缺失 | `Match` 只有 `pageNodeId` | 只能回答「哪个页面」，不能回答「哪个按钮 / 哪一列」 | 6.14 / 6.15 |
 | 8 | 交互链路未进契约与子图 | 子图一跳，`component → fn → api` 的 api 恒缺席 | 用户看不到「点击 → 函数 → 接口」的完整链路 | 6.8 / 6.14 |

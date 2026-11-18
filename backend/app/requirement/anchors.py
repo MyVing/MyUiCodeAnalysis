@@ -297,7 +297,13 @@ def _route_index(graph: IRGraph, nodes_by_id: dict[str, IRNode]) -> dict[str, st
 
 
 def _route_pages(graph: IRGraph, nodes_by_id: dict[str, IRNode]) -> dict[str, list[str]]:
-    """route → 渲染的页面组件（布局复用时一个路由可挂多个页面）。"""
+    """route → 渲染的页面组件（布局复用时一个路由可挂多个页面）。
+
+    ast-worker 已经按 `<Outlet>` / 嵌套路由层级 / index 规则区分过 layout 与
+    page（`attrs.pageComponentId` / `attrs.layoutComponentIds`），这里的顺序
+    以显式标注为准——同一路径下 layout 先声明时，按边遍历顺序取会把布局组件
+    当成页面。attrs 缺省（旧图）时退回全部渲染目标，行为不变。
+    """
     by_route: dict[str, list[str]] = defaultdict(list)
     for edge in graph.edges:
         if edge.kind is not EdgeKind.renders:
@@ -311,6 +317,33 @@ def _route_pages(graph: IRGraph, nodes_by_id: dict[str, IRNode]) -> dict[str, li
             and target.kind in (NodeKind.component, NodeKind.server_component)
         ):
             by_route[source.id].append(target.id)
+
+    for node in graph.nodes:
+        if node.kind is not NodeKind.route:
+            continue
+        declared_layout = node.attrs.get("layoutComponentIds")
+        layout_ids = (
+            {item for item in declared_layout if isinstance(item, str)}
+            if isinstance(declared_layout, list)
+            else set()
+        )
+        declared_page = node.attrs.get("pageComponentId")
+        if not layout_ids and not isinstance(declared_page, str):
+            continue  # 旧图没有区分信息，保持原有顺序
+        targets = by_route.get(node.id, [])
+        if isinstance(declared_page, str):
+            pages = [declared_page] + [
+                item
+                for item in targets
+                if item != declared_page and item not in layout_ids
+            ]
+        else:
+            pages = [item for item in targets if item not in layout_ids]
+        if pages:
+            by_route[node.id] = pages
+        elif targets:
+            # 全被标成 layout 的极端情况：保留原目标，不给空列表
+            by_route[node.id] = targets
     return dict(by_route)
 
 

@@ -24,7 +24,7 @@ from app.contracts import (
 from app.contracts.requirement import Severity
 from app.requirement.features import DecomposeResult, decompose, decompose_with_report
 from app.requirement.lexicon import BIGRAM_TERM_WEIGHT, expand
-from app.requirement.recall import DEFAULT_TOP_K, recall
+from app.requirement.recall import DEFAULT_TOP_K, page_nodes, recall
 from app.requirement.text import ascii_words, contains_cjk, normalize
 
 _STATIC = Source.static
@@ -296,6 +296,41 @@ def test_recall_uses_props_description_as_evidence(user_graph: IRGraph) -> None:
     result = recall(user_graph, decompose("筛选")[0].terms)
     candidate = result.candidates[0].candidate
     assert any(signal.kind is SignalKind.propDescription for signal in candidate.signals)
+
+
+def test_page_nodes_honors_declared_layout_ids() -> None:
+    """差距表 #5：ast-worker 显式标注的 layoutComponentIds 计入布局集合。
+
+    同一路径下 layout + page 混挂（父路由出 layout、index 出内容）时，布局组件
+    只挂一条路径，「被多条路径复用」的启发式抓不到它——必须吃 attrs 的显式标注。
+    布局组件仍保留为召回候选（外壳文案要能被找到），只是语义归入 layout。
+    """
+    layout = _page("src/layouts/FullLayout.tsx#FullLayout", "FullLayout", texts=["后台管理系统"])
+    user_list = _page("src/pages/UserList.tsx#UserList", "UserList", texts=["搜索用户"])
+    route = _node(
+        "src/router.tsx#/users",
+        NodeKind.route,
+        "/users",
+        file="src/router.tsx",
+        attrs={
+            "path": "/users",
+            "pageComponentId": "src/pages/UserList.tsx#UserList",
+            "layoutComponentIds": ["src/layouts/FullLayout.tsx#FullLayout"],
+        },
+    )
+    g = _graph(
+        [layout, user_list, route],
+        [
+            _edge(route.id, layout.id, EdgeKind.renders),
+            _edge(route.id, user_list.id, EdgeKind.renders),
+        ],
+    )
+
+    pages, route_by_page, layout_ids = page_nodes(g)
+    assert layout_ids == {"src/layouts/FullLayout.tsx#FullLayout"}
+    assert route_by_page[layout.id] == route.id
+    assert route_by_page[user_list.id] == route.id
+    assert {item.id for item in pages} == {layout.id, user_list.id}
 
 
 def test_recall_keeps_locatable_evidence_for_each_quote(user_graph: IRGraph) -> None:

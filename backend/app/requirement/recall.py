@@ -179,10 +179,17 @@ def page_nodes(graph: IRGraph) -> tuple[list[IRNode], dict[str, str], set[str]]:
     有 route 节点时，页面就是 route 渲染的目标；没有时降级为顶层组件
     （不被任何组件 renders 的组件）。降级必须显式告警——它改变了候选的含义。
 
-    布局组件：被**多条不同路径**的 route 渲染的页面组件（`FullLayout` 同时挂在
-    `/`、`/posts` 下）。它们在图上和普通页面一样是 route 的目标，但语义上是
-    「每个页面共用的外壳」，其子组件文案需要特殊归属规则（见 `collect_page_evidences`）。
-    只被一条 route 渲染的组件按普通页面处理，行为不变。
+    布局组件有两个来源：
+
+    1. ast-worker 的显式标注（`route.attrs.layoutComponentIds`）：同一 path 下
+       layout + page 混挂（父路由出 layout、index 出内容）时，ast-worker 已经按
+       `<Outlet>` / 嵌套路由层级 / index 规则分好类，Next 则按 layout.tsx 目录
+       约定归属。这是首选来源，不靠启发式猜。
+    2. 被多条不同路径的 route 渲染（`FullLayout` 同时挂在 /、/posts 下）——
+       旧图 / 未标注时的兜底启发式。
+
+    它们在图上和普通页面一样是 route 的目标，但语义上是「每个页面共用的外壳」，
+    其子组件文案需要特殊归属规则（见 `collect_page_evidences`）。
     """
     nodes = {node.id: node for node in graph.nodes}
     route_by_page: dict[str, str] = {}
@@ -204,7 +211,9 @@ def page_nodes(graph: IRGraph) -> tuple[list[IRNode], dict[str, str], set[str]]:
 
     if route_by_page:
         pages = sorted((nodes[node_id] for node_id in route_by_page), key=lambda node: node.id)
-        layout_ids = {page_id for page_id, paths in paths_by_page.items() if len(paths) > 1}
+        layout_ids = _explicit_layout_ids(graph) | {
+            page_id for page_id, paths in paths_by_page.items() if len(paths) > 1
+        }
         return pages, route_by_page, layout_ids
 
     rendered = {edge.to for edge in graph.edges if edge.kind is EdgeKind.renders}
@@ -214,6 +223,18 @@ def page_nodes(graph: IRGraph) -> tuple[list[IRNode], dict[str, str], set[str]]:
         if _is_component(node) and node.attrs.get("external") is not True
     }
     return [nodes[node_id] for node_id in sorted(component_ids - rendered)], {}, set()
+
+
+def _explicit_layout_ids(graph: IRGraph) -> set[str]:
+    """ast-worker 在 route.attrs.layoutComponentIds 里显式声明的布局组件。"""
+    layout_ids: set[str] = set()
+    for node in graph.nodes:
+        if node.kind is not NodeKind.route:
+            continue
+        declared = node.attrs.get("layoutComponentIds")
+        if isinstance(declared, list):
+            layout_ids.update(item for item in declared if isinstance(item, str))
+    return layout_ids
 
 
 def _is_component(node: IRNode) -> bool:

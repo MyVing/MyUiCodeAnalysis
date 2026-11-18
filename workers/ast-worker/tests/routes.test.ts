@@ -580,3 +580,141 @@ describe("路由标题提取（差距表 #4）", () => {
     expect(routeByPath(result, "/users").attrs.title).toBeUndefined();
   });
 });
+
+describe("layout / page 区分（差距表 #5）", () => {
+  it("父路由组件含 <Outlet> 时标为 layout，index 子路由是页面", () => {
+    const result = analyzeSynthetic({
+      "src/router.tsx": `
+        import { createBrowserRouter, Outlet } from "react-router-dom";
+        import { Home, UserDetail } from "./Pages";
+        export function UsersLayout() {
+          return (
+            <div>
+              <Outlet />
+            </div>
+          );
+        }
+        export const router = createBrowserRouter([
+          {
+            path: "/users",
+            element: <UsersLayout />,
+            children: [
+              { index: true, element: <Home /> },
+              { path: ":id", element: <UserDetail /> },
+            ],
+          },
+        ]);
+      `,
+    });
+
+    const users = routeByPath(result, "/users");
+    // index 路由与父路由撞键合并：pageComponentId 指向 index 的页面
+    expect(users.attrs.pageComponentId).toBe("src/Pages.tsx#Home");
+    expect(users.attrs.layoutComponentIds).toEqual(["src/router.tsx#UsersLayout"]);
+    expect(users.attrs.index).toBe(true);
+
+    // layout 与 page 的 renders 边都在
+    expect(result.edges.some((edge) => edge.from === users.id && edge.to === "src/router.tsx#UsersLayout")).toBe(true);
+    expect(result.edges.some((edge) => edge.from === users.id && edge.to === "src/Pages.tsx#Home")).toBe(true);
+
+    // 子路由是叶子：组件是页面，不标 layout
+    const detail = routeByPath(result, "/users/:id");
+    expect(detail.attrs.pageComponentId).toBe("src/Pages.tsx#UserDetail");
+    expect(detail.attrs.layoutComponentIds).toBeUndefined();
+  });
+
+  it("内联 JSX 里的 <Outlet> 同样被识别", () => {
+    const result = analyzeSynthetic({
+      "src/router.tsx": `
+        import { createBrowserRouter, Outlet } from "react-router-dom";
+        import { Layout, UserList } from "./Pages";
+        export const router = createBrowserRouter([
+          {
+            path: "/users",
+            element: <Layout><Outlet /></Layout>,
+            children: [{ index: true, element: <UserList /> }],
+          },
+        ]);
+      `,
+    });
+
+    expect(routeByPath(result, "/users").attrs.layoutComponentIds).toEqual([
+      "src/Pages.tsx#Layout",
+    ]);
+  });
+
+  it("有 children 但组件不含 <Outlet> 时，按嵌套路由层级标为 layout", () => {
+    const result = analyzeSynthetic({
+      "src/router.tsx": `
+        import { createBrowserRouter } from "react-router-dom";
+        import { Home, UserList, UserDetail } from "./Pages";
+        export const router = createBrowserRouter([
+          {
+            path: "/users",
+            element: <UserList />,
+            children: [{ path: ":id", element: <UserDetail /> }],
+          },
+          { path: "/fallback", element: <Home /> },
+        ]);
+      `,
+    });
+
+    // fixture 的 UserList 没有 Outlet，但它是带 children 的父路由
+    expect(routeByPath(result, "/users").attrs.layoutComponentIds).toEqual([
+      "src/Pages.tsx#UserList",
+    ]);
+    // 叶子路由不受影响
+    expect(routeByPath(result, "/fallback").attrs.pageComponentId).toBe("src/Pages.tsx#Home");
+    expect(routeByPath(result, "/fallback").attrs.layoutComponentIds).toBeUndefined();
+  });
+
+  it("同一路径解析到两个页面组件时记 route_page_ambiguous，不写 pageComponentId", () => {
+    const result = analyzeSynthetic({
+      "src/router.tsx": `
+        import { createBrowserRouter } from "react-router-dom";
+        import { Home, UserList } from "./Pages";
+        export const router = createBrowserRouter([
+          { path: "/dup", element: <Home /> },
+          { path: "/dup", element: <UserList /> },
+        ]);
+      `,
+    });
+
+    const dup = routeByPath(result, "/dup");
+    expect(dup.attrs.pageComponentId).toBeUndefined();
+    const warning = result.warnings.find((item) => item.code === "route_page_ambiguous");
+    expect(warning?.severity).toBe("warning");
+    expect(warning?.message).toContain("/dup");
+    // 两个候选的边都保留
+    expect(result.edges.filter((edge) => edge.from === dup.id)).toHaveLength(2);
+  });
+
+  it("Next：layout.tsx 按目录前缀挂到子树内的页面路由", () => {
+    const result = analyzeSynthetic(
+      {
+        "app/layout.tsx": "export default function RootLayout() { return <div />; }",
+        "app/users/layout.tsx": "export default function UsersLayout() { return <div />; }",
+        "app/users/page.tsx": "export default function Users() { return <div />; }",
+        "app/about/page.tsx": "export default function About() { return <div />; }",
+      },
+      "next",
+    );
+
+    const users = routeByPath(result, "/users");
+    // 根 layout + 同目录 layout 都包住 /users（attrs 内按字母序，保证可复现）
+    expect(users.attrs.layoutComponentIds).toEqual([
+      "app/layout.tsx#RootLayout",
+      "app/users/layout.tsx#UsersLayout",
+    ]);
+    expect(users.attrs.pageComponentId).toBe("app/users/page.tsx#Users");
+
+    // 只命中根 layout
+    const about = routeByPath(result, "/about");
+    expect(about.attrs.layoutComponentIds).toEqual(["app/layout.tsx#RootLayout"]);
+
+    // layout 的 renders 边也产出
+    expect(result.edges.some((edge) => edge.from === users.id && edge.to === "app/layout.tsx#RootLayout")).toBe(
+      true,
+    );
+  });
+});

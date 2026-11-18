@@ -193,6 +193,40 @@ def test_route_anchor_connects_page() -> None:
     assert match.confidence == 0.95
 
 
+def test_route_anchor_prefers_declared_page_over_layout() -> None:
+    """差距表 #5：同一路径下 layout + page 混挂，布局组件不冒充页面。
+
+    边按遍历顺序 layout 在前；没有 attrs 显式标注时，route 直连会把布局组件
+    当成页面。ast-worker 已按 `<Outlet>` / 嵌套路由规则分好类（pageComponentId
+    与 layoutComponentIds），这里的候选顺序以标注为准。
+    """
+    layout = page("src/layouts/FullLayout.tsx#FullLayout", "FullLayout", texts=["导航"])
+    user_list = page("src/pages/UserList.tsx#UserList", "UserList", texts=["搜索用户"])
+    route = node(
+        "src/router.tsx#/users",
+        NodeKind.route,
+        "/users",
+        file="src/router.tsx",
+        attrs={
+            "path": "/users",
+            "pageComponentId": "src/pages/UserList.tsx#UserList",
+            "layoutComponentIds": ["src/layouts/FullLayout.tsx#FullLayout"],
+        },
+    )
+    g = graph(
+        [layout, user_list, route],
+        [
+            edge(route.id, layout.id, EdgeKind.renders),
+            edge(route.id, user_list.id, EdgeKind.renders),
+        ],
+    )
+
+    result = anchor_direct_connect(g, decompose("「/users」页面新增筛选"))
+    (match,) = result.matches
+    assert match.pageNodeId == "src/pages/UserList.tsx#UserList"
+    assert match.routeId == route.id
+
+
 def test_dynamic_route_anchor_matches_param_route() -> None:
     result = anchor_direct_connect(user_graph(), decompose("查看 `/users/42` 详情"))
     assert result.covered == {"f1"}

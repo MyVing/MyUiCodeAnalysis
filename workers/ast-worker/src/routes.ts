@@ -20,6 +20,23 @@
  * 两条路都只认**框架的语言级约定**，不出现任何业务名判断：`createBrowserRouter`
  * 是 react-router 的 API，`page.tsx` 是 Next 的约定，对所有项目一致。
  *
+ * ## layout / page 区分
+ *
+ * 同一路径下可能同时挂布局组件和页面组件（父路由出 layout、index 出内容）。
+ * 把布局组件当成页面，0.9 的置信度也救不回来——所以判定规则必须显式：
+ *
+ *  - 路由 element 内出现 react-router 的 `<Outlet>`（内联 JSX 或组件声明子树里）→ layout
+ *  - 有子路由的 element → layout（React Router 语义：子路由渲染在 Outlet 里）
+ *  - 叶子路由（无子路由）的 element → page
+ *  - index route 的 element 优先作为页面
+ *  - Next.js：`layout.tsx` 按目录前缀归属到其子树内所有页面路由
+ *
+ * 结论写进 route 节点的 attrs：`pageComponentId`（唯一页面）与
+ * `layoutComponentIds`（布局组件列表）。renders 边照常产出——layout 和 page
+ * 都是真实的渲染事实，区别只在于语义归类。同一路径解析到**多个**页面组件时
+ * 不写 `pageComponentId`，记 `route_page_ambiguous`，召回结果同时给出候选，
+ * 不静默取第一个。
+ *
  * ## 定不下来时不编造
  *
  * - `path={variable}` → 不产节点，记 `route_path_unresolved`
@@ -41,6 +58,7 @@ import type { Evidence, IREdge, IRNode, Warning } from "@uicodeanalysis/contract
 
 import type { DiscoveredComponent } from "./components.js";
 import {
+  findImportSource,
   isHostElement,
   resolveIdentifierTarget,
   resolveTagTarget,
@@ -187,6 +205,69 @@ function resolvePageComponent(
   return null;
 }
 
+/**
+ * 判断子树里是否出现 JSX 标签 `Outlet`（含 `X.Outlet` 点号形式）。
+ *
+ * 只看标签名——是否真的来自 react-router 由调用方的导入检查兜底。
+ */
+function subtreeHasOutletTag(node: Node): boolean {
+  return node.getDescendants().some((descendant) => {
+    const tag = elementTagName(descendant);
+    return tag !== null && lastTagSegment(tag) === "Outlet";
+  });
+}
+
+/**
+ * 从「指向组件的表达式」取到组件声明节点（变量声明 / 函数声明）。
+ *
+ * 与 resolveSymbolTarget 同一条符号解析路径，但返回声明本身而不是组件 id。
+ */
+function componentDeclarationNodes(value: Node): Node[] {
+  let tagNode: Node | null = null;
+  if (MorphNode.isJsxSelfClosingElement(value) || MorphNode.isJsxElement(value)) {
+    tagNode = MorphNode.isJsxSelfClosingElement(value)
+      ? value.getTagNameNode()
+      : value.getOpeningElement().getTagNameNode();
+  } else if (MorphNode.isIdentifier(value)) {
+    tagNode = value;
+  }
+  if (!tagNode) return [];
+
+  let symbol = tagNode.getSymbol();
+  if (symbol?.isAlias()) {
+    try {
+      symbol = symbol.getAliasedSymbol();
+    } catch {
+      return [];
+    }
+  }
+  return [...(symbol?.getDeclarations() ?? [])];
+}
+
+/**
+ * 判断「路由 element 的值」渲染的内容里是否出现 react-router 的 `<Outlet>`。
+ *
+ * 三种来源都要认：
+ *  - 内联 JSX：`element={<Layout><Outlet /></Layout>}` —— 值节点子树里就有
+ *  - 组件声明子树：`element={<UsersLayout />}`，`<Outlet />` 写在组件体内
+ *  - 点号形式：`<Router.Outlet />`
+ *
+ * 组件声明侧要求该文件真的从 react-router 导入了 `Outlet`（含别名导入的反查
+ * 只认原名），排除项目自造的同名组件——判断依据是导入来源，不看名字猜。
+ * 扫描只做一层，不做传递展开：layout 套 layout 的写法由外层路由自己声明。
+ */
+function containsOutlet(value: Node | null): boolean {
+  if (!value) return false;
+  if (subtreeHasOutletTag(value)) return true;
+  for (const decl of componentDeclarationNodes(value)) {
+    const sourceFile = decl.getSourceFile();
+    const importSource = findImportSource(sourceFile, "Outlet");
+    if (importSource === null || !importSource.includes("react-router")) continue;
+    if (subtreeHasOutletTag(decl)) return true;
+  }
+  return false;
+}
+
 /* ------------------------------------------------------------------ *
  * 产出收集
  * ------------------------------------------------------------------ */
@@ -197,22 +278,38 @@ interface CollectedRoute {
   framework: RouteFramework;
   file: string;
   loc: { line: number; col: number };
-  /** 解析到的页面组件 id；null 表示只产节点不产边 */
+  /** 解析到的组件 id；null 表示只产节点不产边 */
   pageComponentId: string | null;
+  /**
+   * 该组件是否是布局而非页面。
+   *
+   * 判定依据（按优先级）：element 内出现 react-router 的 `<Outlet>` → 是；
+   * 有子路由（React Router 语义：子路由渲染在 Outlet 里）→ 是；否则是页面。
+   */
+  isLayout: boolean;
   /**
    * 路由 / 菜单标题（`title` / `label` / `name` 属性，或 react-router 的
    * `handle.title`）。需求写的是「订单管理页」，代码里只有 `/order/list`，
    * 没有标题就永远对不上。取不到时为 null——标题是可选信息，不编造。
    */
   title: string | null;
+  /**
+   * Next 文件约定下按目录前缀归属到本页面的 layout 组件。
+   *
+   * `app/users/layout.tsx` 包住 `app/users/page.tsx` 及其子树。React Router
+   * 场景不用这个字段——layout 由 element 的解析结果与 isLayout 判定得出。
+   */
+  inheritedLayoutComponentIds?: readonly string[];
 }
 
 /** 同一 nodeId 下累积的声明。 */
 interface RouteBucket {
-  /** 首次出现的那条，决定节点位置与主组件 */
+  /** 首次出现的那条，决定节点位置与标题 */
   primary: CollectedRoute;
-  /** 该路径下解析到的全部页面组件（index 路由与父路由会落在同一路径） */
+  /** 该路径下的页面组件（index 路由与父路由会落在同一路径） */
   pageComponentIds: Set<string>;
+  /** 该路径下的布局组件 */
+  layoutComponentIds: Set<string>;
   /** 只要有任意一条声明是 index，节点就带 index 标记 */
   index: boolean;
 }
@@ -236,7 +333,15 @@ class RouteCollector {
 
     if (existing) {
       if (route.index) existing.index = true;
-      if (route.pageComponentId !== null) existing.pageComponentIds.add(route.pageComponentId);
+      // layout 与 page 分流：同一路径下父路由的布局组件不能冒充页面
+      if (route.pageComponentId !== null) {
+        (route.isLayout ? existing.layoutComponentIds : existing.pageComponentIds).add(
+          route.pageComponentId,
+        );
+      }
+      for (const layoutId of route.inheritedLayoutComponentIds ?? []) {
+        existing.layoutComponentIds.add(layoutId);
+      }
       // 同一路径的 index 声明可能带标题而主声明没有：标题补上，不互相覆盖
       if (existing.primary.title === null && route.title !== null) {
         existing.primary.title = route.title;
@@ -270,9 +375,16 @@ class RouteCollector {
       });
     }
 
+    const layoutComponentIds = new Set(route.inheritedLayoutComponentIds ?? []);
+    if (route.pageComponentId !== null && route.isLayout) {
+      layoutComponentIds.add(route.pageComponentId);
+    }
+
+    const isPageResolved = route.pageComponentId !== null && !route.isLayout;
     this.buckets.set(nodeId, {
       primary: route,
-      pageComponentIds: route.pageComponentId === null ? new Set() : new Set([route.pageComponentId]),
+      pageComponentIds: new Set(isPageResolved ? [route.pageComponentId as string] : []),
+      layoutComponentIds,
       index: route.index,
     });
   }
@@ -291,6 +403,21 @@ class RouteCollector {
         loc: route.loc,
       };
 
+      const pageComponentIds = [...bucket.pageComponentIds];
+      const layoutComponentIds = [...bucket.layoutComponentIds].sort();
+
+      // 页面组件存在歧义时不静默取第一个：留空 attrs，由召回结果给出全部候选
+      if (pageComponentIds.length > 1) {
+        this.warnings.push({
+          code: "route_page_ambiguous",
+          severity: "warning",
+          stage: "static",
+          file: route.file,
+          loc: route.loc,
+          message: `路径 ${route.path} 解析到多个页面组件（${pageComponentIds.join("、")}）；不标记唯一页面，召回结果会同时给出候选`,
+        });
+      }
+
       routeNodes.push({
         id: nodeId,
         kind: "route",
@@ -303,15 +430,18 @@ class RouteCollector {
           params: extractParams(route.path),
           ...(bucket.index ? { index: true } : {}),
           ...(bucket.primary.title !== null ? { title: bucket.primary.title } : {}),
+          ...(pageComponentIds.length === 1 ? { pageComponentId: pageComponentIds[0] } : {}),
+          ...(layoutComponentIds.length > 0 ? { layoutComponentIds } : {}),
         },
         evidence: [evidence],
       });
 
-      for (const pageComponentId of bucket.pageComponentIds) {
+      // layout 与 page 都是真实的渲染事实，renders 边照常产出
+      for (const targetId of [...pageComponentIds, ...layoutComponentIds]) {
         edges.push({
-          id: `e_renders_${nodeId}__${pageComponentId}`,
+          id: `e_renders_${nodeId}__${targetId}`,
           from: nodeId,
-          to: pageComponentId,
+          to: targetId,
           kind: "renders",
           evidence: [{ ...evidence, confidence: ROUTE_EDGE_CONFIDENCE }],
         });
@@ -496,6 +626,10 @@ function walkRouteObjects(
       resolvePageComponent(elementValue, context) ??
       resolvePageComponent(componentValue, context);
 
+    // layout 判定：<Outlet>（内联或组件声明子树里）优先，其次嵌套路由层级
+    const hasChildren = childrenProp !== undefined;
+    const isLayout = containsOutlet(elementValue) || containsOutlet(componentValue) || hasChildren;
+
     collector.add({
       path: fullPath,
       index: isIndex,
@@ -503,6 +637,7 @@ function walkRouteObjects(
       file: relativeFile,
       loc: locOf(pathProp ?? element),
       pageComponentId,
+      isLayout,
       title: routeTitleLiteral(element),
     });
 
@@ -527,6 +662,20 @@ function elementTagName(node: Node): string | null {
 /** 标签的最后一段（`React.Route` → `Route`）。 */
 function lastTagSegment(tagName: string): string {
   return tagName.split(".").pop() ?? tagName;
+}
+
+/**
+ * 判断 JSX 式 `<Route>` 是否带子 `<Route>`。
+ *
+ * 嵌套路由的子元素渲染在父 element 的 Outlet 里——与对象式的 `children`
+ * 属性同一条判定依据，不能只看对象式漏掉 JSX 式。
+ */
+function hasRouteChildren(node: Node): boolean {
+  if (!MorphNode.isJsxElement(node)) return false;
+  return node.getDescendants().some((descendant) => {
+    const tag = elementTagName(descendant);
+    return tag !== null && lastTagSegment(tag) === "Route";
+  });
 }
 
 /** 取 JSX 元素的属性表；自闭合与成对元素统一处理。 */
@@ -633,15 +782,14 @@ function walkRouteElements(
     // JSX 形态没有 handle 约定，只认 title 属性（有的项目把菜单名写在 <Route> 上）
     const titleAttr = jsxAttribute(node, "title");
 
+    const elementValue = elementAttr ? attributeValueNode(elementAttr) : null;
+    const componentValue = componentAttr ? attributeValueNode(componentAttr) : null;
+
     const pageComponentId =
-      resolvePageComponent(
-        elementAttr ? attributeValueNode(elementAttr) : null,
-        context,
-      ) ??
-      resolvePageComponent(
-        componentAttr ? attributeValueNode(componentAttr) : null,
-        context,
-      );
+      resolvePageComponent(elementValue, context) ?? resolvePageComponent(componentValue, context);
+
+    const isLayout =
+      containsOutlet(elementValue) || containsOutlet(componentValue) || hasRouteChildren(node);
 
     computed.set(node.getStart(), fullPath);
 
@@ -652,6 +800,7 @@ function walkRouteElements(
       file: relativeFile,
       loc: locOf(pathAttr ?? node),
       pageComponentId,
+      isLayout,
       title: titleAttr ? literalString(attributeValueNode(titleAttr)) : null,
     });
   }
@@ -730,6 +879,8 @@ function locOf(node: Node | undefined): { line: number; col: number } {
 }
 
 const APP_PAGE_PATTERN = /^(?:src\/)?app\/(.*?)page\.(?:tsx|jsx|ts|js)$/;
+/** Next 的 `layout.tsx`：不产 route 节点，但按目录前缀归属到子树内的页面路由。 */
+const APP_LAYOUT_PATTERN = /^(?:src\/)?app\/(.*?)layout\.(?:tsx|jsx|ts|js)$/;
 const PAGES_PAGE_PATTERN = /^(?:src\/)?pages\/(.*?)\.(?:tsx|jsx|ts|js)$/;
 /** Next 的 pages 目录里这些文件不是路由。 */
 const PAGES_SPECIAL = new Set(["_app", "_document", "_error", "middleware"]);
@@ -765,6 +916,21 @@ export function analyzeRoutes(input: RouteAnalysisInput): RouteAnalysisResult {
       else componentsByFile.set(component.file, [component]);
     }
 
+    // 先收集 layout.tsx：`app/users/layout.tsx` 的目录前缀是 `app/users/`，
+    // 以它开头的页面文件都在这个 layout 的子树里（含分组目录的原始段名，
+    // 不做 URL 转换——文件约定按目录算，不按 URL 算）
+    const layouts: { prefix: string; componentId: string }[] = [];
+    for (const file of project.getSourceFiles()) {
+      const relativeFile = toProjectRelative(rootPath, file.getFilePath());
+      if (relativeFile === null || !APP_LAYOUT_PATTERN.test(relativeFile)) continue;
+      const layoutComponent = pickPageComponent(relativeFile, componentsByFile);
+      if (!layoutComponent) continue;
+      const prefix = relativeFile.slice(0, relativeFile.lastIndexOf("/") + 1);
+      layouts.push({ prefix, componentId: layoutComponent.id });
+    }
+    // 前缀长者排前 = 目录从深到浅（离页面最近的 layout 在最前），顺序可复现
+    layouts.sort((a, b) => b.prefix.length - a.prefix.length || a.prefix.localeCompare(b.prefix));
+
     for (const file of project.getSourceFiles()) {
       const relativeFile = toProjectRelative(rootPath, file.getFilePath());
       if (relativeFile === null) continue;
@@ -794,6 +960,11 @@ export function analyzeRoutes(input: RouteAnalysisInput): RouteAnalysisResult {
       const pageComponent = pickPageComponent(relativeFile, componentsByFile);
       const pageComponentId = pageComponent?.id ?? null;
 
+      // 包住本页面的 layout：文件路径以 layout 目录为前缀（根 layout → "app/"）
+      const inheritedLayoutComponentIds = layouts
+        .filter((layout) => relativeFile.startsWith(layout.prefix))
+        .map((layout) => layout.componentId);
+
       collector.add({
         path,
         index: path === "/" && rawSegments.length === 0,
@@ -802,8 +973,9 @@ export function analyzeRoutes(input: RouteAnalysisInput): RouteAnalysisResult {
         // Next 没有 path 字面量，位置取页面组件声明处；组件缺失时退回文件头
         loc: pageComponent?.loc ?? { line: 1, col: 1 },
         pageComponentId,
-        // Next 的标题在 metadata / generateMetadata 里，是另一个分析器的活，这里不猜
+        isLayout: false,
         title: null,
+        inheritedLayoutComponentIds,
       });
     }
   }
