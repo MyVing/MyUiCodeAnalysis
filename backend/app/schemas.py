@@ -6,6 +6,8 @@ from typing import Literal
 from pydantic import BaseModel, ConfigDict, Field, field_validator
 from pydantic.alias_generators import to_camel
 
+from app.contracts import Evidence, RequirementWarning
+
 
 class ApiModel(BaseModel):
     model_config = ConfigDict(alias_generator=to_camel, populate_by_name=True)
@@ -366,3 +368,24 @@ class SourceExcerpt(ApiModel):
     end_line: int
     content: str
     truncated: bool = False
+
+
+class ApiUsagePage(ApiModel):
+    """接口反查的一条命中：某页面（经某条调用链）请求了这个接口（6.11）。"""
+
+    page_node_id: str
+    route_node_id: str | None = None
+    # 完整调用链 nodeIds / edgeIds：api → … → 页面（→ 路由），每一环都可回图核对
+    path: list[str]
+    edge_path: list[str]
+    confidence: float
+    # URL 只做了后缀匹配（method 未提供或走 match=suffix）：结论降档，如实标注
+    url_suffix_match: bool = False
+    # 运行时双证：trace 的请求 URL 与页面 URL 同时出现
+    runtime_backed: bool = False
+    evidence: list[Evidence] = Field(default_factory=list)
+
+
+class ApiUsageResult(ApiModel):
+    pages: list[ApiUsagePage] = Field(default_factory=list)
+    warnings: list[RequirementWarning] = Field(default_factory=list)

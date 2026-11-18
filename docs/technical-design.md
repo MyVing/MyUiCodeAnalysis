@@ -1059,7 +1059,10 @@ AI 在平台里的角色是**受限的语义翻译官**：它只看得到几十�
 | 函数 → 上层调用者 | `calls` | caller → callee | 3 |
 | 元素 → 所属组件 | `contains` | parent → child | 2 |
 | 子组件 → 父组件 | `renders` | parent → child | 3 |
-| 页面 → 路由 | `renders` | route → page | 1 |
+| hook → 使用者 | `uses` | user → hook | 2 |
+| 页面 → 路由 | `renders` | route → page | 1（终跳，不占上面预算） |
+
+**已实现**（`app/ir/api_usage.py` + `GET /projects/{id}/api-usage`）：索引按 analysisId 内存缓存（节点/边数变化即失效），反查 DFS 收集完整 `nodeIds + edgeIds` 路径，置信度沿路径取最小值 × 锚点系数；页面命中即止（不再向 layout 方向展开，避免「谁可能沾边」冲淡「谁在用」）。实现补了表外的 `uses` 一行：#23 修复请求归属后，`组件 --uses--> hook --requests--> api` 是真实链路，不走它就漏页。
 
 **查询接口设计**（只读、零模型）：
 
@@ -1118,7 +1121,7 @@ export const fetchOrders = () => request(`${API_PREFIX}/orders`);
 
 - 节点层面：前缀求不出来 → 不产 api 节点，产出 `api_url_prefix_unresolved`（warning，带文件 / 行列 / 原始写法）。静默跳过会让「该页面不调用此接口」变成一条错误结论；
 - 节点层面：能定位但源码写法与解析结果不同 → `api.attrs.urlRaw` 保留原始文本，前端可回显「代码里写的是什么」；
-- 反查层面：命中后缀时标 `url_suffix_match`（0.85），并在结果里写明「前缀不可确定」——**未实现**，见第十节 #16；
+- 反查层面：命中后缀时标 `url_suffix_match`（0.85）——**已实现**（`urlSuffixMatch` 字段）；「前缀不可确定」的说明文案仍待做，见第十节 #16；
 - 召回层面：这类 URL 不进 `apiUrl` 信号，避免用 `${…}/orders` 这种残片参与文本匹配。
 
 **当前仍未覆盖**：`axios.create({ baseURL })`、vite `proxy` 配置、`import.meta.env.VITE_*` 的**实际值**（env 运行时才确定，现取 `??` 的显式 fallback）。这些属同一层但需要读配置文件与构建期环境。
@@ -1584,7 +1587,7 @@ dry-run 默认开启：模型产出的计划先给用户审阅，再决定是否
 | --- | --- | --- | --- | --- |
 | 1 | 需求文档只支持纯文本 | `features.py` 按行/句切分，无标题层级、表格、字符偏移、验收标准 | 文档里的接口表、字段表、页面名被当成普通中文词，最可靠的定位信息丢失 | 6.13 |
 | 2 | 没有锚点抽取 | 路由 / 接口 / 组件名 / 字段名没有在拆解前被结构化识别 | 本可 0.95 的确定性定位退化成 ≤0.6 的语义猜测 | 6.13 |
-| 3 | 没有接口反向索引 | 6.11 此前只有交叉引用、没有正文 | 无法回答「这个接口在哪个页面被调用」 | 6.11 |
+| 3 | ~~没有接口反向索引~~ | **已修**：新增 `GET /projects/{id}/api-usage`（只读零模型）——`app/ir/api_usage.py` 构建反向索引（api 键 = method + 归一化 url，按 analysisId 内存缓存），沿 `requests`/`calls`/`contains`/`renders`/`uses` 反向 DFS 收集完整 nodeIds + edgeIds 路径，置信度沿路径取最小值 × 锚点（精确 0.95 / 后缀或无 method 0.85 并标 `urlSuffixMatch`）；超 3 页面记 `api_usage_ambiguous`，无页面可达记 `api_no_page_reachable`（死接口线索）；最新 trace 的请求 URL + 页面 URL 双证命中时抬到 0.95 并标 `runtimeBacked` | — | 6.11 |
 | 4 | ~~route.title~~ / 菜单名未提取 | **已修（route.title）**：`routes.ts` 从路由表提取 `title` / `label` / `name` 字面量与 react-router `handle.title`（JSX 形态收 `title` 属性），写入 `route.attrs.title`；召回新增 `routeTitle` 信号（0.9）并进引文语料，「订单管理页」可命中带标题的路由。菜单配置提取（`mapping.json` 的 `menuFiles` 白名单）仍待做 | 4.1.6 |
 | 5 | layout / page 未区分 | 同一 path 下按遍历顺序取页面组件 | 可能把布局组件当成页面，0.9 置信度也救不回来 | 4.1.6 / 6.12 |
 | 6 | ~~没有 `navigates` 边~~ | **已修**：`navigate.ts` 产出 `navigates` 边 | — | 4.1.5 / 6.14 |
