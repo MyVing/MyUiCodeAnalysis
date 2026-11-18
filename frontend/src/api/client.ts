@@ -107,6 +107,10 @@ export const api = {
   syncProject: (projectId: string) =>
     request<Project>(`/projects/${projectId}/sync`, { method: "POST" }),
 
+  /** 删除项目：Git 项目会一并回收受管克隆目录，领域产物随项目级联清除 */
+  deleteProject: (projectId: string) =>
+    request<void>(`/projects/${projectId}`, { method: "DELETE" }),
+
   getProject: (projectId: string) => request<Project>(`/projects/${projectId}`),
 
   getProjectGraph: (projectId: string) =>

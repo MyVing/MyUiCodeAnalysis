@@ -79,8 +79,14 @@ def get_project_service(
     repository: Annotated[ProjectRepository, Depends(get_project_repository)],
     git: Annotated[GitClient, Depends(get_git_client)],
     settings: SettingsDep,
+    analyses: Annotated[AnalysisRepository, Depends(get_analysis_repository)],
+    requirements: Annotated[RequirementRepository, Depends(get_requirement_repository)],
+    runtimes: Annotated[RuntimeRepository, Depends(get_runtime_repository)],
+    explores: Annotated[ExploreRepository, Depends(get_explore_repository)],
 ) -> ProjectService:
-    return ProjectService(repository, git, settings)
+    return ProjectService(
+        repository, git, settings, analyses, requirements, runtimes, explores
+    )
 
 
 def get_worker_runner() -> WorkerRunner:

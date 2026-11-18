@@ -23,3 +23,6 @@ class ExploreRepository(Protocol):
     async def get_artifact(self, task_id: str) -> dict[str, Any] | None: ...
 
     async def get_artifacts_dir(self, task_id: str) -> str | None: ...
+
+    async def purge_project(self, project_id: str) -> None:
+        """清空该项目的探索任务与产物记录（MySQL 靠外键级联，内存仓储显式清）。"""

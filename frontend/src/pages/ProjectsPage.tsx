@@ -12,6 +12,7 @@ import {
   Plus,
   RefreshCw,
   Sparkles,
+  Trash2,
   TriangleAlert,
   Wifi,
   WifiOff,
@@ -56,6 +57,8 @@ export default function ProjectsPage() {
   const [showGitAdvanced, setShowGitAdvanced] = useState(false);
   const [alreadyOnboardedId, setAlreadyOnboardedId] = useState<string | null>(null);
   const [syncError, setSyncError] = useState<{ id: string; message: string } | null>(null);
+  const [confirmingDeleteId, setConfirmingDeleteId] = useState<string | null>(null);
+  const [deleteError, setDeleteError] = useState<{ id: string; message: string } | null>(null);
 
   const createGit = useMutation({
     mutationFn: (payload: ProjectGitCreate) => api.createGitProject(payload),
@@ -89,6 +92,24 @@ export default function ProjectsPage() {
       setSyncError({
         id: projectId,
         message: error instanceof Error ? error.message : "更新失败，请稍后重试。",
+      });
+    },
+  });
+
+  // 删除走两步确认：第一次点只进入待确认态，再点一次才真正删，
+  // 避免误触——删除会连带清掉分析产物与 Git 受管克隆目录
+  const deleteProject = useMutation({
+    mutationFn: (projectId: string) => api.deleteProject(projectId),
+    onSuccess: () => {
+      setDeleteError(null);
+      setConfirmingDeleteId(null);
+      void queryClient.invalidateQueries({ queryKey: ["projects"] });
+    },
+    onError: (error, projectId) => {
+      setConfirmingDeleteId(null);
+      setDeleteError({
+        id: projectId,
+        message: error instanceof Error ? error.message : "删除失败，请稍后重试。",
       });
     },
   });
@@ -497,9 +518,30 @@ export default function ProjectsPage() {
                   key={project.id}
                   project={project}
                   syncing={syncProject.isPending && syncProject.variables === project.id}
-                  error={syncError?.id === project.id ? syncError.message : null}
-                  onOpen={() => navigate(`/projects/${project.id}`)}
-                  onSync={() => syncProject.mutate(project.id)}
+                  deleting={deleteProject.isPending && deleteProject.variables === project.id}
+                  confirmingDelete={confirmingDeleteId === project.id}
+                  error={
+                    syncError?.id === project.id
+                      ? syncError.message
+                      : deleteError?.id === project.id
+                        ? deleteError.message
+                        : null
+                  }
+                  onOpen={() => {
+                    setConfirmingDeleteId(null);
+                    navigate(`/projects/${project.id}`);
+                  }}
+                  onSync={() => {
+                    setConfirmingDeleteId(null);
+                    syncProject.mutate(project.id);
+                  }}
+                  onDelete={() => {
+                    if (confirmingDeleteId === project.id) {
+                      deleteProject.mutate(project.id);
+                    } else {
+                      setConfirmingDeleteId(project.id);
+                    }
+                  }}
                 />
               ))}
             </div>
@@ -521,15 +563,21 @@ export default function ProjectsPage() {
 function ProjectCard({
   project,
   syncing,
+  deleting,
+  confirmingDelete,
   error,
   onOpen,
   onSync,
+  onDelete,
 }: {
   project: Project;
   syncing: boolean;
+  deleting: boolean;
+  confirmingDelete: boolean;
   error: string | null;
   onOpen: () => void;
   onSync: () => void;
+  onDelete: () => void;
 }) {
   const isGit = project.source === "git";
   const commit = shortCommit(project.commitSha);
@@ -597,14 +645,52 @@ function ProjectCard({
           <button
             type="button"
             onClick={onSync}
-            disabled={syncing}
+            disabled={syncing || deleting}
             title="从远端更新到最新提交"
             className="app-btn-icon shrink-0"
           >
             <RefreshCw size={13} className={syncing ? "animate-spin" : undefined} />
           </button>
         )}
+
+        <button
+          type="button"
+          onClick={onDelete}
+          disabled={deleting || syncing}
+          title={
+            confirmingDelete
+              ? "再点一次确认删除（会清掉分析产物）"
+              : "删除项目（分析产物一并清除）"
+          }
+          className={`app-btn-icon shrink-0 transition ${
+            confirmingDelete
+              ? "border-rose-400/40 bg-rose-400/15 text-rose-300"
+              : "text-slate-400 hover:border-rose-400/30 hover:text-rose-300"
+          }`}
+        >
+          {deleting ? (
+            <Loader2 size={13} className="animate-spin" />
+          ) : (
+            <Trash2 size={13} />
+          )}
+        </button>
       </div>
+
+      {confirmingDelete && (
+        <div className="flex items-center justify-between gap-3 border-t border-rose-400/10 px-4 py-2">
+          <p className="text-[11px] text-rose-200">
+            删除后无法恢复：分析产物{isGit ? "与 Git 克隆目录 " : " "}一并清除，确定吗？
+          </p>
+          <button
+            type="button"
+            onClick={onDelete}
+            disabled={deleting}
+            className="shrink-0 rounded-lg border border-rose-400/40 bg-rose-400/15 px-2.5 py-1 text-[11px] font-medium text-rose-200 transition hover:bg-rose-400/25"
+          >
+            确认删除
+          </button>
+        </div>
+      )}
 
       {error && (
         <p className="border-t border-rose-400/10 px-4 py-2 text-[11px] text-rose-300">

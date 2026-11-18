@@ -143,6 +143,28 @@ def test_clone_failure_is_visible_and_leaves_no_project(
     assert list((tmp_path / "repos").glob("*")) == []
 
 
+def test_delete_git_project_reclaims_managed_directory(
+    client: TestClient, fake_git: FakeGitClient
+) -> None:
+    created = client.post(
+        "/api/v1/projects/git", json={"gitUrl": "https://github.com/acme/app"}
+    ).json()
+    destination = fake_git.clone_calls[0][1]
+    assert destination.is_dir()
+
+    deleted = client.delete(f"/api/v1/projects/{created['id']}")
+    assert deleted.status_code == 204
+    # 受管克隆目录由平台独占，删除项目时一并回收
+    assert not destination.exists()
+
+    # 去重键随项目删除而释放：同一仓库可以重新接入
+    re_created = client.post(
+        "/api/v1/projects/git", json={"gitUrl": "https://github.com/acme/app.git"}
+    )
+    assert re_created.status_code == 201
+    assert len(fake_git.clone_calls) == 2
+
+
 def test_sync_pulls_latest_commit(client: TestClient, fake_git: FakeGitClient) -> None:
     created = client.post(
         "/api/v1/projects/git", json={"gitUrl": "https://github.com/acme/app"}

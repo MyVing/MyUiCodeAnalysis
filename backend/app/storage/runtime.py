@@ -27,3 +27,6 @@ class RuntimeRepository(Protocol):
     async def get_trace_by_task(self, task_id: str) -> RuntimeTrace | None: ...
 
     async def get_latest_trace(self, project_id: str) -> RuntimeTrace | None: ...
+
+    async def purge_project(self, project_id: str) -> None:
+        """清空该项目的采集任务与 trace（MySQL 靠外键级联，内存仓储显式清）。"""

@@ -54,6 +54,10 @@ class InMemoryProjectRepository:
             self._items[project.id] = project
         return project
 
+    async def delete(self, project_id: str) -> bool:
+        async with self._lock:
+            return self._items.pop(project_id, None) is not None
+
 
 class InMemoryAnalysisRepository:
     def __init__(self) -> None:
@@ -149,6 +153,18 @@ class InMemoryAnalysisRepository:
         async with self._lock:
             return self._profiles.get(project_id, {}).get(analysis_id)
 
+    async def purge_project(self, project_id: str) -> None:
+        async with self._lock:
+            self._tasks = {
+                task_id: item
+                for task_id, item in self._tasks.items()
+                if item.project_id != project_id
+            }
+            self._graphs.pop(project_id, None)
+            self._graph_order.pop(project_id, None)
+            self._profiles.pop(project_id, None)
+            self._profile_order.pop(project_id, None)
+
 
 def create_project_repository() -> InMemoryProjectRepository:
     return InMemoryProjectRepository()
@@ -216,6 +232,23 @@ class InMemoryRequirementRepository:
                 return None
             return self._maps.get(requirement_id)
 
+    async def purge_project(self, project_id: str) -> None:
+        async with self._lock:
+            task_ids = [
+                task_id
+                for task_id, item in self._tasks.items()
+                if item.project_id == project_id
+            ]
+            for task_id in task_ids:
+                del self._tasks[task_id]
+                self._map_by_task.pop(task_id, None)
+            self._maps = {
+                requirement_id: item
+                for requirement_id, item in self._maps.items()
+                if item.projectId != project_id
+            }
+            self._map_order.pop(project_id, None)
+
 
 def create_requirement_repository() -> InMemoryRequirementRepository:
     return InMemoryRequirementRepository()
@@ -278,6 +311,20 @@ class InMemoryRuntimeRepository:
                 return None
             return self._traces.get(order[-1])
 
+    async def purge_project(self, project_id: str) -> None:
+        async with self._lock:
+            self._tasks = {
+                task_id: item
+                for task_id, item in self._tasks.items()
+                if item.project_id != project_id
+            }
+            self._traces = {
+                trace_id: item
+                for trace_id, item in self._traces.items()
+                if item.projectId != project_id
+            }
+            self._trace_order.pop(project_id, None)
+
 
 def create_runtime_repository() -> InMemoryRuntimeRepository:
     return InMemoryRuntimeRepository()
@@ -333,6 +380,21 @@ class InMemoryExploreRepository:
         async with self._lock:
             stored = self._artifacts.get(task_id)
             return stored[1] if stored else None
+
+    async def purge_project(self, project_id: str) -> None:
+        async with self._lock:
+            self._tasks = {
+                task_id: item
+                for task_id, item in self._tasks.items()
+                if item.project_id != project_id
+            }
+            for task_id in [
+                task_id
+                for task_id, (artifact, _) in self._artifacts.items()
+                if str(artifact.get("projectId")) == project_id
+            ]:
+                del self._artifacts[task_id]
+            self._artifact_order.pop(project_id, None)
 
 
 def create_explore_repository() -> InMemoryExploreRepository:

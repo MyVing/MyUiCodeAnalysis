@@ -28,3 +28,6 @@ class RequirementRepository(Protocol):
     async def get_map(self, requirement_id: str) -> RequirementMap | None: ...
 
     async def get_map_by_task(self, task_id: str) -> RequirementMap | None: ...
+
+    async def purge_project(self, project_id: str) -> None:
+        """清空该项目的定位任务与产物（MySQL 靠外键级联，内存仓储显式清）。"""

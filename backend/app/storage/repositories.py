@@ -32,8 +32,17 @@ class ProjectRepository(Protocol):
 
     async def update(self, project: Project) -> Project: ...
 
+    async def delete(self, project_id: str) -> bool:
+        """删除项目记录；返回是否真的删了（不存在返回 False）。"""
+
 
 class AnalysisRepository(Protocol):
+    async def purge_project(self, project_id: str) -> None:
+        """清空该项目的分析任务、图产物与页画像。
+
+        MySQL 实现靠 projects 外键 ON DELETE DELETE CASCADE，此方法是内存
+        仓储（无外键）的等价物；删除项目时两条存储路径行为一致。
+        """
     async def add_task(self, task: AnalysisTask) -> AnalysisTask | None:
         """登记新任务；该项目已有 queued/running 任务时返回 None（并发冲突）。"""
 

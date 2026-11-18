@@ -23,7 +23,14 @@ from app.git_client import (
     repo_display_name,
 )
 from app.schemas import Project, ProjectCreate, ProjectGitCreate
-from app.storage.repositories import DuplicateRemoteUrlError, ProjectRepository
+from app.storage.explore import ExploreRepository
+from app.storage.repositories import (
+    AnalysisRepository,
+    DuplicateRemoteUrlError,
+    ProjectRepository,
+)
+from app.storage.requirement import RequirementRepository
+from app.storage.runtime import RuntimeRepository
 
 
 class InvalidGitUrlError(Exception):
@@ -52,10 +59,19 @@ class ProjectService:
         repository: ProjectRepository,
         git: GitClient,
         settings: Settings,
+        analyses: AnalysisRepository | None = None,
+        requirements: RequirementRepository | None = None,
+        runtimes: RuntimeRepository | None = None,
+        explores: ExploreRepository | None = None,
     ) -> None:
         self._repository = repository
         self._git = git
         self._settings = settings
+        # 领域仓储可选：只为删除时的产物清理服务；未传入则只删项目记录
+        self._analyses = analyses
+        self._requirements = requirements
+        self._runtimes = runtimes
+        self._explores = explores
 
     async def list_projects(self) -> list[Project]:
         return await self._repository.list()
@@ -143,3 +159,26 @@ class ProjectService:
             }
         )
         return await self._repository.update(updated)
+
+    async def delete_project(self, project: Project) -> bool:
+        """删除项目与全部领域产物；Git 项目一并回收受管克隆目录。
+
+        返回 False 表示项目已被并发删除。本地目录项目只解除登记，
+        绝不触碰用户自己的文件。
+        """
+        deleted = await self._repository.delete(project.id)
+        if not deleted:
+            return False
+        # 领域产物与项目记录是两条存储路径（MySQL 靠外键级联，内存显式清），
+        # 项目行删掉后这些调用在任何一种存储下都收敛为 no-op 或空清理
+        if self._analyses is not None:
+            await self._analyses.purge_project(project.id)
+        if self._requirements is not None:
+            await self._requirements.purge_project(project.id)
+        if self._runtimes is not None:
+            await self._runtimes.purge_project(project.id)
+        if self._explores is not None:
+            await self._explores.purge_project(project.id)
+        if project.source == "git" and project.root_path:
+            remove_repo_directory(Path(project.root_path))
+        return True

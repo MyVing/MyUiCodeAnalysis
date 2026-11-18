@@ -89,3 +89,15 @@ async def sync_project(project_id: str, service: ProjectServiceDep) -> Project:
 @router.get("/{project_id}", response_model=Project)
 async def get_project(project_id: str, service: ProjectServiceDep) -> Project:
     return await require_project(project_id, service)
+
+
+@router.delete(
+    "/{project_id}",
+    status_code=status.HTTP_204_NO_CONTENT,
+    responses={
+        404: {"description": "项目不存在"},
+    },
+)
+async def delete_project(project_id: str, service: ProjectServiceDep) -> None:
+    project = await require_project(project_id, service)
+    await service.delete_project(project)

@@ -434,6 +434,14 @@ class MySqlProjectRepository:
             )
         return project.model_copy(update={"storage": "mysql"})
 
+    async def delete(self, project_id: str) -> bool:
+        query = text("DELETE FROM projects WHERE id = :id")
+        async with self._engine.begin() as conn:
+            result = await conn.execute(query, {"id": project_id})
+        # 子表全部带 REFERENCES projects(id) ON DELETE CASCADE，
+        # 分析 / 需求 / 运行时 / 探索产物随这一条语句一起消失
+        return result.rowcount > 0
+
 
 class MySqlAnalysisRepository:
     def __init__(self, engine: AsyncEngine) -> None:
@@ -654,6 +662,10 @@ class MySqlAnalysisRepository:
             row = (await conn.execute(query, {"pid": project_id, "aid": analysis_id})).first()
         return ProfilePayload.model_validate_json(row.payload) if row else None
 
+    async def purge_project(self, project_id: str) -> None:
+        # MySQL 路径靠 projects 外键级联删除，无需额外语句
+        return None
+
 
 class MySqlRequirementRepository:
     def __init__(self, engine: AsyncEngine) -> None:
@@ -796,6 +808,10 @@ class MySqlRequirementRepository:
         async with self._engine.connect() as conn:
             row = (await conn.execute(query, {"id": task_id})).first()
         return RequirementMap.model_validate_json(row.payload) if row else None
+
+    async def purge_project(self, project_id: str) -> None:
+        # MySQL 路径靠 projects 外键级联删除，无需额外语句
+        return None
 
 
 class MySqlRuntimeRepository:
@@ -942,6 +958,10 @@ class MySqlRuntimeRepository:
             row = (await conn.execute(query, {"pid": project_id})).first()
         return RuntimeTrace.model_validate_json(row.payload) if row else None
 
+    async def purge_project(self, project_id: str) -> None:
+        # MySQL 路径靠 projects 外键级联删除，无需额外语句
+        return None
+
 
 class MySqlExploreRepository:
     """探索任务 + 整包产物（JSON）+ 产物目录。形状与 runtime 仓储同构。"""
@@ -1080,3 +1100,7 @@ class MySqlExploreRepository:
         async with self._engine.connect() as conn:
             row = (await conn.execute(query, {"tid": task_id})).first()
         return str(row.artifacts_dir) if row else None
+
+    async def purge_project(self, project_id: str) -> None:
+        # MySQL 路径靠 projects 外键级联删除，无需额外语句
+        return None
