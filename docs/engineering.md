@@ -145,7 +145,7 @@ tests/fixtures/            验收样本，M1 的分析器以它们为准
 
 ## 与项目文档的对应
 
-设计依据见仓库外层的 `React代码智能分析平台-项目文档-动态方案补充版.md`。当前处于 **P3（AI 语义层）完成** 的状态：M1 静态分析 + P1 持久化 + P2 运行时采集 + P3 语义判定全部落地，详见文末各阶段记录。
+设计依据见仓库外层的 `React代码智能分析平台-项目文档-动态方案补充版.md`。当前处于 **P4（Git 项目接入与前端重构）完成** 的状态：M1 静态分析 + P1 持久化 + P2 运行时采集 + P3 语义判定 + P4 项目接入全部落地，详见文末各阶段记录。
 
 **M1 已完成**：module resolver、组件发现、renders 边、props 展开、hooks / state、API 链路、事件分析、二次封装映射（`ProTable → antd.Table`）、可见文案提取（`attrs.uiText`）；编排层（`AnalysisService` + `SubprocessWorkerRunner`，queued→running→succeeded/failed，错误码 `worker_timeout` / `worker_spawn_failed` / `worker_protocol_error` / `invalid_ir` 全部可见）；前端工作台（触发分析 + 轮询 + 图谱浏览 + 高级选项）。后端 36 个测试、前端 44 个测试、ruff/mypy 全绿，真实 worker E2E 已验证。
 
@@ -175,9 +175,9 @@ tests/fixtures/            验收样本，M1 的分析器以它们为准
 - 验证：backend 84 单测全绿；MySQL 集成 8 passed（`APP_MYSQL_INTEGRATION` 门控）；**真实 Playwright 采集集成 3 passed**（`APP_RUNTIME_INTEGRATION` 门控，url 与 command 托管两条路径 + 真实 trace 合并，约 24s）；前端 53、ast-worker 175、runtime-worker 33 测试全绿。
 
 **待完成**：
-- 路由 / 页面节点（`NodeKind.route` 已预留但无分析器产出）
 - 运行时增强（可选）：交互主动遍历、Console/网络与节点的关联深化
-- 语义层增强（可选，见 `docs/p3-semantic-layer-design.md`）：路由分析器补 `routePath` 信号、影响面解释、回归建议
+- 语义层增强（可选，见 `docs/p3-semantic-layer-design.md`）：影响面解释、回归建议
+- 链路层（见 `docs/chain-semantic-design.md`）：`derive_chains` + `ActionChain` 契约、前端链路视图、召回语义路
 
 **P3 AI 语义层已完成**：设计文档（`b4aec47`）→ 后端判定编排（`a793ffa`）→ 前端面板（`957191b`）。
 
@@ -190,3 +190,28 @@ tests/fixtures/            验收样本，M1 的分析器以它们为准
 - **aiomysql × pymysql 1.2 不兼容是实测踩坑**：pymysql 1.2 起 `converters.escape_bytes_prefixed` 变成弃用占位字符串（访问返回 deprecation 文案，调用即 `TypeError: 'str' object is not callable`），aiomysql 0.3.2 落 LONGBLOB 必炸。已在 pyproject 钉住 `pymysql>=1.1,<1.2`。
 - 前端 `RequirementPanel`：默认勾选 dry-run（先验证召回质量再烧模型）；匹配项点击联动图节点选中；dropped 单独成块展示（amber 色）——审核模型是否在幻想，只能靠这份记录。
 - 验证：backend 105 单测全绿（judge 9 + 服务/API 12 新增）；MySQL 集成 9 passed（新增 checkpointer roundtrip）；真实模型集成测试就绪（`APP_LLM_INTEGRATION` 门控，需 `APP_LLM_API_KEY`，断言只锁契约不变量不锁模型结论）；前端 57、根仓库 typecheck/test 全绿。
+
+**P4 Git 项目接入与前端重构已完成**：后端接入链路 + 存储升级 + 深色控制台。
+
+- **输入 Git 地址即完成初始化**：`POST /projects/git` 浅克隆到 `APP_REPOS_DIR`（默认 `~/.uicodeanalysis/repos`），自动识别 React / Next 并读取默认分支与提交 SHA；`root_path` 指向受管克隆目录，不污染用户工作区。项目契约新增 `source=local|git`、`remote_url`、`git_branch`、`commit_sha`、`last_synced_at`。
+- **去重键是归一化地址，不是用户输入**（`app/git_client.py`）：`git@github.com:acme/app.git`、`https://github.com/Acme/App/`、带凭据的 HTTPS 地址都归一为 `github.com/acme/app`；MySQL 唯一索引 `uq_projects_remote` 与内存实现同语义，重复接入返回 409 并携带既有 `projectId`，前端直接给出「打开已接入项目」。并发接入同一地址时，后到者清理自己的克隆副本，不覆盖先到者。
+- **Token 与账号密码二选一**：私有仓库可选 `username` + `password`（密码也可以是平台签发的访问令牌）或单独 `token`；凭据只在本次 `git clone` 中使用，按段 URL 编码后注入 HTTPS 地址（`app/git_client.py::inject_credentials`），不落库、不回显；`GIT_TERMINAL_PROMPT=0` 保证凭据缺失时显式失败而不是卡在交互提示。
+- **更新以远端为准**：`POST /projects/{id}/sync` 执行 `fetch --prune` + `reset --hard @{upstream}`——克隆产物由平台独占，本地改动没有保留价值；同步后的分支与提交 SHA 写回项目记录。本地目录项目调用同步返回 409。
+- **旧库幂等升级**：`projects` 新增列与唯一索引在启动时按 `information_schema` 检查后补齐（`_ensure_project_columns`），继续不引入迁移工具；MySQL 唯一索引允许多个 NULL，本地目录项目不受影响。
+- **前端重构为深色控制台**：项目列表页改为「Git 仓库 / 本地目录」双入口 + 项目卡片（框架、远端、分支、短 SHA、同步时间、一键更新、冲突直达）；工作台、图谱画布、侧栏、节点卡片与详情面板统一深色视觉（indigo/violet 强调色、玻璃面板、暗色 React Flow 控件与 MiniMap、状态横幅分级配色）。
+- **大图只渲染聚焦子图**（`frontend/src/graph/focus.ts`）：超过 120 个节点默认进入聚焦模式——从选中节点沿依赖边双向扩两跳、上限 120 个节点，`sliceGraph` 把子图交给 React Flow，dagre 布局也只算子图；用户可随时切「显示全图」。工作台浮层显示「已渲染 / 全量」节点数，切图后自动 `fitView`。
+- **需求 → 组件 → 前端逻辑闭环**：需求定位匹配项点击后不仅选中节点，还强制切到聚焦模式（邻域 + 布局收敛）；右侧 `NodeInspector` 新增「依赖与调用」（上游 / 下游，点击可继续跳转聚焦）与「前端逻辑（源码片段）」——按节点 `file:line` 调 `GET /projects/{id}/source`，带行号展示、高亮当前行，路径越狱仍由后端 `resolve()` 校验兜底。
+- 验证：backend 121 passed + 14 skipped（ruff / mypy 无错误）；frontend 63 tests + lint + typecheck + production build 全绿。
+
+**视图层与导航层已完成（P3.5 第一批）**：`jsx-inventory.ts` + `view.ts` + `navigate.ts`，并把三者接入 `index.ts` 的编排。
+
+- **元素 id 只有一个来源**（`workers/ast-worker/src/jsx-inventory.ts`）：为每个归组件所有的 JSX 开标签分配一次 id，形状为 `组件id + jsx:标签[#序号 或 /处理函数名]`。`view.ts` 与 `events.ts` 都查这份清单——各算各的必然漂移，同一个 `<button>` 会在图上变成两个节点。
+- **计数器覆盖全部元素，不只覆盖被收录的元素**：序号按「该组件内同标签的全部出现顺序」计算。否则给某个按钮加一行 `onClick`，后面所有按钮的序号都会推后，id 随筛选规则漂移——这是最难查的一类不稳定，有专门的测试守着（`view.test.ts` 的「元素 id 不随上方插入注释而漂移」）。
+- **视图层只收有语义的元素**（`view.ts`）：控件 / 链接 / 语义容器 / 文本标签 / 带字面量 `columns` 的表格 / 带可见文案的元素。`div` / `span` 这类布局噪声默认不入图。判据全部是语法事实，`ProTable` 这类业务封装靠 `columns` 字面量进图，不靠名字。
+- **父子关系跨过被丢弃的布局层**：`contains` 连到「最近的、也在收录范围内的祖先」，中间的 `div` 不打断归属。跨函数边界（`rows.map(() => <li>)`）时回退连到所属组件——回调里的元素在渲染时才产生，把外层 JSX 当父级是捏造。置信度分两档：直达 1.0，跨过布局层 0.9。
+- **视图层为事件层补位**（`extraElementIds`）：事件层收了 `<div onClick>` 这类视图层不收的元素，它们已是图上节点，必须有 `contains` 父边，否则在视图树里是孤儿。视图层只补边、不产节点、不改 attrs——节点的内容归收录方。这个缺陷是真实 Worker 跑样本仓时发现的（三个孤儿元素），不是推演出来的。
+- **导航边靠包来源 + 符号回溯，不看名字猜**（`navigate.ts`）：`useNavigate` / `useRouter` / `redirect` 必须来自 `react-router*` / `next/*` / `@remix-run/react` / `@tanstack/react-router`，`navigate` 变量必须回溯到该 hook 的返回值，项目自造的同名函数不算。字面量路径 0.9；模板插值按段匹配动态路由（`/users/${id}` ↔ `/users/:id`）给 0.8；定不下来只告警，不编造边。
+- **`<Link>` 的边从元素出发，`<Navigate>` / `navigate()` 从组件出发**：前者渲染出可点击元素，后者不渲染任何东西、表达的是「渲染到这里就跳」。
+- **接线顺序**（`index.ts`）：`jsx-inventory` → `events` → `view(extraElementIds)` → `routes` → `navigate`。事件层先于视图层（视图层要知道哪些元素已被收）；导航层后于路由层（目标是 route 节点）与视图层（`<Link>` 的起点是元素）。
+- **前端 `ViewPanel`**：元素节点详情新增「界面」块（标签 + 角色徽标 + 可见文案 / 动态文案标注 / 表格列）。`NodeInspector` 的私有属性排除表按「面板是否真的接手」条件判定——`tag` / `target` 是事件层也写的字段，元素没有 `viewRole` 时它们是唯一信息，无条件排除就是丢数据。
+- 验证：ast-worker 211 passed（12 文件）、frontend 69 passed（15 文件）、backend 124 passed + 14 skipped；`npm run typecheck` 全绿；契约生成 `--check` 一致；真实 Worker 跑 `tests/fixtures/enterprise-react-app` 得到 32 节点 / 36 边（含 13 条 `contains`）。

@@ -33,6 +33,45 @@ class ProjectCreate(ApiModel):
         return stripped
 
 
+class ProjectGitCreate(ApiModel):
+    """按 Git 地址接入：平台负责克隆到受管目录，后续更新以远端为准。
+
+    私有仓库支持两种认证写法：`username` + `password`（密码也可以是平台签发的
+    访问令牌），或只给 `token`（等价于 `oauth2:<token>`）。凭据只在本次克隆命令
+    中使用，不落库、不回显；公开仓库全部留空即可。
+    """
+
+    git_url: str = Field(min_length=1, max_length=512)
+    name: str | None = Field(default=None, max_length=80)
+    branch: str | None = Field(default=None, max_length=128)
+    username: str | None = Field(default=None, max_length=256)
+    password: str | None = Field(default=None, max_length=512)
+    token: str | None = Field(default=None, max_length=512)
+    framework: Literal["react", "next"] | None = None
+
+    @field_validator("git_url")
+    @classmethod
+    def strip_git_url(cls, value: str) -> str:
+        stripped = value.strip()
+        if not stripped:
+            raise ValueError("Git 地址不能为空")
+        return stripped
+
+    @field_validator("name", "branch", "username", "token")
+    @classmethod
+    def strip_optional_text(cls, value: str | None) -> str | None:
+        if value is None:
+            return None
+        stripped = value.strip()
+        return stripped or None
+
+    @field_validator("password")
+    @classmethod
+    def empty_password_to_none(cls, value: str | None) -> str | None:
+        # 密码不做 strip：首尾空格可能是凭据的一部分，只把空串归一成 None
+        return value or None
+
+
 class Project(ApiModel):
     id: str
     name: str
@@ -40,6 +79,12 @@ class Project(ApiModel):
     framework: Literal["react", "next"]
     created_at: datetime
     storage: Literal["memory", "mysql"] = "memory"
+    # local = 用户登记的本地目录；git = 平台克隆的受管仓库
+    source: Literal["local", "git"] = "local"
+    remote_url: str | None = None
+    git_branch: str | None = None
+    commit_sha: str | None = None
+    last_synced_at: datetime | None = None
 
 
 class PluginDependency(ApiModel):

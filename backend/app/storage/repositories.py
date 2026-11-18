@@ -4,10 +4,19 @@
 避免同步 Protocol 被迫用线程池桥接。
 """
 
-from typing import Protocol
+from typing import TYPE_CHECKING, Protocol
 
 from app.contracts import IRGraph
 from app.schemas import AnalysisTask, Project
+
+if TYPE_CHECKING:
+    # 画像产物由 app.requirement.page_profile 定义（存储层与生成方共用的数据形状）。
+    # 这里只要类型，不在运行时导入：存储层不该为了一个注解把业务模块拉进导入链。
+    from app.requirement.page_profile import ProfilePayload
+
+
+class DuplicateRemoteUrlError(Exception):
+    """同一 Git 地址只能接入一次；内存校验与 MySQL 唯一索引都以此异常表达。"""
 
 
 class ProjectRepository(Protocol):
@@ -15,7 +24,13 @@ class ProjectRepository(Protocol):
 
     async def get(self, project_id: str) -> Project | None: ...
 
-    async def add(self, project: Project) -> Project: ...
+    async def get_by_remote(self, remote_url: str) -> Project | None:
+        """按归一化后的远程地址查重；本地目录项目永远返回 None。"""
+
+    async def add(self, project: Project) -> Project:
+        """新增项目；remote_url 已存在时抛 DuplicateRemoteUrlError。"""
+
+    async def update(self, project: Project) -> Project: ...
 
 
 class AnalysisRepository(Protocol):
@@ -39,3 +54,11 @@ class AnalysisRepository(Protocol):
 
     async def get_latest_graph(self, project_id: str) -> IRGraph | None:
         """最新图产物：merged 存在且晚于最新 static 时优先返回 merged。"""
+
+    async def save_page_profiles(self, project_id: str, payload: "ProfilePayload") -> None:
+        """保存一份页画像；同一 analysisId 覆盖。"""
+
+    async def get_page_profiles(
+        self, project_id: str, analysis_id: str
+    ) -> "ProfilePayload | None":
+        """按图产物取画像。定位与图版本不一致时应当拿不到，而不是拿到旧描述。"""

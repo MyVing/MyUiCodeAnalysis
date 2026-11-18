@@ -23,9 +23,10 @@ export interface RuntimeTrace {
    */
   analysisId?: string;
   /**
-   * 一期仅 passive（A 模式）；二期追加 ai-exploration
+   * passive：A 模式被动采集；ai-exploration：B 模式 AI 自动探索页面、生成场景与用例
    */
-  mode: "passive";
+  mode: "passive" | "ai-exploration";
+  exploration?: Exploration;
   devServer?: DevServer;
   /**
    * React fiber 树还原的组件挂载树（根组件数组）；file/line 与静态图合并时的关键运行时证据
@@ -52,6 +53,104 @@ export interface RuntimeTrace {
    * DOM 元素与静态节点的关联结果；无法关联时保留为 unmatched，不强行挂接
    */
   correlations?: Correlation[];
+}
+/**
+ * B 模式探索配置与结果；passive 模式缺省
+ */
+export interface Exploration {
+  /**
+   * 用户输入的探索目标，如「测试用户登录流程」
+   */
+  goal: string;
+  /**
+   * 探索步数上限，防止无限循环
+   */
+  maxSteps?: number;
+  /**
+   * AI 决策并执行的探索步骤序列
+   */
+  steps: ExplorationStep[];
+  scenario?: Scenario;
+  /**
+   * AI 生成的测试用例清单
+   */
+  testCases?: TestCase[];
+  screenshots?: {
+    ref: string;
+    stepIndex: number;
+    caption?: string;
+  }[];
+}
+export interface ExplorationStep {
+  index: number;
+  action: "click" | "input" | "select" | "navigate" | "submit" | "hover" | "scroll" | "other";
+  /**
+   * 目标元素的可读描述，如「登录按钮」或 selector 摘要
+   */
+  target: string;
+  /**
+   * 实际使用的 Playwright selector
+   */
+  selector?: string;
+  /**
+   * input/select 的值摘要；敏感字段脱敏
+   */
+  valueSummary?: string;
+  /**
+   * AI 选择该操作的理由（用于审计）
+   */
+  reasoning?: string;
+  /**
+   * 执行结果
+   */
+  result: "success" | "failed" | "no_change";
+  /**
+   * result=failed 时的错误信息
+   */
+  error?: string;
+  /**
+   * 本步执行后的截图引用
+   */
+  screenshotRef?: string;
+  /**
+   * 本步引发的网络事件 id
+   */
+  triggeredNetworkEvents?: string[];
+  /**
+   * 本步是否触发了页面跳转/路由变化
+   */
+  pageTransitioned?: boolean;
+}
+/**
+ * AI 根据探索过程归纳的用户场景
+ */
+export interface Scenario {
+  title: string;
+  description: string;
+  /**
+   * 场景前置条件
+   */
+  preconditions?: string[];
+  /**
+   * 场景预期结果
+   */
+  expectedOutcome?: string;
+}
+export interface TestCase {
+  title: string;
+  priority?: "p0" | "p1" | "p2" | "p3";
+  /**
+   * 测试步骤的自然语言描述
+   */
+  steps: string[];
+  /**
+   * 预期断言
+   */
+  expected: string[];
+  /**
+   * 关联的探索步骤 index
+   */
+  relatedSteps?: number[];
 }
 export interface DevServer {
   /**
@@ -157,6 +256,14 @@ export interface Interaction {
    * 本次交互引发的 network / navigation 事件 id
    */
   triggeredEvents?: string[];
+  /**
+   * 交互后的页面截图引用；B 模式每步必拍
+   */
+  screenshotRef?: string;
+  /**
+   * 交互执行结果：success 正常完成；failed 执行报错；no_change 页面无可见变化
+   */
+  result?: "success" | "failed" | "no_change";
 }
 export interface Correlation {
   id: string;

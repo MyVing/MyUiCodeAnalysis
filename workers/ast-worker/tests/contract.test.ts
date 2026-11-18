@@ -16,11 +16,14 @@ import { discoverComponents } from "../src/components.js";
 import { analyzeEvents } from "../src/events.js";
 import { analyzeHooks } from "../src/hooks.js";
 import { buildGraph } from "../src/ir-builder.js";
+import { buildJsxInventory } from "../src/jsx-inventory.js";
+import { analyzeNavigation } from "../src/navigate.js";
 import { createFullProject } from "../src/project.js";
 import { analyzeRenders } from "../src/renders.js";
 import { analyzeProps } from "../src/props.js";
 import { createResolutionIndex } from "../src/resolver.js";
 import { analyzeRoutes } from "../src/routes.js";
+import { analyzeView } from "../src/view.js";
 import { buildWrapperAttrs, loadWrapperMappings } from "../src/wrappers.js";
 
 const here = path.dirname(fileURLToPath(import.meta.url));
@@ -79,14 +82,26 @@ function analyzeFixture(analysisId = "an_test"): IRGraph {
   });
   const knownNodes = [...hooks.hookNodes, ...hooks.stateNodes, ...api.apiNodes, ...api.fnNodes];
   const events = analyzeEvents({
-    rootPath: FIXTURE_ROOT,
+    inventory: buildJsxInventory(FIXTURE_ROOT, project, discovery.components, discovery.declarations),
     components: discovery.components,
-    declarations: discovery.declarations,
-    project,
     knownNodes,
     propsFields: new Map(
       [...props.byComponent].map(([id, info]) => [id, info.fields.map((f) => f.name)]),
     ),
+    rootPath: FIXTURE_ROOT,
+  });
+  // 视图层与事件层共用同一份 JSX 清单：元素 id 必须一致，否则同一块 UI 在图上
+  // 会变成两个节点，视图树与事件链就断了。事件层先跑，视图层再为它收录的
+  // 元素补 contains 父边（与 index.ts 的接线顺序保持一致）。
+  const inventory = buildJsxInventory(
+    FIXTURE_ROOT,
+    project,
+    discovery.components,
+    discovery.declarations,
+  );
+  const view = analyzeView({
+    inventory,
+    extraElementIds: new Set(events.elementNodes.map((node) => node.id)),
   });
   const wrappers = loadWrapperMappings(FIXTURE_ROOT, discovery.components);
   const routes = analyzeRoutes({
@@ -95,6 +110,17 @@ function analyzeFixture(analysisId = "an_test"): IRGraph {
     components: discovery.components,
     definitionIndex: discovery.definitionIndex,
     resolution: resolution.index,
+  });
+  const navigation = analyzeNavigation({
+    rootPath: FIXTURE_ROOT,
+    inventory,
+    elementNodeIds: new Set([
+      ...view.elementNodes.map((node) => node.id),
+      ...events.elementNodes.map((node) => node.id),
+    ]),
+    routeNodes: routes.routeNodes,
+    components: discovery.components,
+    declarations: discovery.declarations,
   });
 
   return buildGraph({
@@ -105,9 +131,22 @@ function analyzeFixture(analysisId = "an_test"): IRGraph {
       wrappers.byComponent,
       new Set(renders.edges.map((edge) => `${edge.from} ${edge.to}`)),
     ),
-    edges: [...renders.edges, ...hooks.edges, ...api.edges, ...events.edges, ...routes.edges],
+    edges: [
+      ...renders.edges,
+      ...hooks.edges,
+      ...api.edges,
+      ...events.edges,
+      ...view.edges,
+      ...routes.edges,
+      ...navigation.edges,
+    ],
     externalNodes: renders.externalNodes,
-    extraNodes: [...knownNodes, ...events.elementNodes, ...routes.routeNodes],
+    extraNodes: [
+      ...knownNodes,
+      ...view.elementNodes,
+      ...events.elementNodes,
+      ...routes.routeNodes,
+    ],
     warnings: [
       ...resolution.warnings,
       ...discovery.warnings,
@@ -116,8 +155,10 @@ function analyzeFixture(analysisId = "an_test"): IRGraph {
       ...hooks.warnings,
       ...api.warnings,
       ...events.warnings,
+      ...view.warnings,
       ...wrappers.warnings,
       ...routes.warnings,
+      ...navigation.warnings,
     ],
   });
 }
@@ -287,9 +328,16 @@ describe("ast-worker IR 输出符合契约", () => {
     for (const node of elements) {
       expect(node.file).toBeDefined();
       expect(node.loc).toBeDefined();
-      expect(Array.isArray(node.attrs.events)).toBe(true);
-      // 元素必须有宿主组件：组件 uses 元素
-      expect(graph.edges.some((e) => e.kind === "uses" && e.to === node.id)).toBe(true);
+      // 元素要么带事件（事件层），要么带视图角色（视图层），两者可同时存在
+      const hasEvents = Array.isArray(node.attrs.events);
+      const hasRole = typeof node.attrs.viewRole === "string";
+      expect(hasEvents || hasRole).toBe(true);
+      // 元素不能成为孤立点：要么被组件 uses，要么被父元素 contains
+      expect(
+        graph.edges.some(
+          (e) => (e.kind === "uses" || e.kind === "contains") && e.to === node.id,
+        ),
+      ).toBe(true);
     }
 
     // 事件边的端点全部是图上已有节点（不新增 NodeKind 的依据）

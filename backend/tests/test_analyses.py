@@ -50,6 +50,9 @@ def test_successful_analysis_stores_real_graph(
     assert final["nodeCount"] == 1
     assert final["edgeCount"] == 1
     assert final["warningCount"] == 0
+    # startedAt 必须在终态里保留：进入 running 时写入的值不能被后续
+    # 全字段更新用 None 覆盖回去（否则前端算不出耗时）
+    assert final["startedAt"] is not None
     assert final["finishedAt"] is not None
 
     graph = client.get(f"/api/v1/projects/{analysis_project['id']}/graph")

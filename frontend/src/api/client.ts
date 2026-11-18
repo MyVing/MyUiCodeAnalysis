@@ -7,23 +7,35 @@ import type {
   PluginList,
   Project,
   ProjectCreate,
+  ProjectGitCreate,
   RequirementLocateStart,
   RequirementTask,
   RequirementTaskList,
   RuntimeStart,
   RuntimeTask,
   RuntimeTaskList,
+  SourceExcerpt,
 } from "@/api/types";
 
 const API_BASE_URL = import.meta.env.VITE_API_BASE_URL ?? "/api/v1";
 
 export class ApiError extends Error {
   readonly status: number;
+  /** 后端结构化错误的机器码，例如 git_project_exists */
+  readonly code?: string;
+  /** 冲突时指向已存在的项目，前端可直接跳转 */
+  readonly projectId?: string;
 
-  constructor(status: number, message: string) {
+  constructor(
+    status: number,
+    message: string,
+    extra: { code?: string; projectId?: string } = {},
+  ) {
     super(message);
     this.name = "ApiError";
     this.status = status;
+    this.code = extra.code;
+    this.projectId = extra.projectId;
   }
 }
 
@@ -37,15 +49,26 @@ async function request<T>(path: string, init: RequestInit = {}): Promise<T> {
 
   if (!response.ok) {
     let detail = `请求失败（HTTP ${response.status}）`;
+    let code: string | undefined;
+    let projectId: string | undefined;
     try {
       const body = (await response.json()) as { detail?: unknown };
       if (typeof body.detail === "string") {
         detail = body.detail;
+      } else if (body.detail && typeof body.detail === "object") {
+        const structured = body.detail as {
+          message?: unknown;
+          code?: unknown;
+          projectId?: unknown;
+        };
+        if (typeof structured.message === "string") detail = structured.message;
+        if (typeof structured.code === "string") code = structured.code;
+        if (typeof structured.projectId === "string") projectId = structured.projectId;
       }
     } catch {
       // 非 JSON 错误体，保留默认提示
     }
-    throw new ApiError(response.status, detail);
+    throw new ApiError(response.status, detail, { code, projectId });
   }
 
   if (response.status === 204) {
@@ -65,10 +88,27 @@ export const api = {
       body: JSON.stringify(payload),
     }),
 
+  createGitProject: (payload: ProjectGitCreate) =>
+    request<Project>("/projects/git", {
+      method: "POST",
+      body: JSON.stringify(payload),
+    }),
+
+  syncProject: (projectId: string) =>
+    request<Project>(`/projects/${projectId}/sync`, { method: "POST" }),
+
   getProject: (projectId: string) => request<Project>(`/projects/${projectId}`),
 
   getProjectGraph: (projectId: string) =>
     request<IRGraph>(`/projects/${projectId}/graph`),
+
+  /** 读取项目内某文件的一段源码；line 为 1 起始的行号 */
+  getSourceExcerpt: (projectId: string, file: string, line?: number, radius = 20) => {
+    const params = new URLSearchParams({ file });
+    if (line !== undefined) params.set("line", String(line));
+    params.set("radius", String(radius));
+    return request<SourceExcerpt>(`/projects/${projectId}/source?${params.toString()}`);
+  },
 
   startAnalysis: (projectId: string, payload?: AnalysisStart) =>
     request<AnalysisTask>(`/projects/${projectId}/analyses`, {

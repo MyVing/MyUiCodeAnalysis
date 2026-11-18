@@ -22,8 +22,10 @@ from sqlalchemy.ext.asyncio import AsyncEngine, create_async_engine
 
 from app.contracts import IRGraph, RequirementMap, RuntimeTrace
 from app.core.config import Settings
+from app.requirement.page_profile import ProfilePayload
 from app.schemas import AnalysisTask, Project, RequirementTask, RuntimeTask
 from app.storage.checkpoint import CHECKPOINT_DDL_STATEMENTS
+from app.storage.repositories import DuplicateRemoteUrlError
 
 logger = logging.getLogger(__name__)
 
@@ -34,7 +36,15 @@ DDL_STATEMENTS: tuple[str, ...] = (
       name VARCHAR(80) NOT NULL,
       root_path VARCHAR(512) NOT NULL,
       framework VARCHAR(8) NOT NULL,
+      source VARCHAR(8) NOT NULL DEFAULT 'local',
+      -- 归一化后的 Git 地址：同一仓库只能接入一次。MySQL 唯一索引允许多个 NULL，
+      -- 因此本地目录项目（remote_url 为 NULL）不受影响。
+      remote_url VARCHAR(512) NULL,
+      git_branch VARCHAR(128) NULL,
+      commit_sha VARCHAR(64) NULL,
+      last_synced_at DATETIME(6) NULL,
       created_at DATETIME(6) NOT NULL,
+      CONSTRAINT uq_projects_remote UNIQUE (remote_url),
       KEY idx_projects_created (created_at)
     ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4
     """,
@@ -76,6 +86,19 @@ DDL_STATEMENTS: tuple[str, ...] = (
       created_at DATETIME(6) NOT NULL,
       CONSTRAINT uq_graph_version UNIQUE (project_id, analysis_id, kind),
       KEY idx_graph_latest (project_id, id)
+    ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4
+    """,
+    """
+    -- 页面画像：分析后异步生成的页面业务描述，按图版本缓存。
+    -- 与 graphs 分开存：画像是模型产物（可再来一次），图是事实（不可重算）。
+    CREATE TABLE IF NOT EXISTS page_profiles (
+      project_id VARCHAR(32) NOT NULL,
+      analysis_id VARCHAR(32) NOT NULL,
+      payload JSON NOT NULL,
+      created_at DATETIME(6) NOT NULL,
+      PRIMARY KEY (project_id, analysis_id),
+      CONSTRAINT fk_profiles_project FOREIGN KEY (project_id)
+        REFERENCES projects(id) ON DELETE CASCADE
     ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4
     """,
     """
@@ -150,6 +173,17 @@ DDL_STATEMENTS: tuple[str, ...] = (
 
 _RESTARTED_MESSAGE = "服务重启时任务仍在进行中，无法恢复子进程状态，已标记为失败。"
 
+# Git 接入引入的列。已有库的 projects 表由 CREATE TABLE IF NOT EXISTS 不会自动补列，
+# 因此启动时按 information_schema 幂等补齐，不引入迁移工具。
+_PROJECT_COLUMNS: dict[str, str] = {
+    "source": "VARCHAR(8) NOT NULL DEFAULT 'local'",
+    "remote_url": "VARCHAR(512) NULL",
+    "git_branch": "VARCHAR(128) NULL",
+    "commit_sha": "VARCHAR(64) NULL",
+    "last_synced_at": "DATETIME(6) NULL",
+}
+_REMOTE_INDEX = "uq_projects_remote"
+
 
 def _is_duplicate_key(error: IntegrityError) -> bool:
     # pymysql 的 ER_DUP_ENTRY = 1062；外键等其他完整性违规必须如实抛出，
@@ -183,11 +217,49 @@ def create_engine_from_url(settings: Settings) -> AsyncEngine:
     )
 
 
+async def _ensure_project_columns(conn: Any) -> None:
+    """幂等补齐 projects 的新列与远程地址唯一索引（旧库升级路径）。"""
+    rows = (
+        await conn.execute(
+            text(
+                """
+                SELECT COLUMN_NAME FROM information_schema.COLUMNS
+                WHERE TABLE_SCHEMA = DATABASE() AND TABLE_NAME = 'projects'
+                """
+            )
+        )
+    ).all()
+    existing = {str(row[0]) for row in rows}
+    for name, definition in _PROJECT_COLUMNS.items():
+        if name not in existing:
+            await conn.execute(text(f"ALTER TABLE projects ADD COLUMN {name} {definition}"))
+            logger.info("projects 表补充列 %s", name)
+
+    index_rows = (
+        await conn.execute(
+            text(
+                """
+                SELECT INDEX_NAME FROM information_schema.STATISTICS
+                WHERE TABLE_SCHEMA = DATABASE() AND TABLE_NAME = 'projects'
+                  AND INDEX_NAME = :name
+                """
+            ),
+            {"name": _REMOTE_INDEX},
+        )
+    ).all()
+    if not index_rows:
+        await conn.execute(
+            text(f"ALTER TABLE projects ADD UNIQUE KEY {_REMOTE_INDEX} (remote_url)")
+        )
+        logger.info("projects 表补充唯一索引 %s", _REMOTE_INDEX)
+
+
 async def init_schema(engine: AsyncEngine) -> None:
     """幂等建表；单写入方（单进程编排）下 CREATE TABLE IF NOT EXISTS 足够。"""
     async with engine.begin() as conn:
         for statement in DDL_STATEMENTS:
             await conn.execute(text(statement))
+        await _ensure_project_columns(conn)
 
 
 async def run_boot_recovery(engine: AsyncEngine) -> int:
@@ -228,6 +300,11 @@ class MySqlProjectRepository:
             framework=row.framework,
             created_at=_from_db(row.created_at),
             storage="mysql",
+            source=row.source or "local",
+            remote_url=row.remote_url,
+            git_branch=row.git_branch,
+            commit_sha=row.commit_sha,
+            last_synced_at=_from_db(row.last_synced_at),
         )
 
     async def list(self) -> list[Project]:
@@ -242,11 +319,56 @@ class MySqlProjectRepository:
             row = (await conn.execute(query, {"id": project_id})).first()
         return self._project(row) if row else None
 
+    async def get_by_remote(self, remote_url: str) -> Project | None:
+        query = text("SELECT * FROM projects WHERE remote_url = :remote_url")
+        async with self._engine.connect() as conn:
+            row = (await conn.execute(query, {"remote_url": remote_url})).first()
+        return self._project(row) if row else None
+
     async def add(self, project: Project) -> Project:
         query = text(
             """
-            INSERT INTO projects (id, name, root_path, framework, created_at)
-            VALUES (:id, :name, :root_path, :framework, :created_at)
+            INSERT INTO projects (
+              id, name, root_path, framework, source, remote_url,
+              git_branch, commit_sha, last_synced_at, created_at
+            )
+            VALUES (
+              :id, :name, :root_path, :framework, :source, :remote_url,
+              :git_branch, :commit_sha, :last_synced_at, :created_at
+            )
+            """
+        )
+        params = {
+            "id": project.id,
+            "name": project.name,
+            "root_path": project.root_path,
+            "framework": project.framework,
+            "source": project.source,
+            "remote_url": project.remote_url,
+            "git_branch": project.git_branch,
+            "commit_sha": project.commit_sha,
+            "last_synced_at": (
+                _to_db(project.last_synced_at) if project.last_synced_at else None
+            ),
+            "created_at": _to_db(project.created_at),
+        }
+        try:
+            async with self._engine.begin() as conn:
+                await conn.execute(query, params)
+        except IntegrityError as error:
+            if _is_duplicate_key(error):
+                raise DuplicateRemoteUrlError(project.remote_url or "") from error
+            raise
+        return project.model_copy(update={"storage": "mysql"})
+
+    async def update(self, project: Project) -> Project:
+        query = text(
+            """
+            UPDATE projects
+            SET name = :name, root_path = :root_path, framework = :framework,
+                git_branch = :git_branch, commit_sha = :commit_sha,
+                last_synced_at = :last_synced_at
+            WHERE id = :id
             """
         )
         async with self._engine.begin() as conn:
@@ -257,7 +379,11 @@ class MySqlProjectRepository:
                     "name": project.name,
                     "root_path": project.root_path,
                     "framework": project.framework,
-                    "created_at": _to_db(project.created_at),
+                    "git_branch": project.git_branch,
+                    "commit_sha": project.commit_sha,
+                    "last_synced_at": (
+                        _to_db(project.last_synced_at) if project.last_synced_at else None
+                    ),
                 },
             )
         return project.model_copy(update={"storage": "mysql"})
@@ -447,6 +573,40 @@ class MySqlAnalysisRepository:
         async with self._engine.connect() as conn:
             row = (await conn.execute(query, {"pid": project_id})).first()
         return IRGraph.model_validate_json(row.payload) if row else None
+
+    async def save_page_profiles(self, project_id: str, payload: ProfilePayload) -> None:
+        query = text(
+            """
+            INSERT INTO page_profiles (project_id, analysis_id, payload, created_at)
+            VALUES (:pid, :aid, :payload, :created_at)
+            ON DUPLICATE KEY UPDATE payload = VALUES(payload),
+              created_at = VALUES(created_at)
+            """
+        )
+        async with self._engine.begin() as conn:
+            await conn.execute(
+                query,
+                {
+                    "pid": project_id,
+                    "aid": payload.analysis_id,
+                    "payload": payload.model_dump_json(),
+                    "created_at": _to_db(datetime.now(UTC)),
+                },
+            )
+
+    async def get_page_profiles(
+        self, project_id: str, analysis_id: str
+    ) -> ProfilePayload | None:
+        # 按 analysisId 精确取：图换了版本，旧画像就描述的是已经不存在的页面
+        query = text(
+            """
+            SELECT payload FROM page_profiles
+            WHERE project_id = :pid AND analysis_id = :aid
+            """
+        )
+        async with self._engine.connect() as conn:
+            row = (await conn.execute(query, {"pid": project_id, "aid": analysis_id})).first()
+        return ProfilePayload.model_validate_json(row.payload) if row else None
 
 
 class MySqlRequirementRepository:

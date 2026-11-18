@@ -118,13 +118,54 @@ export interface BuildGraphInput {
   /** 外部组件薄节点（如 antd#Table），与项目内组件节点同表产出 */
   externalNodes?: readonly IRNode[];
   /**
-   * 由分析器直接构造的项目内节点（hook / state）。
+   * 由分析器直接构造的项目内节点（hook / state / element / route）。
    *
    * 与 components 分开传而不是让调用方拼一个大数组：组件节点要走 props 组装，
    * 这些节点已经是最终形态，混在一起会让人以为它们也需要 props。
+   *
+   * **同 id 节点会合并 attrs**：视图层与事件层描述的是同一个 `<button>`，
+   * 各自产出节点再合并，而不是让后一个覆盖前一个。
    */
   extraNodes?: readonly IRNode[];
   warnings?: readonly Warning[];
+}
+
+/**
+ * 合并同 id 节点。
+ *
+ * 两个分析器命中同一个元素是正常情况（视图层管"页面上有什么"，事件层管
+ * "点了会发生什么"）。id 相同就必须合并成一个节点——图上不能有两个 `<button>`。
+ *
+ * 合并规则：attrs 浅合并，后者覆盖前者的同名键（事件层的 events 不会被视图层
+ * 的 tag / viewRole 覆盖，因为键不重叠）；evidence 追加去重；file / loc 取
+ * 先出现的（同一元素在同一位置，不该有分歧）。
+ *
+ * 合并后仍要保证契约的 `evidence` 非空（minItems: 1）——两边都至少有一条。
+ */
+function mergeNodes(nodes: readonly IRNode[]): IRNode[] {
+  const merged = new Map<string, IRNode>();
+  for (const node of nodes) {
+    const existing = merged.get(node.id);
+    if (!existing) {
+      merged.set(node.id, { ...node, attrs: { ...node.attrs }, evidence: [...node.evidence] });
+      continue;
+    }
+
+    const seen = new Set(existing.evidence.map((item) => evidenceKey(item)));
+    for (const item of node.evidence) {
+      if (!seen.has(evidenceKey(item))) {
+        existing.evidence.push(item);
+        seen.add(evidenceKey(item));
+      }
+    }
+    existing.attrs = { ...existing.attrs, ...node.attrs };
+  }
+  return [...merged.values()];
+}
+
+/** 证据去重键：来源 + 文件 + 位置 + 置信度。 */
+function evidenceKey(item: Evidence): string {
+  return `${item.source}|${item.file ?? ""}|${item.loc?.line ?? 0}:${item.loc?.col ?? 0}|${item.confidence}`;
 }
 
 /** 节点排序键：有 file 的按 file + 行 + 列 + id，无 file 的排最后。 */
@@ -170,7 +211,8 @@ export function buildGraph({
         texts?.get(component.id),
       ),
     ),
-    ...extraNodes,
+    // 视图层与事件层会各自产出同一个元素节点，这里按 id 收敛成一个
+    ...mergeNodes(extraNodes),
   ].sort(compareNodes);
 
   const sortedExternal = [...externalNodes].sort((a, b) => (a.id < b.id ? -1 : a.id > b.id ? 1 : 0));

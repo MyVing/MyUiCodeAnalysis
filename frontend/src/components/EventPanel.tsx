@@ -1,4 +1,4 @@
-/**
+﻿/**
  * 事件面板：把 element 节点上的 attrs.events 渲染成事件表。
  *
  * 三件事必须在界面上说清楚，否则读图的人会误判：
@@ -82,26 +82,24 @@ export function EventPanel({ node }: { node: IRNode }) {
 
   return (
     <section>
-      <h3 className="text-[11px] font-medium uppercase tracking-wide text-slate-400">
-        事件（{events.length}）
-      </h3>
+      <h3 className="app-section-label">事件（{events.length}）</h3>
 
       <ul className="mt-2 space-y-2">
         {events.map((event, index) => (
           <li
             key={`${event.name}-${index}`}
-            className="rounded-lg border border-slate-200 px-2.5 py-2 text-xs"
+            className="rounded-lg border border-white/[0.07] bg-white/[0.02] px-2.5 py-2 text-xs"
           >
             <div className="flex items-center justify-between gap-2">
-              <span className="font-mono text-[11px] font-medium text-slate-800">{event.name}</span>
+              <span className="font-mono text-[11px] font-medium text-slate-200">{event.name}</span>
               <span className="shrink-0 text-[10px] text-slate-400">
                 {KIND_TEXT[event.kind] ?? event.kind}
               </span>
             </div>
-            <p className="mt-1 break-all font-mono text-[10px] text-slate-500">{event.handler}</p>
+            <p className="mt-1 break-all font-mono text-[10px] text-slate-300">{event.handler}</p>
             <p
               className={`mt-1 break-all text-[10px] ${
-                event.targets.length > 0 ? "text-slate-600" : "text-amber-600"
+                event.targets.length > 0 ? "text-slate-300" : "text-amber-300"
               }`}
             >
               落到：{describeTargets(event)}

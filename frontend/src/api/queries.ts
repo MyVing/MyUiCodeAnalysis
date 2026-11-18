@@ -64,3 +64,13 @@ export const useRequirementTask = (taskId: string | null) =>
       return status === "queued" || status === "running" ? 1000 : false;
     },
   });
+
+/** 节点源码片段：只有拿到文件路径才请求，同一文件的不同行分开缓存 */
+export const useSourceExcerpt = (projectId: string, file: string | null, line?: number) =>
+  useQuery({
+    queryKey: ["projects", projectId, "source", file, line ?? 1],
+    queryFn: () => api.getSourceExcerpt(projectId, file as string, line),
+    enabled: projectId.length > 0 && file !== null,
+    staleTime: 60_000,
+    retry: false,
+  });

@@ -8,6 +8,13 @@
 CI 或提交前用 --check 校验是否漂移。
 """
 
+from app.contracts.chain import (
+    ActionChain,
+    ActionChainList,
+    ChainPath,
+    ChainRole,
+    ChainStep,
+)
 from app.contracts.ir import (
     EdgeKind,
     Evidence,

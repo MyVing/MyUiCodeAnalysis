@@ -15,9 +15,10 @@ export type NodeKind =
  */
 export type Source = "static" | "runtime" | "ai";
 /**
- * 受控枚举；boundary 表示 client/server 组件边界。
+ * 受控枚举；boundary 表示 client/server 组件边界；contains 表示视图层级（组件/元素包含子元素），navigates 表示跳转到某个 route 节点。
  */
-export type EdgeKind = "renders" | "calls" | "reads" | "writes" | "requests" | "uses" | "boundary";
+export type EdgeKind =
+  "renders" | "calls" | "reads" | "writes" | "requests" | "uses" | "boundary" | "contains" | "navigates";
 /**
  * error：该步骤失败且结果不可信；warning：结果可用但存在缺失；info：提示性信息
  */

@@ -22,6 +22,8 @@ import { discoverComponents } from "./components.js";
 import { analyzeEvents } from "./events.js";
 import { analyzeHooks } from "./hooks.js";
 import { buildGraph } from "./ir-builder.js";
+import { buildJsxInventory } from "./jsx-inventory.js";
+import { analyzeNavigation } from "./navigate.js";
 import { createFullProject, createIncrementalProject } from "./project.js";
 import { analyzeProps } from "./props.js";
 import type { WorkerRequest, WorkerResponse } from "./protocol.js";
@@ -29,6 +31,7 @@ import { analyzeRenders } from "./renders.js";
 import { createResolutionIndex } from "./resolver.js";
 import { analyzeRoutes } from "./routes.js";
 import { analyzeUiText } from "./ui-text.js";
+import { analyzeView } from "./view.js";
 import { buildWrapperAttrs, loadWrapperMappings } from "./wrappers.js";
 
 function log(message: string): void {
@@ -69,22 +72,14 @@ async function analyze(request: WorkerRequest): Promise<WorkerResponse> {
   } else {
     const full = createFullProject(rootPath);
     project = full.project;
+    // 配置层的缺口（无 tsconfig / solution-style 换配置 / 扫描不到源文件）
+    // 由 project.ts 判定并随结果返回，入口只负责并入告警
+    warnings.push(...full.warnings);
     log(
       full.fromTsConfig
-        ? `全量模式：读取 tsconfig.json，${project.getSourceFiles().length} 个源文件`
-        : `全量模式：未找到 tsconfig.json，glob 扫描 ${project.getSourceFiles().length} 个源文件`,
+        ? `全量模式：读取 ${path.basename(full.tsConfigPath ?? "tsconfig.json")}，${project.getSourceFiles().length} 个源文件`
+        : `全量模式：未使用 tsconfig，glob 扫描 ${project.getSourceFiles().length} 个源文件`,
     );
-    if (!full.fromTsConfig) {
-      // 没有 tsconfig 就没有 paths，别名 import 必然全部解析失败。
-      // 这不是"分析完成但没有结果"，必须让调用方看到能力缺口。
-      warnings.push({
-        code: "no_tsconfig",
-        severity: "warning",
-        stage: "static",
-        message:
-          "未找到 tsconfig.json，路径别名（paths）无法解析，跨目录别名 import 将被记为未解析；组件发现仍按相对路径工作。",
-      });
-    }
   }
 
   // 解析索引先于组件发现构造：它负责收齐 unresolved_import / dependency_not_installed 告警
@@ -140,15 +135,35 @@ async function analyze(request: WorkerRequest): Promise<WorkerResponse> {
     [...propsResult.byComponent].map(([id, info]) => [id, info.fields.map((f) => f.name)]),
   );
 
-  const eventsResult = analyzeEvents({
+  // JSX 元素清单：视图层与事件层共用同一份 id 来源。必须在组件发现之后，
+  // 因为归属索引依赖组件声明位置；一旦建立，两个分析器都只查表不自算。
+  const inventory = buildJsxInventory(
     rootPath,
-    components: discovery.components,
-    declarations: discovery.declarations,
     project,
+    discovery.components,
+    discovery.declarations,
+  );
+
+  const eventsResult = analyzeEvents({
+    inventory,
+    components: discovery.components,
     knownNodes,
     propsFields,
+    rootPath,
   });
   warnings.push(...eventsResult.warnings);
+
+  // 视图层：把「页面上有什么」补进图。与事件层产同 id 元素节点，
+  // buildGraph 按 id 合并 attrs —— 一个是 events，一个是 viewRole。
+  //
+  // 事件层收录了视图层不收的元素（`<div onClick>` 这类布局元素），它们已经是
+  // 图上的节点，必须同样挂上 contains 父边，否则在视图树里是孤儿、下钻就断了。
+  // 因此这里把事件层的 id 传进去：视图层只补父子关系，不重复产节点。
+  const viewResult = analyzeView({
+    inventory,
+    extraElementIds: new Set(eventsResult.elementNodes.map((node) => node.id)),
+  });
+  warnings.push(...viewResult.warnings);
 
   // 二次封装映射：规则来自项目根的 mapping.json，核心分析器里没有任何
   // `if (tag === "ProTable")`。文件不存在是常态（不是所有项目都配了映射），
@@ -184,13 +199,30 @@ async function analyze(request: WorkerRequest): Promise<WorkerResponse> {
   });
   warnings.push(...routesResult.warnings);
 
+  // 导航边：依赖路由节点（目标是 route）与视图层（<Link> 的起点是元素），
+  // 所以放在两者之后。它把「路由表」变成「页面之间的可达关系」。
+  const navigationResult = analyzeNavigation({
+    rootPath,
+    inventory,
+    elementNodeIds: new Set([
+      ...viewResult.elementNodes.map((node) => node.id),
+      ...eventsResult.elementNodes.map((node) => node.id),
+    ]),
+    routeNodes: routesResult.routeNodes,
+    components: discovery.components,
+    declarations: discovery.declarations,
+  });
+  warnings.push(...navigationResult.warnings);
+
   log(
     `发现 ${discovery.components.length} 个组件、${renders.edges.length} 条 renders 边` +
       `、${renders.externalNodes.length} 个外部组件，` +
       `${hooksResult.hookNodes.length} 个 hook、${hooksResult.stateNodes.length} 个状态，` +
       `${apiResult.apiNodes.length} 个接口、${apiResult.fnNodes.length} 个请求链函数，` +
-      `${eventsResult.elementNodes.length} 个事件元素、${wrapperResult.byComponent.size} 个封装组件，` +
-      `${textCount} 条可见文案、${routesResult.routeNodes.length} 个路由，` +
+      `${eventsResult.elementNodes.length} 个事件元素、${viewResult.elementNodes.length} 个视图节点，` +
+      `${wrapperResult.byComponent.size} 个封装组件，` +
+      `${textCount} 条可见文案、${routesResult.routeNodes.length} 个路由、` +
+      `${navigationResult.edges.length} 条导航边，` +
       `${warnings.length} 条告警`,
   );
 
@@ -214,10 +246,24 @@ async function analyze(request: WorkerRequest): Promise<WorkerResponse> {
         ...hooksResult.edges,
         ...apiResult.edges,
         ...eventsResult.edges,
+        ...viewResult.edges,
         ...routesResult.edges,
+        ...navigationResult.edges,
       ],
       externalNodes: renders.externalNodes,
-      extraNodes: [...knownNodes, ...eventsResult.elementNodes, ...routesResult.routeNodes],
+      extraNodes: [
+        ...knownNodes,
+        // 事件引用到、但图里原本不存在的跨文件函数：边必须连到真实节点，
+        // 否则前端点开目标会发现它不在图上
+        ...eventsResult.fnNodes,
+        // 视图层与事件层对同一元素各产一份节点，buildGraph 按 id 合并 attrs：
+        // 合并后既带 events 又带 viewRole，才是完整的「这个元素是什么、点了会怎样」。
+        // 视图层先放：它的 name 带可见文案（`<button> 导出`），事件层只有 `<button>`；
+        // 两层的 file/loc 取自同一份元素清单，不存在覆盖问题。
+        ...viewResult.elementNodes,
+        ...eventsResult.elementNodes,
+        ...routesResult.routeNodes,
+      ],
       warnings,
     }),
   };

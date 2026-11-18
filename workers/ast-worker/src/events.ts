@@ -25,21 +25,48 @@
  *    对已知节点的调用（setter → writes，函数/hook → calls）。但如果体内调用的
  *    名字是 props 字段（`onClick={() => onClick(userId)}`），真正的逻辑仍在
  *    外部——内联只是转一手，同样标 `injected`。
- * 2. **具名引用**（`onClick={handleSelect}`）：解析名字，命中本组件的 hook /
- *    state / 请求链函数就连边；都没命中说明它来自 props（外部注入），到这里
- *    链就断了——这是事实，不是缺口。
+ * 2. **具名引用**（`onClick={handleSelect}`）：先在本组件的名字表里找 hook /
+ *    state / 同文件函数，命中就连边；未命中再走**符号解析**穿透 import 找到
+ *    跨文件函数。两者都没有、而名字又在 props 字段里，才判定为外部注入——
+ *    到这里链就断了，这是事实，不是缺口。
  * 3. **其他**（`onClick={handleSelect(id)}` 这类调用结果）：只记源码文本，
  *    不推断指向什么。
+ *
+ * ## 为什么必须有符号解析这一路
+ *
+ * 只按「同文件名字表」解析时，`<Button onClick={() => saveOrder(form)}>` 里的
+ * `saveOrder` 从另一个文件 import 进来，永远命中不了。代价不只是少一条边：
+ * `api.ts` 的 `findOwner` 会把该请求记到组件名下，图上呈现成「页面加载时请求」，
+ * 而事实是「点击才请求」——这是语义错误。
+ *
+ * 跨文件命中的函数如果还不在图上，由本模块补一个 `fn` 节点（`fnNodes` 返回值）：
+ * 边必须连到真实存在的节点，凭空连一条边会让前端点不开目标。
+ *
+ * ## 元素 id 不由本模块计算
+ *
+ * 视图层（`view.ts`）描述的 `<button>` 与本模块描述的是同一个元素。id 统一由
+ * `jsx-inventory.ts` 分配，两个分析器查同一份清单——各算各的必然漂移，视图树
+ * 与事件链就会断开。本模块只消费清单，不修改 id 规则。
  */
 
-import type { JsxOpeningElement, JsxSelfClosingElement, Node, SourceFile } from "ts-morph";
+import type {
+  Identifier,
+  JsxOpeningElement,
+  JsxSelfClosingElement,
+  Node,
+} from "ts-morph";
 import { Node as MorphNode, SyntaxKind } from "ts-morph";
 
 import type { Evidence, IREdge, IRNode, Warning } from "@uicodeanalysis/contracts";
 
 import type { DiscoveredComponent } from "./components.js";
-import { buildOwnerIndex, findOwner } from "./ownership.js";
-import { toProjectRelative } from "./paths.js";
+import type { JsxInventory } from "./jsx-inventory.js";
+import {
+  functionIdentity,
+  functionNodeOf,
+  resolveIdentifierDeclarations,
+  type FunctionIdentity,
+} from "./symbols.js";
 
 /** 元素结构是语法事实：标签与事件属性都直接写在源码里。 */
 const STRUCTURE_CONFIDENCE = 1;
@@ -87,16 +114,23 @@ export interface EventBinding {
 export interface EventsAnalysisResult {
   /** 带事件的 JSX 元素节点 */
   elementNodes: IRNode[];
+  /**
+   * 事件引用到、但图上原本不存在的跨文件函数节点。
+   *
+   * 只收录「被事件引用」的：给所有被 import 的业务函数建节点会让大项目多出
+   * 大量孤立节点，而没有被任何事件引用的函数也没有边可挂。调用方负责把它们
+   * 并进图（与 hook / state / fn 同表）。
+   */
+  fnNodes: IRNode[];
   /** 组件 → 元素（uses）、元素 → 处理节点（calls / writes） */
   edges: IREdge[];
   warnings: Warning[];
 }
 
 export interface EventsAnalysisInput {
-  rootPath: string;
+  /** 统一元素清单：id、归属、file/loc 都取自这里，不再自行计算 */
+  inventory: JsxInventory;
   components: readonly DiscoveredComponent[];
-  declarations: ReadonlyMap<string, Node>;
-  project: { getSourceFiles(): readonly SourceFile[] };
   /**
    * 已经产出的节点（hook / state / fn）。
    *
@@ -106,6 +140,8 @@ export interface EventsAnalysisInput {
   knownNodes: readonly IRNode[];
   /** 组件 id → props 字段名；来自 props 分析结果 */
   propsFields: ReadonlyMap<string, readonly string[]>;
+  /** 项目根目录，符号解析要把绝对路径收敛成 IR 用的相对路径 */
+  rootPath: string;
 }
 
 /** 一个组件内的名字解析表。 */
@@ -118,11 +154,37 @@ interface NameTable {
   propNames: Set<string>;
 }
 
+/** 局部名字命中时的落点。 */
+interface NameHit {
+  id: string;
+  kind: IRNode["kind"];
+  /** 命中的是 state 的 setter（`setOpen`）——这种调用算 writes 而不是 calls */
+  isSetter: boolean;
+}
+
+/**
+ * 事件处理的落点解析器。
+ *
+ * 名字表负责「局部名字」（组件内的 hook 绑定名、state 与 setter、同文件函数），
+ * 符号解析负责「跨文件引用」。两条路分开的理由：
+ *  - 局部名字不能用符号解析替代：`const [open, setOpen] = useState()` 的 setter
+ *    符号会指向解构处的 `VariableDeclaration`，反查不到 state 节点；
+ *  - 跨文件引用不能靠名字：同名函数在不同文件是不同实体。
+ */
+interface HandlerResolver {
+  /** 局部名字表 → 命中返回落点；未命中返回 null */
+  byName(name: string): NameHit | null;
+  /** 标识符 → 跨文件函数身份；局部名字或解析不到都返回 null */
+  bySymbol(identifier: Identifier): FunctionIdentity | null;
+  /** 名字是否是 props 字段（外部注入的回调） */
+  isPropCallback(name: string): boolean;
+}
+
 /**
  * 建组件内的名字解析表。
  *
  * 只在**同一文件**内建立：`handleSelect` 这类名字是组件局部作用域的，
- * 跨文件的同名函数是另一个实体。
+ * 跨文件的同名函数是另一个实体（那一类走符号解析）。
  */
 function buildNameTable(
   component: DiscoveredComponent,
@@ -162,6 +224,44 @@ function buildNameTable(
   return { targets, setters, propNames };
 }
 
+/**
+ * 组装落点解析器：名字表优先（局部作用域），符号解析兜底（跨文件）。
+ *
+ * 「名字表优先」不是性能考虑而是语义要求：组件内的 `handleSelect` 遮蔽同名的
+ * 跨文件导出函数，按 JS 作用域规则应该连到局部那个。反过来先查符号会把边连到
+ * 一个用户根本没有调用到的函数上。
+ */
+function buildResolver(
+  table: NameTable,
+  rootPath: string,
+  registerFn: (identity: FunctionIdentity) => void,
+): HandlerResolver {
+  return {
+    byName(name) {
+      const hit = table.targets.get(name);
+      if (!hit) return null;
+      return { ...hit, isSetter: table.setters.has(name) };
+    },
+    bySymbol(identifier) {
+      for (const decl of resolveIdentifierDeclarations(identifier)) {
+        const fn = functionNodeOf(decl);
+        if (!fn) continue;
+
+        const identity = functionIdentity(fn, rootPath);
+        if (!identity) continue;
+
+        // 组件本身不是「处理函数」：`onClick={UserList}` 这类写法没有可执行语义
+        registerFn(identity);
+        return identity;
+      }
+      return null;
+    },
+    isPropCallback(name) {
+      return table.propNames.has(name);
+    },
+  };
+}
+
 /** 收集元素上的事件属性（属性名节点 + 值表达式）。 */
 function readEventBindings(
   opening: JsxOpeningElement | JsxSelfClosingElement,
@@ -191,12 +291,19 @@ function readEventBindings(
  * 与 hooks 归属的"遇函数即停"是相反的：事件处理在**运行期触发**，`arr.map(() => setX())`
  * 里的 setX 仍会在点击时执行，所以这里要下探全部嵌套层级。React 的顶层调用
  * 规则只约束 hook，不约束事件回调。
+ *
+ * 解析顺序：局部名字表 → 符号解析 → props 回调。跨文件函数经符号解析命中后
+ * 同样要等它成为图上节点才连边，因此 identity 由调用方登记。
  */
 function collectInlineEffects(
   fn: Node,
-  table: NameTable,
-): { calls: string[]; writes: string[]; injected: boolean } {
-  const calls: string[] = [];
+  resolver: HandlerResolver,
+): {
+  calls: { id: string; kind: IRNode["kind"] }[];
+  writes: string[];
+  injected: boolean;
+} {
+  const calls: { id: string; kind: IRNode["kind"] }[] = [];
   const writes: string[] = [];
   let injected = false;
 
@@ -209,16 +316,30 @@ function collectInlineEffects(
         : null;
     if (!name) continue;
 
-    const stateId = table.setters.get(name);
-    if (stateId) {
-      if (!writes.includes(stateId)) writes.push(stateId);
+    const local = resolver.byName(name);
+    if (local) {
+      // setter 调用记 writes，其余（hook / 同文件函数）记 calls
+      if (local.isSetter) {
+        if (!writes.includes(local.id)) writes.push(local.id);
+      } else if (!calls.some((entry) => entry.id === local.id)) {
+        calls.push({ id: local.id, kind: local.kind });
+      }
       continue;
     }
 
-    const hit = table.targets.get(name);
-    // setter 已经在 targets 里登记过，这里不会再把它当 calls
-    if (hit && !table.setters.has(name) && !calls.includes(hit.id)) calls.push(hit.id);
-    if (!hit && table.propNames.has(name)) injected = true;
+    // 局部名字没有 → 可能是 import 进来的跨文件函数
+    if (MorphNode.isIdentifier(expr)) {
+      const identity = resolver.bySymbol(expr);
+      if (identity) {
+        if (!calls.some((entry) => entry.id === identity.id)) {
+          calls.push({ id: identity.id, kind: "fn" });
+        }
+        continue;
+      }
+    }
+
+    // 两条路都没命中 → 只有名字在 props 里才是「父组件注入」
+    if (resolver.isPropCallback(name)) injected = true;
   }
 
   return { calls, writes, injected };
@@ -228,8 +349,8 @@ function collectInlineEffects(
 function describeEvent(
   name: string,
   value: Node,
-  table: NameTable,
-): { binding: EventBinding; calls: string[]; writes: string[]; injected: boolean } {
+  resolver: HandlerResolver,
+): { binding: EventBinding; targets: EventTarget[] } {
   const text = value.getText();
   const handler =
     text.length > HANDLER_TEXT_LIMIT
@@ -237,18 +358,11 @@ function describeEvent(
       : text;
 
   if (MorphNode.isArrowFunction(value) || MorphNode.isFunctionExpression(value)) {
-    const effects = collectInlineEffects(value, table);
-    // writes 一定是 state（只有 setter 会产生 writes）；calls 的种类查表得到，
-    // 查不到说明不是本组件可见的节点，那种情况 targets 里就不该有它
-    const kindById = new Map<string, IRNode["kind"]>();
-    for (const entry of table.targets.values()) kindById.set(entry.id, entry.kind);
-
+    const effects = collectInlineEffects(value, resolver);
+    // writes 一定是 state（只有 setter 会产生 writes）；calls 自带 kind
     const targets: EventTarget[] = [
       ...effects.writes.map((id) => ({ id, kind: "state" as const })),
-      ...effects.calls.flatMap((id) => {
-        const kind = kindById.get(id);
-        return kind ? [{ id, kind }] : [];
-      }),
+      ...effects.calls,
     ];
     return {
       binding: {
@@ -260,120 +374,140 @@ function describeEvent(
         // 内联体里调用的是 props 回调 → 逻辑仍在父组件，这条边本来就该断
         injected: effects.injected,
       },
-      ...effects,
+      targets,
     };
   }
 
   if (MorphNode.isIdentifier(value)) {
     const handlerName = value.getText();
-    const hit = table.targets.get(handlerName);
+
+    // 局部作用域优先：组件内的 hook / 同文件函数遮蔽跨文件同名导出
+    const local = resolver.byName(handlerName);
+    if (local) {
+      const targets = [
+        { id: local.id, kind: local.kind },
+      ];
+      return {
+        binding: {
+          name,
+          handler,
+          kind: "reference",
+          handlerName,
+          targets,
+          injected: false,
+        },
+        targets,
+      };
+    }
+
+    // 跨文件函数：穿透 import 别名找到真实声明
+    const identity = resolver.bySymbol(value);
+    if (identity) {
+      const targets = [{ id: identity.id, kind: "fn" as const }];
+      return {
+        binding: {
+          name,
+          handler,
+          kind: "reference",
+          handlerName,
+          targets,
+          injected: false,
+        },
+        targets,
+      };
+    }
+
+    // 两条路都没有，而名字在 props 字段里 = 由父组件注入。
+    // 这个标记让"没有入边"成为一条结论，而不是看起来像链路缺失。
     return {
       binding: {
         name,
         handler,
         kind: "reference",
         handlerName,
-        targets: hit ? [{ id: hit.id, kind: hit.kind }] : [],
-        // 命中 props 字段 = 由父组件注入；这个标记让"没有入边"成为一条结论
-        injected: !hit && table.propNames.has(handlerName),
+        targets: [],
+        injected: resolver.isPropCallback(handlerName),
       },
-      calls: [],
-      writes: [],
-      injected: false,
+      targets: [],
     };
   }
 
   return {
     binding: { name, handler, kind: "other", handlerName: null, targets: [], injected: false },
-    calls: [],
-    writes: [],
-    injected: false,
+    targets: [],
   };
 }
 
-/**
- * 元素节点 id 的后缀。
- *
- * 不用行列号（插一行注释就漂移）。优先用唯一的具名处理函数作后缀：
- * `jsx:div/handleSelect` 比 `jsx:div#2` 可读得多。有多个具名处理函数或没有时，
- * 用「标签 + 组件内序号」。
- */
-function elementSuffix(
-  tag: string,
-  handlerNames: readonly string[],
-  counters: Map<string, number>,
-  componentId: string,
-): string {
-  const named = handlerNames.filter((name) => name.length > 0);
-  const single = named.length === 1 ? named[0] : undefined;
-  if (single) return `jsx:${tag}/${single}`;
-
-  const key = `${componentId} jsx:${tag}`;
-  const next = (counters.get(key) ?? 0) + 1;
-  counters.set(key, next);
-  return next === 1 ? `jsx:${tag}` : `jsx:${tag}#${next}`;
-}
-
-/** 宿主元素判定：与 renders 分析器同一套 JSX 编译语义。 */
-function isHostTag(tag: string): boolean {
-  if (tag === "Fragment" || tag === "React.Fragment") return true;
-  const last = tag.split(".").pop() ?? tag;
-  return !/^[A-Z]/.test(last);
-}
-
 export function analyzeEvents(input: EventsAnalysisInput): EventsAnalysisResult {
-  const { rootPath, components, declarations, project, knownNodes, propsFields } = input;
+  const { inventory, components, knownNodes, propsFields, rootPath } = input;
 
   const warnings: Warning[] = [];
   const edges = new Map<string, IREdge>();
   const elementNodes = new Map<string, IRNode>();
-  const counters = new Map<string, number>();
 
-  const ownerIndex = buildOwnerIndex(components, declarations);
+  // 已有的 fn 节点 id：符号解析命中这些时不必再补节点
+  const knownFnIds = new Set(
+    knownNodes.filter((node) => node.kind === "fn").map((node) => node.id),
+  );
+  // 被事件引用、但图上原本不存在的跨文件函数
+  const newFnNodes = new Map<string, IRNode>();
+
+  const registerFn = (identity: FunctionIdentity): void => {
+    if (knownFnIds.has(identity.id) || newFnNodes.has(identity.id)) return;
+
+    newFnNodes.set(identity.id, {
+      id: identity.id,
+      kind: "fn",
+      name: identity.name,
+      file: identity.file,
+      loc: identity.loc,
+      // role 说明它为什么进图：不是在请求链路上，而是被事件直接引用
+      attrs: { role: "事件处理函数" },
+      evidence: [
+        {
+          source: "static",
+          confidence: STRUCTURE_CONFIDENCE,
+          file: identity.file,
+          loc: identity.loc,
+        },
+      ],
+    });
+  };
 
   // 一次扫描全部文件，而不是「每个组件扫一遍项目」——后者是 O(组件数 × 文件数)。
-  const tables = new Map<string, NameTable>();
+  const resolvers = new Map<string, HandlerResolver>();
   for (const component of components) {
-    tables.set(component.id, buildNameTable(component, knownNodes, propsFields));
+    resolvers.set(
+      component.id,
+      buildResolver(
+        buildNameTable(component, knownNodes, propsFields),
+        rootPath,
+        registerFn,
+      ),
+    );
   }
 
-  for (const file of project.getSourceFiles()) {
-    const relativeFile = toProjectRelative(rootPath, file.getFilePath());
-    if (relativeFile === null) continue;
+  for (const fileEntries of inventory.byFile.values()) {
+    for (const info of fileEntries) {
+      const opening = info.opening;
+      if (!MorphNode.isJsxOpeningElement(opening) && !MorphNode.isJsxSelfClosingElement(opening)) {
+        continue;
+      }
 
-    const openings: (JsxOpeningElement | JsxSelfClosingElement)[] = [
-      ...file.getDescendantsOfKind(SyntaxKind.JsxOpeningElement),
-      ...file.getDescendantsOfKind(SyntaxKind.JsxSelfClosingElement),
-    ];
-
-    for (const opening of openings) {
       const bindings = readEventBindings(opening);
       if (bindings.length === 0) continue;
 
-      // 归属：元素在谁的函数体里就归谁；模块顶层的 JSX 不归任何组件
-      const ownerId = findOwner(opening, ownerIndex, rootPath);
-      if (!ownerId) continue;
+      const resolver = resolvers.get(info.componentId);
+      if (!resolver) continue;
 
-      const table = tables.get(ownerId);
-      if (!table) continue;
-
-      const tag = opening.getTagNameNode().getText();
       const events: EventBinding[] = [];
       for (const { name, value } of bindings) {
-        events.push(describeEvent(name, value, table).binding);
+        events.push(describeEvent(name, value, resolver).binding);
       }
 
-      const position = opening
-        .getSourceFile()
-        .getLineAndColumnAtPos(opening.getTagNameNode().getStart());
-      const loc = { line: position.line, col: position.column };
-      const suffix = elementSuffix(
-        tag,
-        events.map((event) => event.handlerName ?? ""),
-        counters,
-        ownerId,
-      );
-      const nodeId = `${ownerId}/${suffix}`;
+      const { tag, file: relativeFile, loc } = info;
+      // id 来自清单：视图层与事件层描述的必须是同一个节点
+      const nodeId = info.id;
 
       const evidence: Evidence = {
         source: "static",
@@ -406,7 +540,7 @@ export function analyzeEvents(input: EventsAnalysisInput): EventsAnalysisResult 
           attrs: {
             tag,
             // host 是有明确语义的：浏览器元素；其余按 JSX 语义是组件
-            target: isHostTag(tag) ? "host" : "component",
+            target: info.isHost ? "host" : "component",
             events,
           },
           evidence: [evidence],
@@ -414,8 +548,8 @@ export function analyzeEvents(input: EventsAnalysisInput): EventsAnalysisResult 
       }
 
       addEdge(edges, {
-        id: `e_uses_${ownerId}__${nodeId}`,
-        from: ownerId,
+        id: `e_uses_${info.componentId}__${nodeId}`,
+        from: info.componentId,
         to: nodeId,
         kind: "uses",
         evidence: [evidence],
@@ -441,11 +575,15 @@ export function analyzeEvents(input: EventsAnalysisInput): EventsAnalysisResult 
           });
         }
       }
-
     }
   }
 
-  return { elementNodes: [...elementNodes.values()], edges: [...edges.values()], warnings };
+  return {
+    elementNodes: [...elementNodes.values()],
+    fnNodes: [...newFnNodes.values()],
+    edges: [...edges.values()],
+    warnings,
+  };
 }
 
 function addEdge(edges: Map<string, IREdge>, edge: IREdge): void {

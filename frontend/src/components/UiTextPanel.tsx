@@ -1,4 +1,4 @@
-/**
+﻿/**
  * 可见文案面板：列出组件里用户能在页面上看到的文字。
  *
  * 这块信息存在的理由很具体：需求文档说的是「搜索用户」「姓名列」，代码里
@@ -94,9 +94,9 @@ export function UiTextPanel({ node }: { node: IRNode }) {
 
   return (
     <section>
-      <h3 className="flex items-center gap-2 text-[11px] font-medium uppercase tracking-wide text-slate-400">
+      <h3 className="app-section-label flex items-center gap-2">
         可见文案
-        <span className="rounded bg-slate-100 px-1 text-[10px] normal-case text-slate-500">
+        <span className="rounded bg-white/[0.06] px-1 text-[10px] text-slate-300">
           {info.texts.length}
         </span>
       </h3>
@@ -106,12 +106,12 @@ export function UiTextPanel({ node }: { node: IRNode }) {
           {info.texts.map((item, index) => (
             <li
               key={`${item.text}-${index}`}
-              className="flex items-start gap-2 rounded border border-slate-200 px-2 py-1 text-xs"
+              className="flex items-start gap-2 rounded-lg border border-white/[0.07] bg-white/[0.02] px-2 py-1 text-xs"
             >
-              <span className="mt-0.5 shrink-0 rounded bg-slate-50 px-1 text-[10px] text-slate-500">
+              <span className="mt-0.5 shrink-0 rounded bg-white/[0.06] px-1 text-[10px] text-slate-300">
                 {KIND_LABEL[item.kind] ?? item.kind}
               </span>
-              <span className="min-w-0 flex-1 break-all text-slate-700">{item.text}</span>
+              <span className="min-w-0 flex-1 break-all text-slate-200">{item.text}</span>
               <span className="shrink-0 font-mono text-[10px] text-slate-400">
                 {item.via ? `${item.via} · ` : ""}
                 {item.loc ? `L${item.loc.line}` : ""}
@@ -124,15 +124,15 @@ export function UiTextPanel({ node }: { node: IRNode }) {
       )}
 
       {info.dynamic.length > 0 ? (
-        <div className="mt-2 rounded bg-slate-50 px-2 py-1.5">
-          <p className="text-[10px] leading-relaxed text-slate-500">
+        <div className="mt-2 rounded-lg border border-white/[0.06] bg-white/[0.02] px-2 py-1.5">
+          <p className="text-[10px] leading-relaxed text-slate-400">
             以下位置的文案来自变量，字面量不在本文件（不做跨文件求值）：
           </p>
           <ul className="mt-1 space-y-0.5">
             {info.dynamic.map((item, index) => (
               <li
                 key={`${item.expr}-${index}`}
-                className="flex items-center gap-2 font-mono text-[10px] text-slate-500"
+                className="flex items-center gap-2 font-mono text-[10px] text-slate-400"
               >
                 <span className="min-w-0 flex-1 truncate">{item.expr}</span>
                 {item.loc ? <span className="shrink-0">L{item.loc.line}</span> : null}
@@ -143,7 +143,7 @@ export function UiTextPanel({ node }: { node: IRNode }) {
       ) : null}
 
       {info.truncated > 0 ? (
-        <p className="mt-1.5 text-[10px] leading-relaxed text-amber-600">
+        <p className="mt-1.5 text-[10px] leading-relaxed text-amber-400">
           另有 {info.truncated} 条超出上限未列出，检索时可能漏命中。
         </p>
       ) : null}

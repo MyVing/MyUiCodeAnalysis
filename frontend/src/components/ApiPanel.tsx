@@ -1,4 +1,4 @@
-/**
+﻿/**
  * API / 函数面板：把请求链路的两端渲染出来。
  *
  * - `api` 节点：请求方法 + URL。位置来自「首次发现该接口的调用点」而不是接口
@@ -36,16 +36,16 @@ export function ApiPanel({ node }: { node: IRNode }) {
 
   return (
     <section>
-      <h3 className="text-[11px] font-medium uppercase tracking-wide text-slate-400">{title}</h3>
+      <h3 className="app-section-label">{title}</h3>
 
       {rows.length === 0 ? (
         <p className="mt-2 text-xs text-slate-400">无附加信息</p>
       ) : (
-        <dl className="mt-2 divide-y divide-slate-100 rounded-lg border border-slate-200">
+        <dl className="mt-2 divide-y divide-white/[0.05] rounded-lg border border-white/[0.07] bg-white/[0.02]">
           {rows.map((row) => (
             <div key={row.label} className="flex gap-3 px-2.5 py-1.5 text-xs">
               <dt className="w-14 shrink-0 text-slate-400">{row.label}</dt>
-              <dd className="min-w-0 break-all font-mono text-[11px] text-slate-700">
+              <dd className="min-w-0 break-all font-mono text-[11px] text-slate-200">
                 {row.value}
               </dd>
             </div>
@@ -54,7 +54,7 @@ export function ApiPanel({ node }: { node: IRNode }) {
       )}
 
       {node.loc ? (
-        <p className="mt-1 font-mono text-[10px] text-slate-300">
+        <p className="mt-1 font-mono text-[10px] text-slate-400">
           {node.kind === "api" ? "首次发现于 " : ""}
           {node.file}:{node.loc.line}:{node.loc.col}
         </p>

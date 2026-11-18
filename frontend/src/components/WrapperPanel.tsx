@@ -1,4 +1,4 @@
-/**
+﻿/**
  * 封装注解面板：说明组件是某个 UI 库组件的二次封装。
  *
  * 面板回答三个问题：
@@ -52,32 +52,36 @@ export function WrapperPanel({ node }: { node: IRNode }) {
 
   return (
     <section>
-      <h3 className="text-[11px] font-medium uppercase tracking-wide text-slate-400">二次封装</h3>
+      <h3 className="app-section-label">二次封装</h3>
 
-      <div className="mt-2 rounded-lg border border-slate-200 px-2.5 py-2 text-xs">
-        <p className="text-slate-700">
+      <div className="mt-2 rounded-lg border border-white/[0.07] bg-white/[0.02] px-2.5 py-2 text-xs">
+        <p className="text-slate-200">
           封装 <span className="font-mono text-[11px]">{wrapper.package}</span> 的{" "}
-          <span className="font-mono text-[11px] font-medium">{wrapper.display}</span>
+          <span className="font-mono text-[11px] font-medium text-slate-100">
+            {wrapper.display}
+          </span>
         </p>
         <p className="mt-1 break-all font-mono text-[10px] text-slate-400">{wrapper.target}</p>
 
         {wrapper.description ? (
-          <p className="mt-1.5 leading-relaxed text-[11px] text-slate-500">{wrapper.description}</p>
+          <p className="mt-1.5 leading-relaxed text-[11px] text-slate-300">
+            {wrapper.description}
+          </p>
         ) : null}
 
         {wrapper.props.length > 0 ? (
-          <dl className="mt-2 divide-y divide-slate-100 border-t border-slate-100">
+          <dl className="mt-2 divide-y divide-white/[0.05] border-t border-white/[0.06]">
             {wrapper.props.map(([from, to]) => (
               <div key={from} className="flex gap-3 py-1 text-[11px]">
-                <dt className="w-28 shrink-0 break-all font-mono text-slate-500">{from}</dt>
-                <dd className="min-w-0 break-all font-mono text-slate-700">→ {to}</dd>
+                <dt className="w-28 shrink-0 break-all font-mono text-slate-400">{from}</dt>
+                <dd className="min-w-0 break-all font-mono text-slate-200">→ {to}</dd>
               </div>
             ))}
           </dl>
         ) : null}
 
         {wrapper.resolved ? null : (
-          <p className="mt-2 rounded bg-amber-50 px-2 py-1 text-[10px] leading-relaxed text-amber-700">
+          <p className="mt-2 rounded-md border border-amber-400/20 bg-amber-400/[0.08] px-2 py-1 text-[10px] leading-relaxed text-amber-300">
             渲染边没有连到这个组件（常见于动态组件），注解仅来自映射配置。
           </p>
         )}

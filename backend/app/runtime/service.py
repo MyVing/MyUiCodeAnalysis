@@ -96,7 +96,8 @@ class RuntimeService:
         return task
 
     async def _execute(self, project: Project, task: RuntimeTask) -> None:
-        await self._repository.update_task(
+        # 沿用仓储返回的快照：否则后续全字段更新会用 started_at=None 覆盖刚写入的值
+        task = await self._repository.update_task(
             task.model_copy(update={"status": "running", "started_at": datetime.now(UTC)})
         )
         request = RuntimeWorkerRequest(

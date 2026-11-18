@@ -7,6 +7,7 @@
  */
 
 import path from "node:path";
+import { builtinModules } from "node:module";
 
 /** 归一化为正斜杠，用于跨平台比较与写入 IR。 */
 export function toPosix(value: string): string {
@@ -72,6 +73,72 @@ export function isLocalSpecifier(moduleSpecifier: string, aliasPrefixes: readonl
     (prefix) => moduleSpecifier === prefix || moduleSpecifier.startsWith(`${prefix}/`),
   );
 }
+
+/**
+ * 非脚本资源扩展名：样式、图片、字体、媒体。
+ *
+ * 这类导入是打包器（Vite / webpack）负责的，TypeScript 根本不会把它们当模块，
+ * ts-morph 因此必然解析不到。按「本地模块断链」报 error 是错的——代码没有任何问题。
+ */
+const ASSET_EXTENSIONS: ReadonlySet<string> = new Set([
+  // 样式
+  ".css",
+  ".scss",
+  ".sass",
+  ".less",
+  ".styl",
+  ".stylus",
+  // 图片
+  ".svg",
+  ".png",
+  ".jpg",
+  ".jpeg",
+  ".gif",
+  ".webp",
+  ".avif",
+  ".ico",
+  ".bmp",
+  // 字体
+  ".woff",
+  ".woff2",
+  ".ttf",
+  ".otf",
+  ".eot",
+  // 媒体
+  ".mp4",
+  ".webm",
+  ".ogv",
+  ".mp3",
+  ".wav",
+  ".ogg",
+  ".flac",
+]);
+
+/**
+ * 判定说明符是否指向非脚本资源。
+ *
+ * 先剥掉打包器的查询串再取扩展名，因此 `./logo.svg?url`、`?raw`、`?inline`
+ * 这些写法同样命中——它们是 Vite 的资源导入语法，不是模块路径的一部分。
+ */
+export function isAssetSpecifier(moduleSpecifier: string): boolean {
+  const withoutQuery = moduleSpecifier.split(/[?#]/)[0] ?? moduleSpecifier;
+  const extension = path.extname(withoutQuery).toLowerCase();
+  return ASSET_EXTENSIONS.has(extension);
+}
+
+/**
+ * 判定说明符是否为 Node 内置模块。
+ *
+ * `vite.config.ts` / `scripts/*.ts` 里 `import path from "path"` 是正常写法，
+ * 它既没装也不需要装：内置模块由运行时提供。用 Node 自己的列表判断，
+ * 不手写名单——手写名单永远会漏掉新版本新增的模块。
+ */
+export function isNodeBuiltin(moduleSpecifier: string): boolean {
+  if (moduleSpecifier.startsWith("node:")) return true;
+  return NODE_BUILTINS.has(moduleSpecifier);
+}
+
+const NODE_BUILTINS: ReadonlySet<string> = new Set(builtinModules);
 
 /**
  * 从 tsconfig 的 paths 配置推导别名前缀（去掉末尾的 `*` 与 `/`）。

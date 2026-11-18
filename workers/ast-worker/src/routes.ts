@@ -34,7 +34,7 @@
  * - route → 页面组件的边 → 0.9：与 renders 边同档，符号与语法都确定，但未经类型检查
  */
 
-import type { Node, Project, SourceFile } from "ts-morph";
+import type { ArrayLiteralExpression, Node, Project, SourceFile } from "ts-morph";
 import { Node as MorphNode, SyntaxKind } from "ts-morph";
 
 import type { Evidence, IREdge, IRNode, Warning } from "@uicodeanalysis/contracts";
@@ -94,7 +94,7 @@ export interface RouteAnalysisInput {
  * ------------------------------------------------------------------ */
 
 /** 折叠重复斜杠、去掉尾部斜杠（根路径除外）。 */
-function normalizePath(raw: string): string {
+export function normalizePath(raw: string): string {
   const collapsed = raw.replace(/\/{2,}/g, "/");
   if (!collapsed.startsWith("/")) return `/${collapsed}`.replace(/\/$/, "") || "/";
   const trimmed = collapsed.replace(/\/+$/, "");
@@ -119,14 +119,18 @@ function joinPath(parent: string, segment: string): string {
 /**
  * 从路径里取动态段名（`/users/:id` → `["id"]`）。
  *
- * 捕获所有段要剥掉尾部的 `*` / `*?`：`/blog/:slug*` 的参数名是 `slug`
- * 而不是 `slug*`——星号是匹配范围，不是名字的一部分。
+ * 段名后面可能带修饰符，这些都不是名字的一部分：
+ *  - `:id?`   可选参数（React Router v6）→ `id`
+ *  - `:slug*` 捕获所有 → `slug`
+ *  - `:slug*?` 可选捕获所有 → `slug`
+ *
+ * 顺序必须是从长到短：先剥 `?` 再剥 `*` 会把 `:slug*?` 变成 `slug*`。
  */
 function extractParams(path: string): string[] {
   return path
     .split("/")
     .filter((segment) => segment.startsWith(":") && segment.length > 1)
-    .map((segment) => segment.slice(1).replace(/\*+\??$/, ""));
+    .map((segment) => segment.slice(1).replace(/\*?\?$/, "").replace(/\*$/, ""));
 }
 
 /* ------------------------------------------------------------------ *
@@ -318,20 +322,90 @@ class RouteCollector {
  * 不做「任何带 path 的对象都算路由」的猜测——那会把面包屑配置、菜单配置
  * 一并吞进来。
  */
+/**
+ * 把「指向路由数组的表达式」还原成数组字面量。
+ *
+ * 三种写法都要认，它们在真实项目里同样普遍：
+ *  - `useRoutes([...])`            直接是字面量
+ *  - `useRoutes(appRoutes)`        引用变量（`const appRoutes = [...]`）
+ *  - `useRoutes(routes.filter(…))` 这类求值不出来的 → null，由调用方决定是否告警
+ *
+ * 沿符号声明回溯而不是按名字猜：同名变量在不同文件里是不同数组。
+ */
+function resolveRouteArray(node: Node, depth = 0): ArrayLiteralExpression | null {
+  // 层数只记「跨变量」的跳数：括号与 as const / satisfies 只是包裹语法，
+  // 不改变指向哪个数组，不该消耗深度——否则 `const a = b` 套两层断言就越界
+  if (depth > 3) return null;
+  if (MorphNode.isArrayLiteralExpression(node)) return node;
+
+  if (MorphNode.isParenthesizedExpression(node)) {
+    return resolveRouteArray(node.getExpression(), depth);
+  }
+
+  // `as const` / 类型断言不影响数组本身
+  if (MorphNode.isAsExpression(node) || MorphNode.isSatisfiesExpression(node)) {
+    return resolveRouteArray(node.getExpression(), depth);
+  }
+
+  if (MorphNode.isIdentifier(node)) {
+    let symbol = node.getSymbol();
+    if (symbol?.isAlias()) {
+      try {
+        symbol = symbol.getAliasedSymbol();
+      } catch {
+        return null;
+      }
+    }
+    for (const decl of symbol?.getDeclarations() ?? []) {
+      if (!MorphNode.isVariableDeclaration(decl)) continue;
+      const init = decl.getInitializer();
+      if (!init) continue;
+      const resolved = resolveRouteArray(init, depth + 1);
+      if (resolved) return resolved;
+    }
+  }
+
+  return null;
+}
+
 function walkRouteObjects(
   array: Node,
   parentPath: string,
   context: TagResolveContext,
   collector: RouteCollector,
 ): void {
-  if (!MorphNode.isArrayLiteralExpression(array)) return;
+  const resolved = resolveRouteArray(array);
+  if (!resolved) return;
+
   const relativeFile = toProjectRelative(
     context.rootPath,
-    array.getSourceFile().getFilePath(),
+    resolved.getSourceFile().getFilePath(),
   );
   if (relativeFile === null) return;
 
-  for (const element of array.getElements()) {
+  for (const element of resolved.getElements()) {
+    // `[...WelcomeRoutes, ...PostRoutes]`：每条 spread 都是一个独立的路由数组，
+    // 递归展开到它的字面量。真实项目普遍按 feature 拆分路由再聚合，
+    // 只认数组字面量会让整张路由表一个节点都产不出。
+    if (MorphNode.isSpreadElement(element)) {
+      const spreadTarget = resolveRouteArray(element.getExpression());
+      if (spreadTarget) {
+        walkRouteObjects(spreadTarget, parentPath, context, collector);
+        continue;
+      }
+      // 展开不到字面量（函数返回、条件表达式）：路由确实存在但看不到，
+      // 如实记一条，不假装这个项目没有路由。
+      collector.warnings.push({
+        code: "route_table_unresolved",
+        severity: "info",
+        stage: "static",
+        file: relativeFile,
+        loc: locOf(element),
+        message: `路由表展开项 \`${element.getText()}\` 无法静态求值，其下的路由未计入图谱`,
+      });
+      continue;
+    }
+
     if (!MorphNode.isObjectLiteralExpression(element)) continue;
 
     const pathProp = element.getProperty("path");
@@ -494,6 +568,9 @@ function walkRouteElements(
     }
 
     if (pathLiteral === null && !isIndex) {
+      // 与对象式路由表保持一致：路径拿不到时这个路由自己不产节点，但仍要登记
+      // 一条「子路由的基准路径」——纯 layout 路由（无 path、只有 children）在
+      // JSX 写法里很常见，不登记的话子路由会丢掉父前缀，`/users/:id` 变成 `/:id`。
       if (pathAttr !== undefined) {
         collector.warnings.push({
           code: "route_path_unresolved",
@@ -504,6 +581,7 @@ function walkRouteElements(
           message: "路由的 path 不是字符串字面量，无法确定 URL，未产出 route 节点",
         });
       }
+      computed.set(node.getStart(), parentPath);
       continue;
     }
 

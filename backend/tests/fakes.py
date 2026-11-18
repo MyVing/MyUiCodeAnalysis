@@ -5,6 +5,8 @@ run() 自身负责超时判定，超时返回 worker_timeout 结果而不是抛�
 """
 
 import asyncio
+import json
+from pathlib import Path
 
 from app.analysis.runner import WorkerOutcome, WorkerRequest
 from app.contracts import (
@@ -20,10 +22,57 @@ from app.contracts import (
     RuntimeTrace,
     Source,
 )
+from app.git_client import GitError, GitSnapshot
 from app.requirement.llm import LLMCallError
 from app.runtime.runner import RuntimeWorkerOutcome, RuntimeWorkerRequest
 
 _HANG_SECONDS = 5.0
+
+
+class FakeGitClient:
+    """假 Git 客户端：只落一个最小 package.json，用来验证去重与同步语义。"""
+
+    def __init__(
+        self,
+        branch: str = "main",
+        commit: str = "a" * 40,
+        *,
+        next_commit: str = "b" * 40,
+        error: str | None = None,
+    ) -> None:
+        self.branch = branch
+        self.commit = commit
+        self.next_commit = next_commit
+        self.error = error
+        self.clone_calls: list[
+            tuple[str, Path, str | None, str | None, str | None, str | None]
+        ] = []
+        self.sync_calls: list[Path] = []
+
+    async def clone(
+        self,
+        remote_url: str,
+        destination: Path,
+        branch: str | None = None,
+        username: str | None = None,
+        password: str | None = None,
+        token: str | None = None,
+    ) -> GitSnapshot:
+        if self.error is not None:
+            raise GitError(self.error)
+        destination.mkdir(parents=True, exist_ok=True)
+        (destination / "package.json").write_text(
+            json.dumps({"dependencies": {"react": "^19.0.0"}}), encoding="utf-8"
+        )
+        self.clone_calls.append((remote_url, destination, branch, username, password, token))
+        return GitSnapshot(branch=branch or self.branch, commit=self.commit)
+
+    async def sync(self, root: Path) -> GitSnapshot:
+        if self.error is not None:
+            raise GitError(self.error)
+        self.sync_calls.append(root)
+        self.commit = self.next_commit
+        return GitSnapshot(branch=self.branch, commit=self.commit)
 
 
 class FakeLLMClient:

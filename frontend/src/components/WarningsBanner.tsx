@@ -1,4 +1,4 @@
-import { ChevronDown, ChevronRight, OctagonAlert, TriangleAlert, Info } from "lucide-react";
+﻿import { ChevronDown, ChevronRight, OctagonAlert, TriangleAlert, Info } from "lucide-react";
 import { useState } from "react";
 
 import type { Severity, Warning } from "@uicodeanalysis/contracts";
@@ -14,19 +14,19 @@ const SEVERITY_META: Record<
   error: {
     label: "错误",
     icon: OctagonAlert,
-    container: "border-rose-200 bg-rose-50 text-rose-800",
-    iconClass: "text-rose-500",
+    container: "border-rose-400/20 bg-rose-400/[0.08] text-rose-200",
+    iconClass: "text-rose-400",
   },
   warning: {
     label: "警告",
     icon: TriangleAlert,
-    container: "border-amber-200 bg-amber-50 text-amber-800",
-    iconClass: "text-amber-500",
+    container: "border-amber-400/20 bg-amber-400/[0.08] text-amber-200",
+    iconClass: "text-amber-400",
   },
   info: {
     label: "提示",
     icon: Info,
-    container: "border-slate-200 bg-slate-50 text-slate-700",
+    container: "border-white/[0.08] bg-white/[0.03] text-slate-200",
     iconClass: "text-slate-400",
   },
 };

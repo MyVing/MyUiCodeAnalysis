@@ -11,7 +11,10 @@ from datetime import UTC, datetime
 from uuid import uuid4
 
 from app.analysis.runner import WorkerRequest, WorkerRunner
+from app.contracts import IRGraph
 from app.core.config import Settings
+from app.requirement.llm import LLMClient
+from app.requirement.profile import profile_pages
 from app.schemas import AnalysisStart, AnalysisTask, Project
 from app.storage.repositories import AnalysisRepository
 
@@ -28,10 +31,13 @@ class AnalysisService:
         repository: AnalysisRepository,
         runner: WorkerRunner,
         settings: Settings,
+        llm: LLMClient | None = None,
     ) -> None:
         self._repository = repository
         self._runner = runner
         self._settings = settings
+        # 画像用的模型客户端。为 None 或开关关闭时不生成画像，分析照常成功。
+        self._llm = llm
         # asyncio.Task 弱引用会被事件循环 GC，必须持有强引用直到完成
         self._background: set[asyncio.Task[None]] = set()
 
@@ -72,7 +78,10 @@ class AnalysisService:
         return task
 
     async def _execute(self, project: Project, task: AnalysisTask) -> None:
-        await self._repository.update_task(
+        # 必须沿用 update_task 的返回值：仓储返回的是持久化后的任务快照，
+        # 若继续用入参 task（started_at 为 None）做后续全字段更新，
+        # 会把刚写入的 started_at 覆盖回 NULL。
+        task = await self._repository.update_task(
             task.model_copy(update={"status": "running", "started_at": datetime.now(UTC)})
         )
         request = WorkerRequest(
@@ -111,6 +120,7 @@ class AnalysisService:
                     }
                 )
             )
+            self._schedule_profile(project, outcome.graph)
             return
 
         await self._repository.update_task(
@@ -123,3 +133,50 @@ class AnalysisService:
                 }
             )
         )
+
+    def _schedule_profile(self, project: Project, graph: IRGraph) -> None:
+        """分析成功后异步生成页面画像。
+
+        放在后台任务而不是分析主流程里，因为画像是**可选的辅助线索**：
+        多花一次模型调用，慢的是画像不是分析；失败也只是少一段描述。
+        开关默认关，未配置模型时同样跳过——两者都不该让分析结果受影响。
+        """
+        if not self._settings.llm_profile_enabled or self._llm is None:
+            return
+        analysis_id = graph.analysisId
+        if analysis_id is None:
+            return
+        background = asyncio.get_running_loop().create_task(
+            self._generate_profile(project, graph, analysis_id)
+        )
+        self._background.add(background)
+        background.add_done_callback(self._background.discard)
+
+    async def _generate_profile(
+        self, project: Project, graph: IRGraph, analysis_id: str
+    ) -> None:
+        assert self._llm is not None
+        try:
+            outcome = await profile_pages(
+                graph,
+                self._llm,
+                analysis_id=analysis_id,
+                model=self._settings.llm_model,
+                max_calls=self._settings.llm_max_calls_per_request,
+                max_pages=self._settings.llm_max_pages or None,
+            )
+        except Exception:  # noqa: BLE001 - 画像失败绝不能冒泡到分析任务
+            logger.exception("页面画像生成失败：project=%s analysis=%s", project.id, analysis_id)
+            return
+        if outcome.degraded:
+            # 降级也落库：告警本身是「为什么这个项目没有描述」的唯一记录
+            logger.warning(
+                "页面画像降级：project=%s analysis=%s %s",
+                project.id,
+                analysis_id,
+                ";".join(outcome.payload.warnings),
+            )
+        try:
+            await self._repository.save_page_profiles(project.id, outcome.payload)
+        except Exception:  # noqa: BLE001
+            logger.exception("页面画像落库失败：project=%s analysis=%s", project.id, analysis_id)

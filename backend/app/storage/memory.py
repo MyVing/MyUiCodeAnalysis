@@ -8,7 +8,9 @@ import asyncio
 from collections import deque
 
 from app.contracts import IRGraph, RequirementMap, RuntimeTrace
+from app.requirement.page_profile import ProfilePayload
 from app.schemas import AnalysisTask, Project, RequirementTask, RuntimeTask
+from app.storage.repositories import DuplicateRemoteUrlError
 
 MAX_GRAPHS_PER_PROJECT = 5
 MAX_MAPS_PER_PROJECT = 20
@@ -28,7 +30,23 @@ class InMemoryProjectRepository:
         async with self._lock:
             return self._items.get(project_id)
 
+    async def get_by_remote(self, remote_url: str) -> Project | None:
+        async with self._lock:
+            for item in self._items.values():
+                if item.remote_url == remote_url:
+                    return item
+            return None
+
     async def add(self, project: Project) -> Project:
+        async with self._lock:
+            if project.remote_url and any(
+                item.remote_url == project.remote_url for item in self._items.values()
+            ):
+                raise DuplicateRemoteUrlError(project.remote_url)
+            self._items[project.id] = project
+        return project
+
+    async def update(self, project: Project) -> Project:
         async with self._lock:
             self._items[project.id] = project
         return project
@@ -41,6 +59,9 @@ class InMemoryAnalysisRepository:
         # 两个版本，淘汰顺序按写入时间统一排序，get_latest_graph 因此天然 merged 优先
         self._graphs: dict[str, dict[str, IRGraph]] = {}
         self._graph_order: dict[str, deque[str]] = {}
+        # 页画像按 analysisId 存放：与图同一版本口径，图被淘汰后画像也不再有用
+        self._profiles: dict[str, dict[str, ProfilePayload]] = {}
+        self._profile_order: dict[str, deque[str]] = {}
         self._lock = asyncio.Lock()
 
     async def add_task(self, task: AnalysisTask) -> AnalysisTask | None:
@@ -105,6 +126,25 @@ class InMemoryAnalysisRepository:
             if not order:
                 return None
             return self._graphs[project_id].get(order[-1])
+
+    async def save_page_profiles(self, project_id: str, payload: ProfilePayload) -> None:
+        async with self._lock:
+            profiles = self._profiles.setdefault(project_id, {})
+            order = self._profile_order.setdefault(project_id, deque())
+            analysis_id = payload.analysis_id
+            if analysis_id in order:
+                order.remove(analysis_id)
+            profiles[analysis_id] = payload
+            order.append(analysis_id)
+            # 与图产物的淘汰口径一致：画像按图版本存放，图被淘汰后画像也不再有用
+            while len(order) > MAX_GRAPHS_PER_PROJECT:
+                profiles.pop(order.popleft(), None)
+
+    async def get_page_profiles(
+        self, project_id: str, analysis_id: str
+    ) -> ProfilePayload | None:
+        async with self._lock:
+            return self._profiles.get(project_id, {}).get(analysis_id)
 
 
 def create_project_repository() -> InMemoryProjectRepository:

@@ -3,41 +3,57 @@
 信任模型的原因，校验模型的产出。四条服务端校验缺一不可：
   1. featureId 必须是本次拆解出的功能点（unknown_feature）
   2. pageNodeId 必须落在候选集内（node_not_in_candidates）
-  3. quote 必须能在该候选的原文语料里逐字找到（quote_not_found）
+  3. quote 必须能在该候选的原文语料里找到（quote_not_found）——整条相等优先，
+     归一化子串兜底，见 `match_quote`
   4. 字段类型必须符合预期（invalid_shape）
 未通过校验的输出进 dropped 而不是静默丢弃——审核模型是否在幻想，只能靠这份记录。
 
 模型自报的置信度不透传：落库置信度硬上限 0.6（AI 推断永远不等于语法事实），
 原始值记在 modelConfidence 里供比对封顶是否生效。
+
+## 本模块现在的角色
+
+主路径是 `locate.py`（页面 + 交互链路）。本模块保留「页面级」判定能力：
+图里没有任何可推导链路时（纯静态页面），页面仍是合法落点。两条路径共用
+`match_quote` / `parse_json` / `MAX_CONFIDENCE` —— 校验规则只能有一份，否则
+`chain_not_in_candidates` 这类新闸在一条路径上生效、另一条上悄悄缺失。
 """
 
 from __future__ import annotations
 
 import json
 import re
+from collections.abc import Sequence
 from dataclasses import dataclass, field
 
 from app.contracts import IRGraph
 from app.contracts.requirement import (
     Candidate,
     Dropped,
+    Location,
     Match,
     Reason,
     RequirementWarning,
     Severity,
     Source,
     Unmatched,
+    VerifiedEvidence,
 )
 from app.requirement.features import DecomposedFeature
 from app.requirement.llm import LLMCallError, LLMClient
 from app.requirement.recall import CandidateDetail
 from app.requirement.subgraph import build_subgraph
+from app.requirement.text import normalize
 
 # 未匹配功能点附带的召回候选数：足够判断「需求超纲」还是「召回不足」
 _UNMATCHED_CANDIDATES = 3
 
 # 落库置信度硬上限，与契约约定一致
-_MAX_CONFIDENCE = 0.6
+MAX_CONFIDENCE = 0.6
+
+# 子串兜底的最小长度。更短的片段（「列表」「状态」「的」）能命中几乎一切语料，
+# 这样的"校验"等于不校验。
+MIN_SUBSTRING_QUOTE = 4
 
 _SYSTEM_PROMPT = """\
 你是 React 项目的需求定位助手。输入是一段需求拆解出的功能点，和一份「页面候选」\
@@ -48,8 +64,9 @@ _SYSTEM_PROMPT = """\
 规则：
 1. pageNodeId 只能从候选清单里选，禁止发明候选外的节点。
 2. quote 是你判断依据的原文，必须从该候选的 signals/uiTexts/propNames/\
-propDescriptions/apiUrls/name 里逐字复制；服务端会做逐字校验，复制不到的匹配会被\
-整条丢弃。
+propDescriptions/apiUrls/name 里复制：优先整条复制；确实需要截取时，截取的片段\
+至少 4 个字、且在该候选里只对应一段原文。服务端会做校验，复制不到的匹配会被\
+整条丢弃。summary（如果有）是页面用途的一句话描述，只能用来理解页面，不能作为 quote。
 3. confidence 为 0 到 1 之间的小数，表示你对该匹配的把握，宁可保守。
 4. featureId 必须来自输入的功能点清单。
 5. 需求超纲、或候选里找不到能实现该功能点的页面时，把 featureId 放进 unmatched \
@@ -80,6 +97,7 @@ async def judge(
     *,
     requirement: str,
     max_calls: int,
+    summaries: dict[str, str] | None = None,
 ) -> JudgeOutcome:
     if not candidates:
         # 召回已经失败（no_page_candidates 等），不必烧一次模型调用
@@ -98,7 +116,7 @@ async def judge(
         )
 
     candidate_by_id = {detail.candidate.nodeId: detail for detail in candidates}
-    user_prompt = _build_user_prompt(requirement, features, candidates)
+    user_prompt = _build_user_prompt(requirement, features, candidates, summaries)
 
     raw: dict[str, object] | None = None
     last_error: str | None = None
@@ -112,8 +130,12 @@ async def judge(
             text = await llm.chat(_SYSTEM_PROMPT, prompt)
         except LLMCallError as error:
             last_error = error.message
+            # 不可重试的错误（鉴权失败、模型不存在、请求体被拒）再发同样的请求
+            # 必然同样失败，继续只会烧掉预算并拖长用户等待。
+            if not error.retryable:
+                break
             continue
-        parsed = _parse_json(text)
+        parsed = parse_json(text)
         if parsed is not None:
             raw = parsed
             break
@@ -135,7 +157,7 @@ async def judge(
                 RequirementWarning(
                     code="llm_unavailable",
                     severity=Severity.error,
-                    message=f"模型判定在 {max_calls} 次尝试内未产出有效结果"
+                    message=f"模型判定在 {calls} 次尝试内未产出有效结果"
                     f"（{last_error or '未知原因'}），已降级为确定性召回。",
                 )
             ],
@@ -148,6 +170,7 @@ def _build_user_prompt(
     requirement: str,
     features: list[DecomposedFeature],
     candidates: list[CandidateDetail],
+    summaries: dict[str, str] | None = None,
 ) -> str:
     feature_lines = "\n".join(
         f"{feature.id}: {feature.text}" for feature in features
@@ -155,23 +178,26 @@ def _build_user_prompt(
     candidate_payload = []
     for detail in candidates:
         candidate = detail.candidate
-        candidate_payload.append(
-            {
-                "nodeId": candidate.nodeId,
-                "name": candidate.name,
-                "routeId": candidate.routeId,
-                "file": candidate.file,
-                "score": candidate.score,
-                "signals": [
-                    {"kind": signal.kind.value, "value": signal.value}
-                    for signal in candidate.signals
-                ],
-                "uiTexts": detail.ui_texts,
-                "propNames": detail.prop_names,
-                "propDescriptions": detail.prop_descriptions,
-                "apiUrls": detail.api_urls,
-            }
-        )
+        payload: dict[str, object] = {
+            "nodeId": candidate.nodeId,
+            "name": candidate.name,
+            "routeId": candidate.routeId,
+            "file": candidate.file,
+            "score": candidate.score,
+            "signals": [
+                {"kind": signal.kind.value, "value": signal.value}
+                for signal in candidate.signals
+            ],
+            "uiTexts": detail.ui_texts,
+            "propNames": detail.prop_names,
+            "propDescriptions": detail.prop_descriptions,
+            "apiUrls": detail.api_urls,
+        }
+        # 页面画像：只帮助理解页面用途，不是引文来源（见 profile.py 的约束 1）
+        summary = (summaries or {}).get(candidate.nodeId)
+        if summary:
+            payload["summary"] = summary
+        candidate_payload.append(payload)
     candidates_json = json.dumps(candidate_payload, ensure_ascii=False, indent=2)
     return (
         f"需求：{requirement}\n\n"
@@ -180,7 +206,7 @@ def _build_user_prompt(
     )
 
 
-def _parse_json(text: str) -> dict[str, object] | None:
+def parse_json(text: str) -> dict[str, object] | None:
     """从模型输出里提取目标 JSON；容忍代码围栏与前后杂文。"""
     stripped = _CODE_FENCE_RE.sub("", text.strip())
     start = stripped.find("{")
@@ -226,6 +252,7 @@ def _assemble_outcome(
                 graph=graph,
                 matches=outcome.matches,
                 dropped=outcome.dropped,
+                warnings=outcome.warnings,
             )
     else:
         outcome.dropped.append(Dropped(reason=Reason.invalid_shape))
@@ -256,6 +283,114 @@ def _top_candidates(candidate_by_id: dict[str, CandidateDetail]) -> list[Candida
     return [detail.candidate for detail in ordered[:_UNMATCHED_CANDIDATES]]
 
 
+@dataclass(frozen=True)
+class QuoteMatch:
+    """引文校验结果。
+
+    命中时要带回**语料里那段原文**而不是模型写的字串：`Match.quote` 与
+    `VerifiedEvidence.quote` 都必须是代码里的真实文本，否则前端点开证据看到的
+    是一句代码里不存在的话。
+    """
+
+    # 语料中命中的那一整条原文
+    corpus_text: str
+    # True 表示模型截取了子串，而不是整条复制
+    partial: bool
+
+
+def match_quote(quote: str, corpus: Sequence[str]) -> QuoteMatch | None:
+    """在候选语料里定位引文：整条相等优先，归一化子串兜底。
+
+    为什么要子串兜底：企业项目里一条文案常常很长（「用户列表-状态筛选-全部」），
+    模型引用其中「状态筛选」是完全合理的判断依据。只做整条相等会把它判成幻觉，
+    这是系统性偏向长引文的偏差，不是随机误差。
+
+    兜底必须成对约束，否则等于取消校验：
+      - 长度下限 `MIN_SUBSTRING_QUOTE`：短词能命中几乎一切语料；
+      - **唯一命中**：同一片段在语料里对上多段原文时，无法证明模型指的是哪一段，
+        按「校验失败」处理（宁缺勿滥），而不是挑第一条蒙过去。
+    """
+    # 先用模型原样字串比：语料本身就是源码原文，不需要归一化才能命中
+    for text in corpus:
+        if text == quote:
+            return QuoteMatch(corpus_text=text, partial=False)
+
+    # 再按归一化后的等值比：全角/半角、空白、大小写差异不该冤枉正确引文
+    normalized_quote = normalize(quote)
+    if not normalized_quote:
+        return None
+    for text in corpus:
+        if normalize(text) == normalized_quote:
+            return QuoteMatch(corpus_text=text, partial=False)
+
+    if len(normalized_quote) < MIN_SUBSTRING_QUOTE:
+        return None
+
+    hits = [text for text in corpus if normalized_quote in normalize(text)]
+    # 去重后再判唯一：语料里同一句话出现两次不算歧义
+    distinct = list(dict.fromkeys(hits))
+    if len(distinct) != 1:
+        return None
+
+    return QuoteMatch(corpus_text=distinct[0], partial=True)
+
+
+def _candidates_sharing(
+    corpus_text: str,
+    node_id: str,
+    candidate_by_id: dict[str, CandidateDetail],
+) -> list[str]:
+    """除命中候选外，语料里也含这段原文的候选。
+
+    多页面共用一句文案（「暂无数据」「加载中」）是常态：此时引文命中只能证明
+    「这句话在这堆候选里存在过」，不能证明归属。这种弱化必须让人看见——否则
+    一条本该含糊的匹配会以和其他匹配完全相同的面貌出现在审核界面上。
+    """
+    return sorted(
+        other.candidate.nodeId
+        for other in candidate_by_id.values()
+        if other.candidate.nodeId != node_id and corpus_text in other.quote_corpus
+    )
+
+
+def _verified_evidence(
+    detail: CandidateDetail,
+    match: QuoteMatch,
+) -> list[VerifiedEvidence]:
+    """按已通过语料校验的引文查找后端保存的结构化来源。
+
+    子串命中时一条原文可能对应多条结构化证据（同一段文案挂在多个节点上），
+    因此按 `corpus_text` 相等匹配，而不是按模型给的片段匹配。
+    """
+    matching = [item for item in detail.evidence if item.text == match.corpus_text]
+    matching.sort(
+        key=lambda item: (
+            -item.confidence,
+            item.kind.value,
+            item.node_id,
+            item.file or "",
+            item.loc.line if item.loc else 0,
+            item.loc.col if item.loc else 0,
+        )
+    )
+    return [
+        VerifiedEvidence(
+            nodeId=item.node_id,
+            quote=item.text,
+            file=item.file,
+            loc=(
+                Location(line=item.loc.line, col=item.loc.col)
+                if item.loc is not None
+                else None
+            ),
+            via=item.kind.value,
+            source=item.source.value,
+            confidence=item.confidence,
+        )
+        for item in matching
+    ]
+
+
 def _validate_match(
     entry: dict[str, object],
     *,
@@ -264,6 +399,7 @@ def _validate_match(
     graph: IRGraph,
     matches: list[Match],
     dropped: list[Dropped],
+    warnings: list[RequirementWarning],
 ) -> None:
     feature_id = entry.get("featureId")
     node_id = entry.get("pageNodeId")
@@ -298,9 +434,54 @@ def _validate_match(
     if detail is None:
         reject(Reason.node_not_in_candidates)
         return
-    if quote not in detail.quote_corpus:
+
+    quote_match = match_quote(quote, detail.quote_corpus)
+    if quote_match is None:
         reject(Reason.quote_not_found)
         return
+
+    if quote_match.partial:
+        # 子串命中是放宽而不是等价：模型确实指对了位置，但它写的不是原文。
+        # 记一条 info 让人能复核「到底引了哪一段」，而不是把它当整条复制放过。
+        warnings.append(
+            RequirementWarning(
+                code="quote_partial_match",
+                severity=Severity.info,
+                message=(
+                    f"模型引文为子串，已按候选语料中的原文记录：\n"
+                    f"引文：{quote}\n原文：{quote_match.corpus_text}"
+                ),
+                featureId=feature_id,
+            )
+        )
+
+    # 同一段原文也出现在别的候选里时，引文无法证明归属（「暂无数据」这类共通文案
+    # 尤其常见）。匹配仍然保留——模型还有 reason 与置信度——但必须标注出来，
+    # 否则审核者会以为这条和其他匹配一样确定。
+    shared_with = _candidates_sharing(quote_match.corpus_text, node_id, candidate_by_id)
+    if shared_with:
+        warnings.append(
+            RequirementWarning(
+                code="quote_not_discriminative",
+                severity=Severity.warning,
+                message=(
+                    f"引文「{quote_match.corpus_text}」同样出现在其他候选里，"
+                    f"不能单独证明页面归属：{', '.join(shared_with)}"
+                ),
+                featureId=feature_id,
+            )
+        )
+
+    verified_evidence = _verified_evidence(detail, quote_match)
+    if not verified_evidence:
+        warnings.append(
+            RequirementWarning(
+                code="verified_evidence_unresolved",
+                severity=Severity.warning,
+                message=f"引文已通过语料校验，但无法解析到结构化证据位置：{quote_match.corpus_text}",
+                featureId=feature_id,
+            )
+        )
 
     model_confidence = float(confidence)
     matches.append(
@@ -308,11 +489,13 @@ def _validate_match(
             featureId=feature_id,
             pageNodeId=node_id,
             routeId=detail.candidate.routeId,
-            confidence=min(model_confidence, _MAX_CONFIDENCE),
+            confidence=min(model_confidence, MAX_CONFIDENCE),
             modelConfidence=model_confidence,
-            quote=quote,
+            # 落库的是语料原文，不是模型写的片段：证据必须能在代码里原样找到
+            quote=quote_match.corpus_text,
             reason=reason if isinstance(reason, str) and reason.strip() else None,
             subgraph=build_subgraph(graph, node_id, detail.candidate.routeId),
+            verifiedEvidence=verified_evidence,
             source=Source.ai,
         )
     )

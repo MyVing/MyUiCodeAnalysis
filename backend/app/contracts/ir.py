@@ -35,6 +35,8 @@ class EdgeKind(StrEnum):
     requests = 'requests'
     uses = 'uses'
     boundary = 'boundary'
+    contains = 'contains'
+    navigates = 'navigates'
 
 
 class Severity(StrEnum):

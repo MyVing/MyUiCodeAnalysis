@@ -22,7 +22,7 @@ from app.contracts import (
 # Severity 必须取自 requirement 契约：app.contracts 顶层同名导出是 IR 契约的另一个
 # 枚举，混用会让 `warning.severity is Severity.info` 莫名其妙地失败。
 from app.contracts.requirement import Severity
-from app.requirement.features import decompose
+from app.requirement.features import DecomposeResult, decompose, decompose_with_report
 from app.requirement.lexicon import BIGRAM_TERM_WEIGHT, expand
 from app.requirement.recall import DEFAULT_TOP_K, recall
 from app.requirement.text import ascii_words, contains_cjk, normalize
@@ -252,6 +252,36 @@ def test_recall_uses_props_description_as_evidence(user_graph: IRGraph) -> None:
     assert any(signal.kind is SignalKind.propDescription for signal in candidate.signals)
 
 
+def test_recall_keeps_locatable_evidence_for_each_quote(user_graph: IRGraph) -> None:
+    """判定阶段要靠这份元数据把引文落成可复核坐标，不能只剩字符串。"""
+    result = recall(user_graph, decompose("用户列表增加状态筛选")[0].terms)
+    detail = next(item for item in result.candidates if item.candidate.nodeId.endswith("#UserList"))
+
+    text_evidence = next(item for item in detail.evidence if item.text == "搜索用户")
+    assert text_evidence.kind is SignalKind.uiText
+    # UI 文案归属页面节点，坐标取 attrs.uiText 里的精确位置
+    assert text_evidence.node_id == "src/pages/UserList.tsx#UserList"
+    assert text_evidence.file == "src/pages/UserList.tsx"
+    assert text_evidence.loc == Location(line=1, col=1)
+    assert text_evidence.source is _STATIC
+    assert text_evidence.confidence == 1.0
+
+    # 每条引文都能在 quote_corpus 里找到，两套数据不允许各说各话
+    assert {item.text for item in detail.evidence} == set(detail.quote_corpus)
+
+
+def test_recall_attributes_api_evidence_to_the_api_node(user_graph: IRGraph) -> None:
+    """接口 url 的坐标属于 api 节点本身，不该记在页面上。"""
+    result = recall(user_graph, decompose("users 接口")[0].terms)
+    detail = next(item for item in result.candidates if item.candidate.nodeId.endswith("#UserList"))
+
+    api_evidence = next(item for item in detail.evidence if item.kind is SignalKind.apiUrl)
+    assert api_evidence.text == "/api/users"
+    assert api_evidence.node_id == "api:GET:/api/users"
+    # api 节点没有 file，回落到其 evidence 上的文件
+    assert api_evidence.file == "src/unknown.tsx"
+
+
 def test_recall_reaches_api_url_through_one_hop(user_graph: IRGraph) -> None:
     """页面 calls fetchUsers，fetchUsers requests /api/users：接口词要算到页面上。"""
     result = recall(user_graph, decompose("users 接口")[0].terms)
@@ -266,6 +296,119 @@ def test_recall_does_not_inherit_children_texts(user_graph: IRGraph) -> None:
     """TableCard 的文案只归 TableCard，不许被页面继承——否则候选之间失去区分度。"""
     result = recall(user_graph, decompose("查看")[0].terms)
     assert result.candidates == []
+
+
+def test_recall_does_not_inherit_children_texts_for_single_route_page(
+    user_graph: IRGraph,
+) -> None:
+    """单路由页面不享受布局特权：TableCard 是 UserList 的子组件，文案仍不继承。
+
+    布局例外只对「被多条路由复用」的组件开启。UserList 只挂在 /users 下，
+    它渲染 TableCard 是普通页面结构，不是全站外壳。
+    """
+    result = recall(user_graph, decompose("查看")[0].terms)
+    assert all(
+        "TableCard" not in item.candidate.nodeId for item in result.candidates
+    )
+
+
+# --- 布局组件 -------------------------------------------------------------
+
+
+def _layout_graph(header_texts: list[str]) -> IRGraph:
+    """模拟一条真实形态：route → FullLayout → Header，且 FullLayout 被多个路由复用。"""
+    header = _node(
+        "src/core/layouts/components/Header.tsx#Header",
+        NodeKind.component,
+        "Header",
+        file="src/core/layouts/components/Header.tsx",
+        attrs=_ui_text_attrs(header_texts),
+    )
+    layout = _node(
+        "src/core/layouts/FullLayout.tsx#FullLayout",
+        NodeKind.component,
+        "FullLayout",
+        file="src/core/layouts/FullLayout.tsx",
+    )
+    welcome = _page("src/features/Welcome/views/WelcomeView.tsx#WelcomeView", "WelcomeView")
+    route_home = _node(
+        "src/features/Welcome/routes.ts#/",
+        NodeKind.route,
+        "/",
+        file="src/features/Welcome/routes.ts",
+        attrs={"path": "/"},
+    )
+    route_posts = _node(
+        "src/features/Post/routes.ts#/posts",
+        NodeKind.route,
+        "/posts",
+        file="src/features/Post/routes.ts",
+        attrs={"path": "/posts"},
+    )
+    post_view = _page("src/features/Post/views/PostView.tsx#PostView", "PostView")
+    return _graph(
+        [header, layout, welcome, post_view, route_home, route_posts],
+        [
+            _edge(route_home.id, layout.id, EdgeKind.renders),
+            _edge(route_posts.id, layout.id, EdgeKind.renders),
+            _edge(layout.id, header.id, EdgeKind.renders),
+            _edge(route_home.id, welcome.id, EdgeKind.renders),
+            _edge(route_posts.id, post_view.id, EdgeKind.renders),
+        ],
+    )
+
+
+def _ui_text_attrs(texts: list[str]) -> dict:
+    return {
+        "uiText": {
+            "texts": [
+                {"text": text, "kind": "text", "via": None, "loc": {"line": 1, "col": 1}}
+                for text in texts
+            ]
+        }
+    }
+
+
+def test_recall_finds_layout_child_text() -> None:
+    """全站导航栏的文案写在子组件里，但它在每个页面上——必须能召回。
+
+    这是缺陷 2：`route → FullLayout → Header`，GitHub 链接在 Header 中，
+    三层之外的文案此前被完全丢弃，导致「点击 GitHub 跳转」召回 0 候选。
+    """
+    result = recall(_layout_graph(["github", "Products"]), expand("github"))
+
+    assert result.candidates, "布局子组件的文案应当能召回页面"
+    assert all(item.candidate.nodeId.endswith("#FullLayout") for item in result.candidates)
+
+
+def test_recall_marks_layout_child_text_with_lower_score() -> None:
+    """布局文案折半计权：能召回，但不能压过页面自有文案。"""
+    layout_only = recall(_layout_graph(["github"]), expand("github"))
+
+    # 同一条文案若写在页面自己身上，得分应恰好是布局版本的两倍
+    page = _page("src/pages/X.tsx#X", "X", texts=["github"])
+    route = _node("src/router.tsx#/x", NodeKind.route, "/x", attrs={"path": "/x"})
+    own_page = _graph(
+        [page, route],
+        [_edge(route.id, page.id, EdgeKind.renders)],
+    )
+    from_own = recall(own_page, expand("github"))
+
+    layout_score = layout_only.candidates[0].candidate.score
+    own_score = from_own.candidates[0].candidate.score
+    assert layout_score == pytest.approx(own_score * 0.5, abs=1e-6)
+
+
+def test_recall_layout_evidence_keeps_real_source_location() -> None:
+    """折半的是分数，证据坐标仍指向 Header 文件——复核时要能跳回原文。"""
+    result = recall(_layout_graph(["github"]), expand("github"))
+    detail = result.candidates[0]
+    evidence = next(item for item in detail.evidence if item.text == "github")
+
+    assert evidence.node_id == "src/core/layouts/components/Header.tsx#Header"
+    assert evidence.file == "src/core/layouts/components/Header.tsx"
+    # 引文语料必须包含它，否则判定阶段会把它判成幻觉
+    assert "github" in detail.quote_corpus
 
 
 def test_recall_returns_nothing_for_unrelated_requirement(user_graph: IRGraph) -> None:
@@ -347,3 +490,31 @@ def test_decompose_assigns_stable_ids_and_dedupes() -> None:
 def test_decompose_caps_feature_count() -> None:
     paragraph = "\n".join(f"功能点编号{i}需要支持搜索" for i in range(20))
     assert len(decompose(paragraph)) == 8
+
+
+def test_decompose_reports_feature_limit_instead_of_silently_dropping() -> None:
+    """超出上限被挤掉的功能点必须告警：否则用户会以为需求被完整拆解了。"""
+    paragraph = "\n".join(f"功能点编号{i}需要支持搜索" for i in range(20))
+    result = decompose_with_report(paragraph)
+
+    assert len(result.features) == 8
+    assert [warning.code for warning in result.warnings] == ["feature_limit_reached"]
+    # 告警要说出丢了多少，不能只说「超限了」
+    assert "12" in result.warnings[0].message
+
+
+def test_decompose_reports_truncated_feature() -> None:
+    """单个功能点被截断时同样告警，并标明是哪个功能点。"""
+    result = decompose_with_report("需求" * 200)
+
+    assert len(result.features) == 1
+    assert len(result.features[0].text) == 200
+    assert [warning.code for warning in result.warnings] == ["feature_truncated"]
+    assert result.warnings[0].featureId == "f1"
+
+
+def test_decompose_within_limits_emits_no_warning() -> None:
+    requirement = "用户列表增加状态筛选"
+    assert decompose_with_report(requirement) == DecomposeResult(
+        features=decompose(requirement)
+    )

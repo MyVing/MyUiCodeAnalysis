@@ -1,4 +1,4 @@
-/**
+﻿/**
  * props 面板：把组件节点的 attrs.props 渲染成属性表。
  *
  * 数据来自静态分析（worker），形状由 shared/schemas 的 attrs 自由扩展承载。
@@ -69,12 +69,10 @@ export function PropsPanel({ node }: { node: IRNode }) {
 
   return (
     <section>
-      <h3 className="text-[11px] font-medium uppercase tracking-wide text-slate-400">
-        Props（{props.fields.length}）
-      </h3>
+      <h3 className="app-section-label">Props（{props.fields.length}）</h3>
 
       {props.typeName ? (
-        <p className="mt-1 font-mono text-[11px] text-slate-500">
+        <p className="mt-1 font-mono text-[11px] text-slate-300">
           {props.typeName}
           {props.generic ? "<…>" : ""}
           {props.typeFile ? (
@@ -88,27 +86,27 @@ export function PropsPanel({ node }: { node: IRNode }) {
       {props.fields.length === 0 ? (
         <p className="mt-2 text-xs text-slate-400">该组件不声明 props</p>
       ) : (
-        <ul className="mt-2 divide-y divide-slate-100 rounded-lg border border-slate-200">
+        <ul className="mt-2 divide-y divide-white/[0.05] rounded-lg border border-white/[0.07] bg-white/[0.02]">
           {props.fields.map((field) => (
             <li key={field.name} className="px-2.5 py-2">
               <div className="flex flex-wrap items-baseline gap-x-1.5 font-mono text-[11px]">
-                <span className="font-medium text-slate-800">{field.name}</span>
+                <span className="font-medium text-slate-200">{field.name}</span>
                 {/* 可选性用问号表达，不靠在类型里写 undefined */}
                 <span className="text-slate-400">{field.optional ? "?:" : ":"}</span>
-                <span className="break-all text-slate-600">{field.type}</span>
+                <span className="break-all text-slate-300">{field.type}</span>
                 {field.defaultValue ? (
                   <span className="text-slate-400">= {field.defaultValue}</span>
                 ) : null}
               </div>
 
               {field.description ? (
-                <p className="mt-0.5 text-[11px] leading-snug text-slate-500">
+                <p className="mt-0.5 text-[11px] leading-snug text-slate-300">
                   {field.description}
                 </p>
               ) : null}
 
               {field.file && field.loc ? (
-                <p className="mt-0.5 font-mono text-[10px] text-slate-300">
+                <p className="mt-0.5 font-mono text-[10px] text-slate-400">
                   {field.file}:{field.loc.line}:{field.loc.col}
                 </p>
               ) : null}

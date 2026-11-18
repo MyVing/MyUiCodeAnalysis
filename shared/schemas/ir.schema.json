@@ -58,8 +58,8 @@
     "EdgeKind": {
       "title": "EdgeKind",
       "type": "string",
-      "enum": ["renders", "calls", "reads", "writes", "requests", "uses", "boundary"],
-      "description": "受控枚举；boundary 表示 client/server 组件边界。"
+      "enum": ["renders", "calls", "reads", "writes", "requests", "uses", "boundary", "contains", "navigates"],
+      "description": "受控枚举；boundary 表示 client/server 组件边界；contains 表示视图层级（组件/元素包含子元素），navigates 表示跳转到某个 route 节点。"
     },
     "Severity": {
       "title": "Severity",

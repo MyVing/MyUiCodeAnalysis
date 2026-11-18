@@ -50,6 +50,7 @@ import type { Warning } from "@uicodeanalysis/contracts";
 
 import type { DiscoveredComponent } from "./components.js";
 import { buildOwnerIndex, findOwner } from "./ownership.js";
+import { toProjectRelative } from "./paths.js";
 
 /** 文案来源分类，前端据此分组显示。 */
 export type UiTextKind = "text" | "attr" | "object" | "array" | "template" | "i18n";
@@ -405,6 +406,8 @@ export function analyzeUiText(input: UiTextAnalysisInput): UiTextAnalysisResult 
   }
 
   let unassigned = 0;
+  /** 未归属文案的位置：告警必须能指到具体出处，否则用户无从核对 */
+  const unassignedSites: { file: string; line: number; col: number }[] = [];
 
   for (const file of project.getSourceFiles()) {
     const candidates: { node: Node; handle: (c: TextCollector) => void }[] = [];
@@ -493,6 +496,10 @@ export function analyzeUiText(input: UiTextAnalysisInput): UiTextAnalysisResult 
       const collector = collectorFor(candidate.node);
       if (!collector) {
         unassigned += 1;
+        const relativeFile = toProjectRelative(rootPath, candidate.node.getSourceFile().getFilePath());
+        if (relativeFile !== null) {
+          unassignedSites.push({ file: relativeFile, ...locationOf(candidate.node) });
+        }
         continue;
       }
       candidate.handle(collector);
@@ -522,14 +529,20 @@ export function analyzeUiText(input: UiTextAnalysisInput): UiTextAnalysisResult 
   }
 
   if (unassigned > 0) {
-    warnings.push({
-      code: "ui_text_unassigned",
-      severity: "info",
-      stage: "static",
-      message:
-        `有 ${unassigned} 处文案位于组件之外（模块级常量或普通函数内），未归属到任何组件。` +
-        "常见于写在组件外的 columns / options 常量；本期不做跨作用域求值，因此这些文案不会出现在节点 attrs 中。",
-    });
+    // 每个未归属位置各报一条：一条汇总告警不带 file/loc 时，用户只能知道
+    // 「有文案没归属」，却无法回到源码核对——那等于什么也没说
+    for (const site of unassignedSites) {
+      warnings.push({
+        code: "ui_text_unassigned",
+        severity: "info",
+        stage: "static",
+        file: site.file,
+        loc: { line: site.line, col: site.col },
+        message:
+          "该文案位于组件之外（模块级常量或普通函数内），未归属到任何组件。" +
+          "常见于写在组件外的 columns / options 常量；本期不做跨作用域求值，因此不会出现在节点 attrs 中。",
+      });
+    }
   }
 
   return { byComponent: result, warnings };

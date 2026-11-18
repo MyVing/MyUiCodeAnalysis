@@ -73,6 +73,11 @@
       "type": "array",
       "description": "降级与缺口：无 route 节点、quote 校验失败、模型不可用等",
       "items": { "$ref": "#/$defs/RequirementWarning" }
+    },
+    "interactionChains": {
+      "type": "array",
+      "description": "本次定位涉及的交互链路（只含被 matches 引用的那些）。链路本身由 IRGraph 确定性推导（见 chain.schema.json），不在这里重复序列化全量链路——全量链路属于「图的派生」，不属于「某次需求定位的产物」",
+      "items": { "$ref": "chain.schema.json#/$defs/ActionChain" }
     }
   },
   "$defs": {
@@ -122,8 +127,16 @@
     "SignalKind": {
       "title": "SignalKind",
       "type": "string",
-      "enum": ["routePath", "componentName", "uiText", "apiUrl", "propName", "propDescription"],
-      "description": "召回信号来源。前端按此分类展示「为什么这个页面被选为候选」"
+      "enum": [
+        "routePath",
+        "componentName",
+        "uiText",
+        "apiUrl",
+        "propName",
+        "propDescription",
+        "semanticRank"
+      ],
+      "description": "召回信号来源。前端按此分类展示「为什么这个页面被选为候选」。semanticRank 是 AI 定位给出的名次（value 形如 rank=2）——只落名次不落分数：语义分的绝对值没有解释力，「语义路排第 2」才能被人理解和质疑"
     },
     "Signal": {
       "title": "Signal",
@@ -193,7 +206,7 @@
       "type": "object",
       "additionalProperties": false,
       "required": ["nodeIds", "edgeIds", "counts"],
-      "description": "命中页面的两跳子图，由后端按边遍历得到。前端聚焦时直接喂给布局，不重新推导",
+      "description": "命中页面的一跳子图（页面 + route + 直接邻居），由后端按边遍历得到。前端聚焦时直接喂给布局，不重新推导。取一跳而非两跳：两跳会把共享基础组件带进来，子图失去证据范围的含义；代价是 component → fn → api 链上的接口节点不在此处，需要接口清单时按 pageNodeId 在全图上检索 requests 边",
       "properties": {
         "nodeIds": {
           "type": "array",
@@ -210,8 +223,8 @@
       "title": "VerifiedEvidence",
       "type": "object",
       "additionalProperties": false,
-      "required": ["nodeId", "quote"],
-      "description": "服务端复核通过的证据。loc 取自 IR 节点而非模型输出 —— 模型给的坐标不可信",
+      "required": ["nodeId", "quote", "source", "confidence"],
+      "description": "服务端复核通过的证据。loc/source/confidence 取自 IR，而非模型输出",
       "properties": {
         "nodeId": { "type": "string", "minLength": 1 },
         "quote": { "type": "string", "minLength": 1 },
@@ -220,6 +233,17 @@
         "via": {
           "type": "string",
           "description": "命中的字段来源，如 uiText / prop / apiUrl"
+        },
+        "source": {
+          "type": "string",
+          "enum": ["static", "runtime", "ai"],
+          "description": "证据来源，取自对应 IR 节点的 evidence"
+        },
+        "confidence": {
+          "type": "number",
+          "minimum": 0,
+          "maximum": 1,
+          "description": "证据自身置信度，取自对应 IR 节点的 evidence"
         }
       }
     },
@@ -243,7 +267,16 @@
         "pageNodeId": {
           "type": "string",
           "minLength": 1,
-          "description": "必须落在本次候选集内，否则整条 match 被丢弃"
+          "description": "必须落在本次给出的页面集合内，否则整条 match 被丢弃"
+        },
+        "chainId": {
+          "type": "string",
+          "description": "命中的交互链路 id。必须来自本次给出的链路集合（由 derive_chains 确定性产出），否则整条 match 被丢弃。缺省表示模型只定位到页面、没有落到具体交互"
+        },
+        "targets": {
+          "type": "array",
+          "description": "被引文命中的链路段 nodeId（链路段的有序子集）。由服务端按 quote 归属算出，不由模型提供——前端据此高亮「需求说的是这条链的哪一步」",
+          "items": { "type": "string" }
         },
         "routeId": { "type": "string" },
         "confidence": {
@@ -273,8 +306,8 @@
         },
         "source": {
           "type": "string",
-          "enum": ["ai"],
-          "description": "本条结论的来源。当前只有 AI 判定会产出 match，确定性召回只产候选"
+          "enum": ["static", "runtime", "ai"],
+          "description": "结论来源。当前 AI 判定结果为 ai；确定性证据的真实来源记录在 verifiedEvidence.source"
         }
       }
     },
@@ -308,16 +341,21 @@
           "minLength": 1,
           "enum": [
             "node_not_in_candidates",
+            "chain_not_in_candidates",
             "quote_not_found",
             "unknown_feature",
             "invalid_shape"
           ],
-          "description": "被拒原因。node_not_in_candidates：模型选了候选集外的节点；quote_not_found：引文在该节点里找不到；unknown_feature：featureId 不是本次拆解出的功能点；invalid_shape：字段类型不符"
+          "description": "被拒原因。node_not_in_candidates：模型选了候选集外的页面；chain_not_in_candidates：模型选了本次链路集合外的链路（或链路不属于所选页面）；quote_not_found：引文在该页面/链路的语料里找不到；unknown_feature：featureId 不是本次拆解出的功能点；invalid_shape：字段类型不符"
         },
         "featureId": { "type": "string" },
         "nodeId": {
           "type": "string",
           "description": "模型给出的原始 nodeId，原样记录以便审计"
+        },
+        "chainId": {
+          "type": "string",
+          "description": "模型给出的原始 chainId，原样记录以便审计"
         },
         "quote": {
           "type": "string",

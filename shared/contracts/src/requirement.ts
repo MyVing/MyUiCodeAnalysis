@@ -6,10 +6,15 @@
  */
 
 /**
- * 召回信号来源。前端按此分类展示「为什么这个页面被选为候选」
+ * 召回信号来源。前端按此分类展示「为什么这个页面被选为候选」。semanticRank 是 AI 定位给出的名次（value 形如 rank=2）——只落名次不落分数：语义分的绝对值没有解释力，「语义路排第 2」才能被人理解和质疑
  */
-export type SignalKind = "routePath" | "componentName" | "uiText" | "apiUrl" | "propName" | "propDescription";
+export type SignalKind =
+  "routePath" | "componentName" | "uiText" | "apiUrl" | "propName" | "propDescription" | "semanticRank";
 export type Severity = "error" | "warning" | "info";
+/**
+ * 该段在链路里的语义角色。起点恒为 element；元素的事件处理函数是 handler；处理函数写入的状态、调用的接口、跳转的路由分别是 state / api / route；hook 是 handler 写到 hook 内部状态的情形
+ */
+export type ChainRole = "element" | "handler" | "state" | "hook" | "api" | "route";
 
 /**
  * 需求映射结果：把一段需求文本对应到 IR 中已有的页面节点。刻意不进 IRGraph —— IRGraph 是语法事实层（confidence 恒为 1.0），本契约是 AI 推断层（confidence 封顶 0.6），两者物理隔离，避免把推断混进事实。
@@ -61,6 +66,10 @@ export interface RequirementMap {
    * 降级与缺口：无 route 节点、quote 校验失败、模型不可用等
    */
   warnings?: RequirementWarning[];
+  /**
+   * 本次定位涉及的交互链路（只含被 matches 引用的那些）。链路本身由 IRGraph 确定性推导（见 chain.schema.json），不在这里重复序列化全量链路——全量链路属于「图的派生」，不属于「某次需求定位的产物」
+   */
+  interactionChains?: ActionChain[];
 }
 export interface Feature {
   /**
@@ -76,9 +85,17 @@ export interface Feature {
 export interface Match {
   featureId: string;
   /**
-   * 必须落在本次候选集内，否则整条 match 被丢弃
+   * 必须落在本次给出的页面集合内，否则整条 match 被丢弃
    */
   pageNodeId: string;
+  /**
+   * 命中的交互链路 id。必须来自本次给出的链路集合（由 derive_chains 确定性产出），否则整条 match 被丢弃。缺省表示模型只定位到页面、没有落到具体交互
+   */
+  chainId?: string;
+  /**
+   * 被引文命中的链路段 nodeId（链路段的有序子集）。由服务端按 quote 归属算出，不由模型提供——前端据此高亮「需求说的是这条链的哪一步」
+   */
+  targets?: string[];
   routeId?: string;
   /**
    * AI 推断的落库置信度，硬上限 0.6；模型自报的更高值不得透传
@@ -99,12 +116,12 @@ export interface Match {
   subgraph: Subgraph;
   verifiedEvidence?: VerifiedEvidence[];
   /**
-   * 本条结论的来源。当前只有 AI 判定会产出 match，确定性召回只产候选
+   * 结论来源。当前 AI 判定结果为 ai；确定性证据的真实来源记录在 verifiedEvidence.source
    */
-  source: "ai";
+  source: "static" | "runtime" | "ai";
 }
 /**
- * 命中页面的两跳子图，由后端按边遍历得到。前端聚焦时直接喂给布局，不重新推导
+ * 命中页面的一跳子图（页面 + route + 直接邻居），由后端按边遍历得到。前端聚焦时直接喂给布局，不重新推导。取一跳而非两跳：两跳会把共享基础组件带进来，子图失去证据范围的含义；代价是 component → fn → api 链上的接口节点不在此处，需要接口清单时按 pageNodeId 在全图上检索 requests 边
  */
 export interface Subgraph {
   nodeIds: string[];
@@ -125,7 +142,7 @@ export interface SubgraphCounts {
   element: number;
 }
 /**
- * 服务端复核通过的证据。loc 取自 IR 节点而非模型输出 —— 模型给的坐标不可信
+ * 服务端复核通过的证据。loc/source/confidence 取自 IR，而非模型输出
  */
 export interface VerifiedEvidence {
   nodeId: string;
@@ -136,6 +153,14 @@ export interface VerifiedEvidence {
    * 命中的字段来源，如 uiText / prop / apiUrl
    */
   via?: string;
+  /**
+   * 证据来源，取自对应 IR 节点的 evidence
+   */
+  source: "static" | "runtime" | "ai";
+  /**
+   * 证据自身置信度，取自对应 IR 节点的 evidence
+   */
+  confidence: number;
 }
 export interface Location {
   line: number;
@@ -182,14 +207,19 @@ export interface Signal {
 }
 export interface Dropped {
   /**
-   * 被拒原因。node_not_in_candidates：模型选了候选集外的节点；quote_not_found：引文在该节点里找不到；unknown_feature：featureId 不是本次拆解出的功能点；invalid_shape：字段类型不符
+   * 被拒原因。node_not_in_candidates：模型选了候选集外的页面；chain_not_in_candidates：模型选了本次链路集合外的链路（或链路不属于所选页面）；quote_not_found：引文在该页面/链路的语料里找不到；unknown_feature：featureId 不是本次拆解出的功能点；invalid_shape：字段类型不符
    */
-  reason: "node_not_in_candidates" | "quote_not_found" | "unknown_feature" | "invalid_shape";
+  reason:
+    "node_not_in_candidates" | "chain_not_in_candidates" | "quote_not_found" | "unknown_feature" | "invalid_shape";
   featureId?: string;
   /**
    * 模型给出的原始 nodeId，原样记录以便审计
    */
   nodeId?: string;
+  /**
+   * 模型给出的原始 chainId，原样记录以便审计
+   */
+  chainId?: string;
   /**
    * 模型给出的原始引文，原样记录以便审计
    */
@@ -206,4 +236,72 @@ export interface RequirementWarning {
    * 关联的功能点；与具体功能点无关时缺省
    */
   featureId?: string;
+}
+/**
+ * 一次用户动作的完整路径。id 必须稳定：同一份图重复推导得到同一个 id，否则前端选中态与增量 diff 会抖
+ */
+export interface ActionChain {
+  /**
+   * 由起点元素 id 与逐段 nodeId 拼成，可读且稳定
+   */
+  id: string;
+  /**
+   * 链路所属的页面组件节点 id
+   */
+  pageId: string;
+  element: ChainStep;
+  /**
+   * 逐段路径，从起点元素开始（steps[0] 即 element）。相邻两段之间的关系都是图上真实存在的边
+   *
+   * @minItems 1
+   */
+  steps: [ChainStep, ...ChainStep[]];
+  path: ChainPath;
+  /**
+   * 元素的可见文案；文案是动态表达式时为 null
+   */
+  text?: string | null;
+  /**
+   * 元素在视图里的角色
+   */
+  viewRole?: ("control" | "container" | "text" | "link") | null;
+  /**
+   * 链接地址（仅宿主 `<a>` 且为字面量时）
+   */
+  href?: string | null;
+  /**
+   * 非空表示链路在此中断，值为原因。链路宁可如实标注断点，也不编造下游节点
+   */
+  terminatedAt?: string | null;
+  /**
+   * 这条链路能用来校验引文的全部原文（元素文案 + href + 处理函数名 + 接口 URL + 路由路径）。判定阶段只允许从这里逐字复制引文
+   */
+  corpus?: string[];
+}
+/**
+ * 链路中的一段。file / loc 必须能跳回源码，这是「可复核」的底线。链路起点（steps[0]）同时被 ActionChain.element 单独引用：UI 最常只渲染这一层
+ */
+export interface ChainStep {
+  nodeId: string;
+  role: ChainRole;
+  /**
+   * 节点的展示名，如 `<button> 导出`、`handleExport`、`GET /api/orders/export`
+   */
+  name: string;
+  /**
+   * 定义所在文件（相对项目根目录）
+   */
+  file?: string;
+  loc?: Location1;
+}
+export interface Location1 {
+  line: number;
+  col: number;
+}
+/**
+ * 链路的可聚焦路径。前端「聚焦」直接喂这两个集合，不重新推导。nodeIds 与 steps 同序；edgeIds 是推导过程中实际走过的边（按遍历顺序）。两者不保证等长：一个按钮可能扇出到多个接口，此时节点数与边数不是简单链的关系
+ */
+export interface ChainPath {
+  nodeIds: string[];
+  edgeIds: string[];
 }

@@ -24,6 +24,7 @@ import { analyzeApi } from "../src/api.js";
 import { discoverComponents } from "../src/components.js";
 import { analyzeEvents, type EventBinding, type EventsAnalysisResult } from "../src/events.js";
 import { analyzeHooks } from "../src/hooks.js";
+import { buildJsxInventory } from "../src/jsx-inventory.js";
 import { analyzeProps } from "../src/props.js";
 import { createFullProject } from "../src/project.js";
 
@@ -51,14 +52,18 @@ function analyze(rootPath: string): EventsAnalysisResult {
   });
 
   return analyzeEvents({
-    rootPath,
+    inventory: buildJsxInventory(
+      rootPath,
+      project,
+      discovery.components,
+      discovery.declarations,
+    ),
     components: discovery.components,
-    declarations: discovery.declarations,
-    project,
     knownNodes: [...hooks.hookNodes, ...hooks.stateNodes, ...api.apiNodes, ...api.fnNodes],
     propsFields: new Map(
       [...props.byComponent].map(([id, info]) => [id, info.fields.map((f) => f.name)]),
     ),
+    rootPath,
   });
 }
 
@@ -336,5 +341,166 @@ describe("事件分析的边界（合成项目）", () => {
     });
 
     expect(after.elementNodes.map((n) => n.id)).toEqual(before.elementNodes.map((n) => n.id));
+  });
+});
+
+/**
+ * 跨文件处理函数。
+ *
+ * 这一组守住的是「图上不能把请求归属到错误的调用者」：只按同文件名字表解析时，
+ * import 进来的 `saveOrder` 命中不了任何节点，targets 为空，而 `api.ts` 的
+ * findOwner 会把请求记到组件名下——页面上就变成"加载时请求"。
+ */
+describe("跨文件处理函数（符号解析）", () => {
+  const SERVICES = `
+    export async function saveOrder(id: string) {
+      return fetch("/api/orders", { method: "POST" });
+    }
+  `;
+
+  it("具名引用直接 import 时，calls 边连到跨文件函数节点", () => {
+    const result = analyzeSynthetic({
+      "src/services/order.ts": SERVICES,
+      "src/Save.tsx": `
+        import { saveOrder } from "./services/order";
+
+        export function Save({ id }: { id: string }) {
+          return <button onClick={saveOrder}>保存</button>;
+        }
+      `,
+    });
+
+    const element = elementOf(result, "src/Save.tsx#Save/jsx:button/saveOrder");
+    const event = bindingOf(element, "onClick");
+
+    expect(event.kind).toBe("reference");
+    expect(event.handlerName).toBe("saveOrder");
+    expect(event.targets).toEqual([{ id: "src/services/order.ts#saveOrder", kind: "fn" }]);
+    // 命中真实函数，不是父组件注入
+    expect(event.injected).toBe(false);
+
+    const edge = edgeOf(
+      result,
+      "calls",
+      element.id,
+      "src/services/order.ts#saveOrder",
+    );
+    expect(edge.evidence[0]).toMatchObject({ source: "static", confidence: 0.9 });
+  });
+
+  it("被事件引用但图上没有的跨文件函数补产 fn 节点", () => {
+    // validateForm 不含请求，api.ts 不会注册它；只有"被事件引用"才让它进图
+    const result = analyzeSynthetic({
+      "src/services/form.ts": `
+        export function validateForm(values: Record<string, unknown>) {
+          return Object.keys(values).length > 0;
+        }
+      `,
+      "src/Save.tsx": `
+        import { validateForm } from "./services/form";
+
+        export function Save() {
+          return <button onClick={validateForm}>保存</button>;
+        }
+      `,
+    });
+
+    const node = result.fnNodes.find((n) => n.id === "src/services/form.ts#validateForm");
+    expect(node).toBeDefined();
+    expect(node?.kind).toBe("fn");
+    expect(node?.file).toBe("src/services/form.ts");
+    expect(node?.attrs.role).toBe("事件处理函数");
+
+    // 边指向的节点必须在 fnNodes 里存在，否则前端点开目标会找不到
+    const element = elementOf(result, "src/Save.tsx#Save/jsx:button/validateForm");
+    const event = bindingOf(element, "onClick");
+    expect(event.targets).toEqual([
+      { id: "src/services/form.ts#validateForm", kind: "fn" },
+    ]);
+  });
+
+  it("请求链函数已由接口分析产出时，不重复补节点", () => {
+    const result = analyzeSynthetic({
+      "src/services/order.ts": SERVICES,
+      "src/Save.tsx": `
+        import { saveOrder } from "./services/order";
+
+        export function Save() {
+          return <button onClick={saveOrder}>保存</button>;
+        }
+      `,
+    });
+
+    // saveOrder 含 fetch，analyzeApi 已经注册了它（测试的 analyze 会把
+    // api.fnNodes 一并传给事件层）
+    expect(
+      result.fnNodes.filter((n) => n.id === "src/services/order.ts#saveOrder"),
+    ).toEqual([]);
+  });
+
+  it("import 别名照样解析到真实声明", () => {
+    const result = analyzeSynthetic({
+      "src/services/order.ts": SERVICES,
+      "src/Save.tsx": `
+        import { saveOrder as submit } from "./services/order";
+
+        export function Save({ id }: { id: string }) {
+          return <button onClick={submit}>保存</button>;
+        }
+      `,
+    });
+
+    const element = elementOf(result, "src/Save.tsx#Save/jsx:button/submit");
+    const event = bindingOf(element, "onClick");
+
+    // 边连到定义处的 id，而不是别名字符串
+    expect(event.targets).toEqual([{ id: "src/services/order.ts#saveOrder", kind: "fn" }]);
+  });
+
+  it("跨文件解析不到且名字不在 props 里，不标 injected", () => {
+    const result = analyzeSynthetic({
+      "src/Save.tsx": `
+        export function Save() {
+          // 没有 import，符号解析不到；也不在 props 里
+          return <button onClick={unknownHandler}>保存</button>;
+        }
+      `,
+    });
+
+    const element = elementOf(result, "src/Save.tsx#Save/jsx:button/unknownHandler");
+    const event = bindingOf(element, "onClick");
+
+    expect(event.targets).toEqual([]);
+    // 这是「无法静态判定」，不是「父组件注入」——两者前端文案不同
+    expect(event.injected).toBe(false);
+  });
+
+  it("名字表优先于符号解析：组件内的 hook 绑定遮蔽同名跨文件函数", () => {
+    const result = analyzeSynthetic({
+      "src/services/order.ts": `
+        export function handleSelect(userId: string) {
+          console.log(userId);
+        }
+      `,
+      "src/Save.tsx": `
+        import { useCallback } from "react";
+        import { handleSelect as remoteSelect } from "./services/order";
+
+        export function Save() {
+          // 组件内绑定的 handleSelect 与跨文件的 remoteSelect 是两回事
+          const handleSelect = useCallback((userId: string) => {
+            remoteSelect(userId);
+          }, []);
+
+          return <button onClick={handleSelect}>选择</button>;
+        }
+      `,
+    });
+
+    const element = elementOf(result, "src/Save.tsx#Save/jsx:button/handleSelect");
+    const event = bindingOf(element, "onClick");
+
+    // 连到组件内的 hook 节点，而不是跨文件同名函数
+    expect(event.targets).toEqual([{ id: "src/Save.tsx#Save/handleSelect", kind: "hook" }]);
   });
 });

@@ -1,4 +1,4 @@
-/**
+﻿/**
  * Hook / State 面板：把 hook 与 state 节点的 attrs 渲染成一张小表。
  *
  * 两类节点共用一个组件，因为它们的 attrs 形状是刻意对齐的（都有 hookName），
@@ -52,7 +52,7 @@ export function HookPanel({ node }: { node: IRNode }) {
 
   return (
     <section>
-      <h3 className="text-[11px] font-medium uppercase tracking-wide text-slate-400">{title}</h3>
+      <h3 className="app-section-label">{title}</h3>
 
       {custom ? (
         <p className="mt-1 text-[11px] text-slate-400">自定义 Hook（非 react 内置）</p>
@@ -61,11 +61,11 @@ export function HookPanel({ node }: { node: IRNode }) {
       {rows.length === 0 ? (
         <p className="mt-2 text-xs text-slate-400">无附加信息</p>
       ) : (
-        <dl className="mt-2 divide-y divide-slate-100 rounded-lg border border-slate-200">
+        <dl className="mt-2 divide-y divide-white/[0.05] rounded-lg border border-white/[0.07] bg-white/[0.02]">
           {rows.map((row) => (
             <div key={row.label} className="flex gap-3 px-2.5 py-1.5 text-xs">
               <dt className="w-14 shrink-0 text-slate-400">{row.label}</dt>
-              <dd className="min-w-0 break-all font-mono text-[11px] text-slate-700">
+              <dd className="min-w-0 break-all font-mono text-[11px] text-slate-200">
                 {row.value}
               </dd>
             </div>
@@ -74,7 +74,7 @@ export function HookPanel({ node }: { node: IRNode }) {
       )}
 
       {node.loc ? (
-        <p className="mt-1 font-mono text-[10px] text-slate-300">
+        <p className="mt-1 font-mono text-[10px] text-slate-400">
           {node.file}:{node.loc.line}:{node.loc.col}
         </p>
       ) : null}

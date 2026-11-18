@@ -26,7 +26,9 @@ import type { Warning } from "@uicodeanalysis/contracts";
 import {
   getAliasPrefixes,
   getPackageName,
+  isAssetSpecifier,
   isLocalSpecifier,
+  isNodeBuiltin,
   isProjectSource,
   toPosix,
   toProjectRelative,
@@ -46,6 +48,16 @@ export type Resolution =
       packageName: string;
       /** 依赖已安装且有类型声明时，指向其 .d.ts */
       declarationFile?: string;
+    }
+  | {
+      /** Node 内置模块（`path` / `node:fs`）：运行时提供，既没装也不需要装 */
+      status: "builtin";
+      packageName: string;
+    }
+  | {
+      /** 非脚本资源（`.css` / `.png` 等）：由打包器处理，不是 TS 模块 */
+      status: "asset";
+      moduleSpecifier: string;
     }
   | {
       status: "unresolved";
@@ -92,6 +104,16 @@ export function createResolutionIndex(rootPath: string, project: Project): Resol
       // 解析到了 node_modules 里的 .d.ts：外部依赖且类型可用
       const packageName = getPackageName(moduleSpecifier) ?? moduleSpecifier;
       return { status: "external", packageName, declarationFile: target.getFilePath() };
+    }
+
+    // 资源导入与 Node 内置模块在 TS 里必然解析不到，但它们不是缺陷。
+    // 必须放在 target 判定之后：装了类型声明的内置模块（如 @types/node 的 path）
+    // 是能解析到的，那种情况下按外部依赖处理更准确。
+    if (isAssetSpecifier(moduleSpecifier)) {
+      return { status: "asset", moduleSpecifier };
+    }
+    if (isNodeBuiltin(moduleSpecifier)) {
+      return { status: "builtin", packageName: getPackageName(moduleSpecifier) ?? moduleSpecifier };
     }
 
     return { status: "unresolved", moduleSpecifier, isLocal };
@@ -200,6 +222,10 @@ export function formatResolution(resolution: Resolution, rootPath: string): stri
       return `internal:${toProjectRelative(rootPath, resolution.filePath) ?? toPosix(resolution.filePath)}`;
     case "external":
       return `external:${resolution.packageName}`;
+    case "builtin":
+      return `builtin:${resolution.packageName}`;
+    case "asset":
+      return `asset:${resolution.moduleSpecifier}`;
     case "unresolved":
       return `unresolved:${resolution.moduleSpecifier}`;
   }

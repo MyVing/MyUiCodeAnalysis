@@ -4,6 +4,9 @@ export type Framework = "react" | "next";
 
 export type StorageBackend = "memory" | "mysql";
 
+/** local = 用户登记的本机目录；git = 平台克隆的受管仓库 */
+export type ProjectSource = "local" | "git";
+
 export interface HealthStatus {
   status: "ok";
   name: string;
@@ -19,12 +22,37 @@ export interface Project {
   framework: Framework;
   createdAt: string;
   storage: StorageBackend;
+  source: ProjectSource;
+  remoteUrl?: string | null;
+  gitBranch?: string | null;
+  commitSha?: string | null;
+  lastSyncedAt?: string | null;
 }
 
 export interface ProjectCreate {
   name: string;
   rootPath: string;
   framework: Framework;
+}
+
+/** 按 Git 地址接入；username/password 或 token 仅用于一次克隆，不回显 */
+export interface ProjectGitCreate {
+  gitUrl: string;
+  name?: string;
+  branch?: string;
+  username?: string;
+  password?: string;
+  token?: string;
+  framework?: Framework;
+}
+
+/** 源码片段：点开「文件:行」时由后端读取 */
+export interface SourceExcerpt {
+  file: string;
+  startLine: number;
+  endLine: number;
+  content: string;
+  truncated: boolean;
 }
 
 export interface PluginDependency {

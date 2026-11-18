@@ -1,4 +1,4 @@
-import { formatConfidence, SOURCE_META } from "@/graph/meta";
+﻿import { formatConfidence, SOURCE_META } from "@/graph/meta";
 import type { Evidence } from "@uicodeanalysis/contracts";
 
 interface EvidencePanelProps {
@@ -20,24 +20,24 @@ export function EvidencePanel({ evidence }: EvidencePanelProps) {
               <span className={`rounded border px-1.5 py-0.5 text-[10px] font-medium ${meta.badge}`}>
                 {meta.label}
               </span>
-              <span className="font-mono text-[11px] text-slate-500">
+              <span className="font-mono text-[11px] text-slate-400">
                 置信度 {formatConfidence(item.confidence)}
               </span>
             </div>
 
             {item.file && (
-              <p className="mt-1.5 break-all font-mono text-[11px] text-slate-600">
+              <p className="mt-1.5 break-all font-mono text-[11px] text-slate-300">
                 {item.file}
                 {item.loc ? `:${item.loc.line}:${item.loc.col}` : ""}
               </p>
             )}
             {item.traceId && (
-              <p className="mt-1.5 break-all font-mono text-[11px] text-emerald-700">
+              <p className="mt-1.5 break-all font-mono text-[11px] text-emerald-300">
                 trace: {item.traceId}
               </p>
             )}
             {item.source === "ai" && (
-              <p className="mt-1.5 text-[11px] text-amber-700">推断结论，需人工确认或驳回。</p>
+              <p className="mt-1.5 text-[11px] text-amber-300">推断结论，需人工确认或驳回。</p>
             )}
           </li>
         );

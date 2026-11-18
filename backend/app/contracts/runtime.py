@@ -6,11 +6,12 @@ from __future__ import annotations
 from enum import StrEnum
 from typing import Annotated
 
-from pydantic import BaseModel, ConfigDict, Field
+from pydantic import BaseModel, ConfigDict, Field, RootModel
 
 
 class Mode(StrEnum):
     passive = 'passive'
+    ai_exploration = 'ai-exploration'
 
 
 class DevServer(BaseModel):
@@ -139,6 +140,12 @@ class Action(StrEnum):
     other = 'other'
 
 
+class Result(StrEnum):
+    success = 'success'
+    failed = 'failed'
+    no_change = 'no_change'
+
+
 class Interaction(BaseModel):
     model_config = ConfigDict(
         extra='forbid',
@@ -156,6 +163,18 @@ class Interaction(BaseModel):
     triggeredEvents: Annotated[
         list[str] | None,
         Field(description='本次交互引发的 network / navigation 事件 id'),
+    ] = None
+    screenshotRef: Annotated[
+        str | None,
+        Field(
+            description='交互后的页面截图引用；B 模式每步必拍', pattern='^artifact://'
+        ),
+    ] = None
+    result: Annotated[
+        Result | None,
+        Field(
+            description='交互执行结果：success 正常完成；failed 执行报错；no_change 页面无可见变化'
+        ),
     ] = None
 
 
@@ -215,6 +234,95 @@ class Correlation(BaseModel):
     ] = 'pending'
 
 
+class Screenshot(BaseModel):
+    model_config = ConfigDict(
+        extra='forbid',
+        populate_by_name=True,
+    )
+    ref: Annotated[str, Field(pattern='^artifact://')]
+    stepIndex: Annotated[int, Field(ge=0)]
+    caption: str | None = None
+
+
+class Action1(StrEnum):
+    click = 'click'
+    input = 'input'
+    select = 'select'
+    navigate = 'navigate'
+    submit = 'submit'
+    hover = 'hover'
+    scroll = 'scroll'
+    other = 'other'
+
+
+class ExplorationStep(BaseModel):
+    model_config = ConfigDict(
+        extra='forbid',
+        populate_by_name=True,
+    )
+    index: Annotated[int, Field(ge=0)]
+    action: Action1
+    target: Annotated[
+        str, Field(description='目标元素的可读描述，如「登录按钮」或 selector 摘要')
+    ]
+    selector: Annotated[
+        str | None, Field(description='实际使用的 Playwright selector')
+    ] = None
+    valueSummary: Annotated[
+        str | None, Field(description='input/select 的值摘要；敏感字段脱敏')
+    ] = None
+    reasoning: Annotated[
+        str | None, Field(description='AI 选择该操作的理由（用于审计）')
+    ] = None
+    result: Annotated[Result, Field(description='执行结果')]
+    error: Annotated[str | None, Field(description='result=failed 时的错误信息')] = None
+    screenshotRef: Annotated[
+        str | None, Field(description='本步执行后的截图引用', pattern='^artifact://')
+    ] = None
+    triggeredNetworkEvents: Annotated[
+        list[str] | None, Field(description='本步引发的网络事件 id')
+    ] = None
+    pageTransitioned: Annotated[
+        bool | None, Field(description='本步是否触发了页面跳转/路由变化')
+    ] = None
+
+
+class Scenario(BaseModel):
+    model_config = ConfigDict(
+        extra='forbid',
+        populate_by_name=True,
+    )
+    title: Annotated[str, Field(min_length=1)]
+    description: str
+    preconditions: Annotated[list[str] | None, Field(description='场景前置条件')] = None
+    expectedOutcome: Annotated[str | None, Field(description='场景预期结果')] = None
+
+
+class Priority(StrEnum):
+    p0 = 'p0'
+    p1 = 'p1'
+    p2 = 'p2'
+    p3 = 'p3'
+
+
+class RelatedStep(RootModel[int]):
+    root: Annotated[int, Field(ge=0)]
+
+
+class TestCase(BaseModel):
+    model_config = ConfigDict(
+        extra='forbid',
+        populate_by_name=True,
+    )
+    title: Annotated[str, Field(min_length=1)]
+    priority: Priority | None = None
+    steps: Annotated[list[str], Field(description='测试步骤的自然语言描述')]
+    expected: Annotated[list[str], Field(description='预期断言')]
+    relatedSteps: Annotated[
+        list[RelatedStep] | None, Field(description='关联的探索步骤 index')
+    ] = None
+
+
 class PageInfo(BaseModel):
     model_config = ConfigDict(
         extra='forbid',
@@ -242,6 +350,30 @@ class PageError(BaseModel):
     timestamp: Annotated[int | None, Field(ge=0)] = None
 
 
+class Exploration(BaseModel):
+    model_config = ConfigDict(
+        extra='forbid',
+        populate_by_name=True,
+    )
+    goal: Annotated[
+        str,
+        Field(description='用户输入的探索目标，如「测试用户登录流程」', min_length=1),
+    ]
+    maxSteps: Annotated[
+        int | None, Field(description='探索步数上限，防止无限循环', ge=1, le=50)
+    ] = 15
+    steps: Annotated[
+        list[ExplorationStep], Field(description='AI 决策并执行的探索步骤序列')
+    ]
+    scenario: Annotated[
+        Scenario | None, Field(description='AI 根据探索过程归纳的用户场景')
+    ] = None
+    testCases: Annotated[
+        list[TestCase] | None, Field(description='AI 生成的测试用例清单')
+    ] = None
+    screenshots: list[Screenshot] | None = None
+
+
 class RuntimeTrace(BaseModel):
     model_config = ConfigDict(
         extra='forbid',
@@ -266,8 +398,14 @@ class RuntimeTrace(BaseModel):
         str | None, Field(description='关联的静态分析产物标识；一次分析可对应多次采集')
     ] = None
     mode: Annotated[
-        Mode, Field(description='一期仅 passive（A 模式）；二期追加 ai-exploration')
+        Mode,
+        Field(
+            description='passive：A 模式被动采集；ai-exploration：B 模式 AI 自动探索页面、生成场景与用例'
+        ),
     ]
+    exploration: Annotated[
+        Exploration | None, Field(description='B 模式探索配置与结果；passive 模式缺省')
+    ] = None
     devServer: DevServer | None = None
     componentTree: Annotated[
         list[ComponentNode] | None,

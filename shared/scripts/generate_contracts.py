@@ -46,6 +46,13 @@ TARGETS: dict[str, tuple[Path, Path]] = {
         REPO_ROOT / "backend" / "app" / "contracts" / "requirement.py",
         REPO_ROOT / "shared" / "contracts" / "src" / "requirement.ts",
     ),
+    # requirement.schema.json 通过 $ref 引用 chain.schema.json 的 ActionChain，
+    # 两个生成器都会跨文件解析并把被引用的定义内联进产物——因此顺序无关，
+    # 但两边必须来自同一份 chain.schema.json，否则会出现两套互不兼容的链类型。
+    "chain": (
+        REPO_ROOT / "backend" / "app" / "contracts" / "chain.py",
+        REPO_ROOT / "shared" / "contracts" / "src" / "chain.ts",
+    ),
 }
 
 # datamodel-code-generator 0.96.0 的参数，已用现有 contracts.py 逐字节验证还原。
@@ -113,8 +120,11 @@ def _generate(name: str, out_dir: Path, codegen: Path, json2ts: list[str]) -> tu
     py_out = out_dir / f"{name}.py"
     ts_out = out_dir / f"{name}.ts"
 
-    _run([str(codegen), "--input", str(schema), "--output", str(py_out), *PYTHON_CODEGEN_ARGS], REPO_ROOT)
-    _run([*json2ts, str(schema), "-o", str(ts_out)], REPO_ROOT)
+    # 两个生成器都按 **cwd** 解析 schema 里的相对 $ref（requirement 引用
+    # chain.schema.json）。在仓库根目录跑会把 ref 解析成仓库根下的同名文件，
+    # 因此必须把 cwd 设成 schema 目录，并用相对文件名传参。
+    _run([str(codegen), "--input", schema.name, "--output", str(py_out), *PYTHON_CODEGEN_ARGS], SCHEMA_DIR)
+    _run([*json2ts, schema.name, "-o", str(ts_out)], SCHEMA_DIR)
     return py_out, ts_out
 
 

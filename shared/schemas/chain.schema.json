@@ -1,0 +1,114 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://uicodeanalysis.local/schemas/chain.schema.json",
+  "title": "ActionChainList",
+  "description": "交互链路列表：由 IR 图确定性推导得到，不是某次需求定位的产物。刻意独立于 requirement.schema.json —— 同一份图被不同需求反复引用时，链路只序列化一次。链路里没有任何 AI 推断：每一段都是图上已带证据的边，因此 confidence 不受 0.6 封顶约束（它表达的是静态事实强度，不是语义判断）。",
+  "type": "array",
+  "items": { "$ref": "#/$defs/ActionChain" },
+  "$defs": {
+    "ChainRole": {
+      "title": "ChainRole",
+      "type": "string",
+      "enum": ["element", "handler", "state", "hook", "api", "route"],
+      "description": "该段在链路里的语义角色。起点恒为 element；元素的事件处理函数是 handler；处理函数写入的状态、调用的接口、跳转的路由分别是 state / api / route；hook 是 handler 写到 hook 内部状态的情形"
+    },
+    "Location": {
+      "title": "Location",
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["line", "col"],
+      "properties": {
+        "line": { "type": "integer", "minimum": 1 },
+        "col": { "type": "integer", "minimum": 1 }
+      }
+    },
+    "ChainStep": {
+      "title": "ChainStep",
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["nodeId", "role", "name"],
+      "description": "链路中的一段。file / loc 必须能跳回源码，这是「可复核」的底线。链路起点（steps[0]）同时被 ActionChain.element 单独引用：UI 最常只渲染这一层",
+      "properties": {
+        "nodeId": { "type": "string", "minLength": 1 },
+        "role": { "$ref": "#/$defs/ChainRole" },
+        "name": {
+          "type": "string",
+          "description": "节点的展示名，如 `<button> 导出`、`handleExport`、`GET /api/orders/export`"
+        },
+        "file": {
+          "type": "string",
+          "description": "定义所在文件（相对项目根目录）"
+        },
+        "loc": { "$ref": "#/$defs/Location" }
+      }
+    },
+    "ChainPath": {
+      "title": "ChainPath",
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["nodeIds", "edgeIds"],
+      "description": "链路的可聚焦路径。前端「聚焦」直接喂这两个集合，不重新推导。nodeIds 与 steps 同序；edgeIds 是推导过程中实际走过的边（按遍历顺序）。两者不保证等长：一个按钮可能扇出到多个接口，此时节点数与边数不是简单链的关系",
+      "properties": {
+        "nodeIds": {
+          "type": "array",
+          "items": { "type": "string" }
+        },
+        "edgeIds": {
+          "type": "array",
+          "items": { "type": "string" }
+        }
+      }
+    },
+    "ActionChain": {
+      "title": "ActionChain",
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["id", "pageId", "element", "steps", "path"],
+      "description": "一次用户动作的完整路径。id 必须稳定：同一份图重复推导得到同一个 id，否则前端选中态与增量 diff 会抖",
+      "properties": {
+        "id": {
+          "type": "string",
+          "minLength": 1,
+          "description": "由起点元素 id 与逐段 nodeId 拼成，可读且稳定"
+        },
+        "pageId": {
+          "type": "string",
+          "minLength": 1,
+          "description": "链路所属的页面组件节点 id"
+        },
+        "element": { "$ref": "#/$defs/ChainStep" },
+        "steps": {
+          "type": "array",
+          "minItems": 1,
+          "description": "逐段路径，从起点元素开始（steps[0] 即 element）。相邻两段之间的关系都是图上真实存在的边",
+          "items": { "$ref": "#/$defs/ChainStep" }
+        },
+        "path": { "$ref": "#/$defs/ChainPath" },
+        "text": {
+          "type": ["string", "null"],
+          "description": "元素的可见文案；文案是动态表达式时为 null"
+        },
+        "viewRole": {
+          "description": "元素在视图里的角色",
+          "anyOf": [
+            { "type": "string", "enum": ["control", "container", "text", "link"] },
+            { "type": "null" }
+          ]
+        },
+        "href": {
+          "type": ["string", "null"],
+          "description": "链接地址（仅宿主 `<a>` 且为字面量时）"
+        },
+        "terminatedAt": {
+          "type": ["string", "null"],
+          "description": "非空表示链路在此中断，值为原因。链路宁可如实标注断点，也不编造下游节点"
+        },
+        "corpus": {
+          "type": "array",
+          "description": "这条链路能用来校验引文的全部原文（元素文案 + href + 处理函数名 + 接口 URL + 路由路径）。判定阶段只允许从这里逐字复制引文",
+          "items": { "type": "string" }
+        }
+      }
+    }
+  }
+}

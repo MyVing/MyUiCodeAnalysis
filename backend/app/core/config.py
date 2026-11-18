@@ -24,6 +24,12 @@ class Settings(BaseSettings):
     worker_entry_path: Path | None = None
     worker_timeout_seconds: float = 120.0
 
+    # Git 接入：克隆产物落在受管目录，root_path 指向它，避免污染用户工作区。
+    # 默认在用户主目录下，可用 APP_REPOS_DIR 覆盖。
+    repos_dir: Path = Field(default_factory=lambda: Path.home() / ".uicodeanalysis" / "repos")
+    git_command: str = "git"
+    git_timeout_seconds: float = 180.0
+
     # runtime-worker 子进程：采集要托管 dev server + 浏览器，整体超时更宽松
     runtime_worker_entry_path: Path | None = None
     runtime_worker_timeout_seconds: float = 300.0
@@ -49,10 +55,25 @@ class Settings(BaseSettings):
     llm_api_key: str | None = None
     llm_model: str = "gpt-4o-mini"
     llm_timeout_seconds: float = 60.0
+    # 输出 token 上限：判定产物只是若干条 JSON 结论，但 8 个功能点满载时也可能
+    # 上千 token。截断会让整份输出变成非法 JSON，所以留足余量而不是卡着成本设。
+    llm_max_tokens: int = 4096
+    # 用 response_format=json_object 约束输出。少数 OpenAI 兼容端点不支持该字段
+    # （会返回 400），此时可关掉退化为纯 prompt 约束。
+    llm_response_format: bool = True
     # 喂给判定节点的候选上限：候选越多越容易召回，但也越容易超上下文与引入噪声
     llm_max_candidates: int = 30
     # 单次需求定位在模型侧的调用次数上限，防止重试把一次请求拖成无限等待
     llm_max_calls_per_request: int = 4
+    # 交给模型的页面数上限（页面 + 链路索引）。超过时按词法得分预筛并显式告警：
+    # 一个中型 SPA 有几十上百个路由，全量进 prompt 会挤掉链路细节。
+    # 设 0 表示不预筛。
+    llm_max_pages: int = 60
+
+    # 分析成功后是否异步生成页面画像（每页一句业务描述，缓存给在线定位用）。
+    # 默认关：打开意味着「每次分析多一次模型调用」，不该是隐式行为。
+    # 即使打开，未配置 key 时也不会触发（llm_ready 为假）。
+    llm_profile_enabled: bool = False
 
     @property
     def llm_ready(self) -> bool:

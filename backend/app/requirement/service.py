@@ -118,7 +118,8 @@ class RequirementLocateService:
     async def _execute(
         self, project: Project, task: RequirementTask, graph: IRGraph
     ) -> None:
-        await self._repository.update_task(
+        # 沿用仓储返回的快照：否则后续全字段更新会用 started_at=None 覆盖刚写入的值
+        task = await self._repository.update_task(
             task.model_copy(update={"status": "running", "started_at": datetime.now(UTC)})
         )
         try:
@@ -158,6 +159,15 @@ class RequirementLocateService:
 
         模型层失败（调用不通 / 输出无效）在图内降级为确定性结果 + 显式告警，
         不炸任务；编排层自身的意外异常仍由 _execute 落成 failed。
+
+        画像按图版本取：图换了版本就拿不到旧画像（`get_page_profiles` 用分析 id
+        精确匹配），此时定位照常工作，只是 prompt 里少一句页面描述。
         """
+        profile = None
+        if not task.dry_run and graph.analysisId is not None:
+            try:
+                profile = await self._analyses.get_page_profiles(project.id, graph.analysisId)
+            except Exception:  # noqa: BLE001 - 读画像失败不该让定位失败
+                logger.exception("读取页面画像失败：project=%s", project.id)
         orchestrator = RequirementOrchestrator(self._settings, self._llm, self._checkpointer)
-        return await orchestrator.run(project, task, graph)
+        return await orchestrator.run(project, task, graph, profile)

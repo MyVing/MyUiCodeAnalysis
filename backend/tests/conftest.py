@@ -8,6 +8,7 @@ from fastapi.testclient import TestClient
 
 from app.api.deps import (
     get_analysis_repository,
+    get_git_client,
     get_project_repository,
     get_requirement_repository,
     get_runtime_repository,
@@ -22,7 +23,7 @@ from app.storage.memory import (
     InMemoryRequirementRepository,
     InMemoryRuntimeRepository,
 )
-from tests.fakes import FakeRuntimeWorkerRunner, FakeWorkerRunner
+from tests.fakes import FakeGitClient, FakeRuntimeWorkerRunner, FakeWorkerRunner
 
 
 @pytest.fixture
@@ -51,17 +52,25 @@ def fake_runtime_runner() -> FakeRuntimeWorkerRunner:
 
 
 @pytest.fixture
+def fake_git() -> FakeGitClient:
+    return FakeGitClient()
+
+
+@pytest.fixture
 def client(
+    tmp_path,
     analysis_repository: InMemoryAnalysisRepository,
     requirement_repository: InMemoryRequirementRepository,
     runtime_repository: InMemoryRuntimeRepository,
     fake_runner: FakeWorkerRunner,
     fake_runtime_runner: FakeRuntimeWorkerRunner,
+    fake_git: FakeGitClient,
 ) -> Iterator[TestClient]:
     # 测试必须与开发者本地 .env 隔离：显式传不读 .env 的配置，
     # 并覆盖 get_settings，防止 DI 路径读到本地 APP_DB_URL（如 MySQL）
-    app = create_app(settings_with())
-    app.dependency_overrides[get_settings] = lambda: settings_with()
+    settings = settings_with(repos_dir=tmp_path / "repos")
+    app = create_app(settings)
+    app.dependency_overrides[get_settings] = lambda: settings
     repository = InMemoryProjectRepository()
     app.dependency_overrides[get_project_repository] = lambda: repository
     app.dependency_overrides[get_analysis_repository] = lambda: analysis_repository
@@ -69,6 +78,7 @@ def client(
     app.dependency_overrides[get_runtime_repository] = lambda: runtime_repository
     app.dependency_overrides[get_worker_runner] = lambda: fake_runner
     app.dependency_overrides[get_runtime_worker_runner] = lambda: fake_runtime_runner
+    app.dependency_overrides[get_git_client] = lambda: fake_git
     with TestClient(app) as test_client:
         yield test_client
     app.dependency_overrides.clear()

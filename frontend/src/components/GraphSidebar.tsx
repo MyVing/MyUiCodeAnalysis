@@ -1,4 +1,4 @@
-import { Search } from "lucide-react";
+﻿import { Search } from "lucide-react";
 
 import { KIND_META } from "@/graph/meta";
 import type { IRGraph, NodeKind } from "@uicodeanalysis/contracts";
@@ -43,25 +43,25 @@ export function GraphSidebar({
 
   return (
     <div className="flex h-full flex-col">
-      <div className="border-b border-slate-200 p-3">
+      <div className="border-b border-white/[0.06] p-3">
         <label className="relative block">
           <Search size={14} className="absolute left-2.5 top-2.5 text-slate-400" />
           <input
             value={search}
             onChange={(event) => onSearchChange(event.target.value)}
             placeholder="搜索组件、文件或 ID"
-            className="w-full rounded-lg border border-slate-200 bg-white py-1.5 pl-8 pr-2 text-xs outline-none transition focus:border-indigo-300 focus:ring-2 focus:ring-indigo-100"
+            className="app-input py-1.5 pl-8 pr-2 text-xs"
           />
         </label>
 
         <div className="mt-3 flex items-center justify-between">
-          <span className="text-[11px] font-medium uppercase tracking-wide text-slate-400">
+          <span className="text-[11px] font-medium uppercase tracking-[0.12em] text-slate-400">
             节点类型
           </span>
           <button
             type="button"
             onClick={onSelectAllKinds}
-            className="text-[11px] text-indigo-600 hover:text-indigo-700"
+            className="text-[11px] text-indigo-300 transition hover:text-indigo-200"
           >
             全部
           </button>
@@ -77,7 +77,7 @@ export function GraphSidebar({
                 className={`rounded-full border px-2 py-0.5 text-[10px] transition ${
                   active
                     ? KIND_META[kind].badge
-                    : "border-slate-200 bg-white text-slate-400 hover:text-slate-600"
+                    : "border-white/[0.08] bg-white/[0.02] text-slate-400 hover:text-slate-200"
                 }`}
               >
                 {KIND_META[kind].label} {count}
@@ -104,8 +104,8 @@ export function GraphSidebar({
               onClick={() => onSelectNode(node.id)}
               className={`w-full rounded-lg border px-2.5 py-2 text-left transition ${
                 selected
-                  ? "border-indigo-300 bg-indigo-50"
-                  : "border-transparent hover:border-slate-200 hover:bg-slate-50"
+                  ? "border-indigo-400/40 bg-indigo-400/10"
+                  : "border-transparent hover:border-white/10 hover:bg-white/[0.03]"
               }`}
             >
               <span
@@ -113,7 +113,7 @@ export function GraphSidebar({
               >
                 {KIND_META[node.kind].label}
               </span>
-              <p className="mt-1 truncate text-xs font-medium text-slate-800">{node.name}</p>
+              <p className="mt-1 truncate text-xs font-medium text-slate-200">{node.name}</p>
               <p className="truncate font-mono text-[10px] text-slate-400">{file ?? node.id}</p>
             </button>
           );

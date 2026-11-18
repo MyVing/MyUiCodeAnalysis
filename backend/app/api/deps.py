@@ -19,6 +19,7 @@ from app.core.config import (
     resolve_runtime_worker_entry,
     resolve_worker_entry,
 )
+from app.git_client import GitClient, SubprocessGitClient
 from app.plugin_manager.registry import PluginRegistry, create_plugin_registry
 from app.requirement.llm import LLMClient, build_llm_client
 from app.requirement.service import RequirementLocateService
@@ -61,10 +62,16 @@ def get_runtime_repository(request: Request) -> RuntimeRepository:
     return get_storage(request).runtimes
 
 
+def get_git_client(settings: SettingsDep) -> GitClient:
+    return SubprocessGitClient(settings.git_command, settings.git_timeout_seconds)
+
+
 def get_project_service(
     repository: Annotated[ProjectRepository, Depends(get_project_repository)],
+    git: Annotated[GitClient, Depends(get_git_client)],
+    settings: SettingsDep,
 ) -> ProjectService:
-    return ProjectService(repository)
+    return ProjectService(repository, git, settings)
 
 
 def get_worker_runner() -> WorkerRunner:
@@ -75,21 +82,22 @@ def get_worker_runner() -> WorkerRunner:
     )
 
 
+def get_llm_client() -> LLMClient | None:
+    return build_llm_client(get_settings())
+
+
 def get_analysis_service(
     repository: Annotated[AnalysisRepository, Depends(get_analysis_repository)],
     runner: Annotated[WorkerRunner, Depends(get_worker_runner)],
+    llm: Annotated[LLMClient | None, Depends(get_llm_client)],
     settings: SettingsDep,
 ) -> AnalysisService:
-    return AnalysisService(repository, runner, settings)
+    return AnalysisService(repository, runner, settings, llm)
 
 
 @lru_cache
 def get_plugin_registry() -> PluginRegistry:
     return create_plugin_registry()
-
-
-def get_llm_client() -> LLMClient | None:
-    return build_llm_client(get_settings())
 
 
 def get_requirement_checkpointer(request: Request) -> BaseCheckpointSaver:

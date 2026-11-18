@@ -9,6 +9,59 @@ from typing import Annotated
 from pydantic import AwareDatetime, BaseModel, ConfigDict, Field
 
 
+class ViewRole(StrEnum):
+    control = 'control'
+    container = 'container'
+    text = 'text'
+    link = 'link'
+
+
+class ChainRole(StrEnum):
+    element = 'element'
+    handler = 'handler'
+    state = 'state'
+    hook = 'hook'
+    api = 'api'
+    route = 'route'
+
+
+class Location(BaseModel):
+    model_config = ConfigDict(
+        extra='forbid',
+        populate_by_name=True,
+    )
+    line: Annotated[int, Field(ge=1)]
+    col: Annotated[int, Field(ge=1)]
+
+
+class ChainStep(BaseModel):
+    model_config = ConfigDict(
+        extra='forbid',
+        populate_by_name=True,
+    )
+    nodeId: Annotated[str, Field(min_length=1)]
+    role: ChainRole
+    name: Annotated[
+        str,
+        Field(
+            description='节点的展示名，如 `<button> 导出`、`handleExport`、`GET /api/orders/export`'
+        ),
+    ]
+    file: Annotated[str | None, Field(description='定义所在文件（相对项目根目录）')] = (
+        None
+    )
+    loc: Location | None = None
+
+
+class ChainPath(BaseModel):
+    model_config = ConfigDict(
+        extra='forbid',
+        populate_by_name=True,
+    )
+    nodeIds: list[str]
+    edgeIds: list[str]
+
+
 class Severity(StrEnum):
     error = 'error'
     warning = 'warning'
@@ -53,6 +106,7 @@ class SignalKind(StrEnum):
     apiUrl = 'apiUrl'
     propName = 'propName'
     propDescription = 'propDescription'
+    semanticRank = 'semanticRank'
 
 
 class Signal(BaseModel):
@@ -116,16 +170,9 @@ class Subgraph(BaseModel):
     counts: SubgraphCounts
 
 
-class Location(BaseModel):
-    model_config = ConfigDict(
-        extra='forbid',
-        populate_by_name=True,
-    )
-    line: Annotated[int, Field(ge=1)]
-    col: Annotated[int, Field(ge=1)]
-
-
 class Source(StrEnum):
+    static = 'static'
+    runtime = 'runtime'
     ai = 'ai'
 
 
@@ -146,6 +193,7 @@ class Unmatched(BaseModel):
 
 class Reason(StrEnum):
     node_not_in_candidates = 'node_not_in_candidates'
+    chain_not_in_candidates = 'chain_not_in_candidates'
     quote_not_found = 'quote_not_found'
     unknown_feature = 'unknown_feature'
     invalid_shape = 'invalid_shape'
@@ -159,15 +207,58 @@ class Dropped(BaseModel):
     reason: Annotated[
         Reason,
         Field(
-            description='被拒原因。node_not_in_candidates：模型选了候选集外的节点；quote_not_found：引文在该节点里找不到；unknown_feature：featureId 不是本次拆解出的功能点；invalid_shape：字段类型不符'
+            description='被拒原因。node_not_in_candidates：模型选了候选集外的页面；chain_not_in_candidates：模型选了本次链路集合外的链路（或链路不属于所选页面）；quote_not_found：引文在该页面/链路的语料里找不到；unknown_feature：featureId 不是本次拆解出的功能点；invalid_shape：字段类型不符'
         ),
     ]
     featureId: str | None = None
     nodeId: Annotated[
         str | None, Field(description='模型给出的原始 nodeId，原样记录以便审计')
     ] = None
+    chainId: Annotated[
+        str | None, Field(description='模型给出的原始 chainId，原样记录以便审计')
+    ] = None
     quote: Annotated[
         str | None, Field(description='模型给出的原始引文，原样记录以便审计')
+    ] = None
+
+
+class ActionChain(BaseModel):
+    model_config = ConfigDict(
+        extra='forbid',
+        populate_by_name=True,
+    )
+    id: Annotated[
+        str,
+        Field(description='由起点元素 id 与逐段 nodeId 拼成，可读且稳定', min_length=1),
+    ]
+    pageId: Annotated[str, Field(description='链路所属的页面组件节点 id', min_length=1)]
+    element: ChainStep
+    steps: Annotated[
+        list[ChainStep],
+        Field(
+            description='逐段路径，从起点元素开始（steps[0] 即 element）。相邻两段之间的关系都是图上真实存在的边',
+            min_length=1,
+        ),
+    ]
+    path: ChainPath
+    text: Annotated[
+        str | None, Field(description='元素的可见文案；文案是动态表达式时为 null')
+    ] = None
+    viewRole: Annotated[ViewRole | None, Field(description='元素在视图里的角色')] = None
+    href: Annotated[
+        str | None, Field(description='链接地址（仅宿主 `<a>` 且为字面量时）')
+    ] = None
+    terminatedAt: Annotated[
+        str | None,
+        Field(
+            description='非空表示链路在此中断，值为原因。链路宁可如实标注断点，也不编造下游节点'
+        ),
+    ] = None
+    corpus: Annotated[
+        list[str] | None,
+        Field(
+            description='这条链路能用来校验引文的全部原文（元素文案 + href + 处理函数名 + 接口 URL + 路由路径）。判定阶段只允许从这里逐字复制引文'
+        ),
     ] = None
 
 
@@ -183,6 +274,15 @@ class VerifiedEvidence(BaseModel):
     via: Annotated[
         str | None, Field(description='命中的字段来源，如 uiText / prop / apiUrl')
     ] = None
+    source: Annotated[
+        Source, Field(description='证据来源，取自对应 IR 节点的 evidence')
+    ]
+    confidence: Annotated[
+        float,
+        Field(
+            description='证据自身置信度，取自对应 IR 节点的 evidence', ge=0.0, le=1.0
+        ),
+    ]
 
 
 class Match(BaseModel):
@@ -193,8 +293,23 @@ class Match(BaseModel):
     featureId: Annotated[str, Field(min_length=1)]
     pageNodeId: Annotated[
         str,
-        Field(description='必须落在本次候选集内，否则整条 match 被丢弃', min_length=1),
+        Field(
+            description='必须落在本次给出的页面集合内，否则整条 match 被丢弃',
+            min_length=1,
+        ),
     ]
+    chainId: Annotated[
+        str | None,
+        Field(
+            description='命中的交互链路 id。必须来自本次给出的链路集合（由 derive_chains 确定性产出），否则整条 match 被丢弃。缺省表示模型只定位到页面、没有落到具体交互'
+        ),
+    ] = None
+    targets: Annotated[
+        list[str] | None,
+        Field(
+            description='被引文命中的链路段 nodeId（链路段的有序子集）。由服务端按 quote 归属算出，不由模型提供——前端据此高亮「需求说的是这条链的哪一步」'
+        ),
+    ] = None
     routeId: str | None = None
     confidence: Annotated[
         float,
@@ -226,7 +341,7 @@ class Match(BaseModel):
     source: Annotated[
         Source,
         Field(
-            description='本条结论的来源。当前只有 AI 判定会产出 match，确定性召回只产候选'
+            description='结论来源。当前 AI 判定结果为 ai；确定性证据的真实来源记录在 verifiedEvidence.source'
         ),
     ]
 
@@ -299,4 +414,10 @@ class RequirementMap(BaseModel):
     warnings: Annotated[
         list[RequirementWarning] | None,
         Field(description='降级与缺口：无 route 节点、quote 校验失败、模型不可用等'),
+    ] = None
+    interactionChains: Annotated[
+        list[ActionChain] | None,
+        Field(
+            description='本次定位涉及的交互链路（只含被 matches 引用的那些）。链路本身由 IRGraph 确定性推导（见 chain.schema.json），不在这里重复序列化全量链路——全量链路属于「图的派生」，不属于「某次需求定位的产物」'
+        ),
     ] = None

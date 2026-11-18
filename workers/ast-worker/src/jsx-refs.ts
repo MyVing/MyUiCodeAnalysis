@@ -39,6 +39,14 @@ export type TagTarget =
   | { kind: "external"; nodeId: string; packageName: string; tagName: string }
   | { kind: "unresolved" };
 
+/**
+ * 多分支标签（`const Comp = cond ? Slot : "button"`）的展开深度上限。
+ *
+ * 只服务于「沿声明回溯初始值」，三元 / 逻辑运算各算一层。三层足够覆盖
+ * slot 组件这种一层的写法；再深就不是可以静态确定的东西了。
+ */
+const MAX_TAG_BRANCH_DEPTH = 3;
+
 /** 解析所需的上下文，由调用方从分析流程里透传。 */
 export interface TagResolveContext {
   rootPath: string;
@@ -88,13 +96,16 @@ function resolveSymbolTarget(tagNameNode: Node, context: TagResolveContext): Tag
     return { kind: "unresolved" };
   }
 
-  // external（已安装）与 unresolved 且非本地（未安装的裸包名）都归为外部引用
+  // external（已安装）、builtin（Node 内置）与 unresolved 且非本地（未安装的裸包名）
+  // 都归为外部引用；asset 不是模块，无法指向组件，按未解析处理
   const packageName =
     target.status === "external"
       ? target.packageName
-      : target.status === "unresolved" && !target.isLocal
-        ? getPackageName(importSource)
-        : null;
+      : target.status === "builtin"
+        ? target.packageName
+        : target.status === "unresolved" && !target.isLocal
+          ? getPackageName(importSource)
+          : null;
 
   if (!packageName) return { kind: "unresolved" };
 
@@ -153,6 +164,112 @@ export function findImportSource(sourceFile: SourceFile, localName: string): str
     }
   }
   return null;
+}
+
+/**
+ * 把「指向组件的表达式」展开成候选表达式列表。
+ *
+ * 典型形态是 slot / polymorphic 组件：
+ *   `const Comp = asChild ? Slot : "button";` 然后 `<Comp />`
+ *
+ * 这不是解析失败——两个分支各自都指向真实的东西（一个外部组件、一个宿主元素），
+ * 只是「这一次渲染用哪个」取决于运行时 prop。静态分析只能如实说「可能是这些」。
+ */
+function expandTagCandidates(expr: Node, depth: number): Node[] {
+  if (depth > MAX_TAG_BRANCH_DEPTH) return [expr];
+
+  if (MorphNode.isParenthesizedExpression(expr)) {
+    return expandTagCandidates(expr.getExpression(), depth + 1);
+  }
+  // `as const` / 非空断言不改变指向
+  if (MorphNode.isAsExpression(expr) || MorphNode.isSatisfiesExpression(expr)) {
+    return expandTagCandidates(expr.getExpression(), depth + 1);
+  }
+  if (MorphNode.isNonNullExpression(expr)) {
+    return expandTagCandidates(expr.getExpression(), depth + 1);
+  }
+
+  // `cond ? A : B`：两个分支都在候选里
+  if (MorphNode.isConditionalExpression(expr)) {
+    return [
+      ...expandTagCandidates(expr.getWhenTrue(), depth + 1),
+      ...expandTagCandidates(expr.getWhenFalse(), depth + 1),
+    ];
+  }
+
+  // `A || B` / `A ?? B` / `A && <B />` 里都可能出现组件
+  if (MorphNode.isBinaryExpression(expr)) {
+    const operator = expr.getOperatorToken().getText();
+    if (operator === "||" || operator === "??" || operator === "&&") {
+      return [
+        ...expandTagCandidates(expr.getLeft(), depth + 1),
+        ...expandTagCandidates(expr.getRight(), depth + 1),
+      ];
+    }
+  }
+
+  // 变量：沿声明回溯到初始值。回溯不到（函数参数、props）时保留自身，
+  // 由调用方按未解析处理——那是真正定不下来的情况
+  if (MorphNode.isIdentifier(expr)) {
+    const initializer = initializerOf(expr);
+    if (initializer) return expandTagCandidates(initializer, depth + 1);
+  }
+
+  return [expr];
+}
+
+/** 标识符 → 其变量声明的初始值（穿透别名）。 */
+function initializerOf(identifier: Node): Node | null {
+  let symbol = identifier.getSymbol();
+  if (symbol?.isAlias()) {
+    try {
+      symbol = symbol.getAliasedSymbol();
+    } catch {
+      return null;
+    }
+  }
+  for (const decl of symbol?.getDeclarations() ?? []) {
+    if (!MorphNode.isVariableDeclaration(decl)) continue;
+    const init = decl.getInitializer();
+    if (init) return init;
+  }
+  return null;
+}
+
+/**
+ * 解析「可能指向多个组件」的标签，返回全部可确定的目标。
+ *
+ * 与 resolveTagTarget 的关系：它只回答单值。当单值解析未命中时，这里的多分支
+ * 解析能说明「标签不是错的，只是运行时才决定」——两者结论不同，不该混为一谈。
+ *
+ * 宿主元素分支（`"button"`）不进结果：字符串标签编译成 DOM 元素，不是组件。
+ * 返回类型里没有 unresolved：解析不到的分支只是没进结果，不冒充「确定不了」。
+ */
+export function resolvePolymorphicTagTargets(
+  tagNameNode: Node,
+  context: TagResolveContext,
+): Exclude<TagTarget, { kind: "unresolved" }>[] {
+  const targets: Exclude<TagTarget, { kind: "unresolved" }>[] = [];
+  const seen = new Set<string>();
+
+  for (const candidate of expandTagCandidates(tagNameNode, 0)) {
+    // 字符串字面量分支 = 宿主元素，不产 renders 边
+    if (
+      MorphNode.isStringLiteral(candidate) ||
+      MorphNode.isNoSubstitutionTemplateLiteral(candidate)
+    ) {
+      continue;
+    }
+
+    const target = resolveSymbolTarget(candidate, context);
+    if (target.kind === "unresolved") continue;
+
+    const key = target.kind === "component" ? `c:${target.id}` : `e:${target.nodeId}`;
+    if (seen.has(key)) continue;
+    seen.add(key);
+    targets.push(target);  }
+
+  return targets;
 }
 
 /** 便于调试：把解析结果格式化成一行。 */

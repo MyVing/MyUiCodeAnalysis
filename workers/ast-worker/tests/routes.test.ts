@@ -421,4 +421,53 @@ describe("路由节点的边界（合成项目）", () => {
       "userId",
     ]);
   });
+
+  it("spread 合并的路由表被展开（useRoutes([...A, ...B])）", () => {
+    const result = analyzeSynthetic({
+      "src/Pages.tsx": `
+        export function Home() { return <div />; }
+        export function UserList() { return <div />; }
+        export function OrderList() { return <div />; }
+      `,
+      "src/features/users/routes.tsx": `
+        import { UserList } from "../../Pages";
+        export const userRoutes = [{ path: "/users", element: <UserList /> }];
+      `,
+      "src/features/orders/routes.tsx": `
+        import { OrderList } from "../../Pages";
+        export const orderRoutes = [{ path: "/orders", element: <OrderList /> }];
+      `,
+      "src/router.tsx": `
+        import { useRoutes } from "react-router-dom";
+        import { userRoutes } from "./features/users/routes";
+        import { orderRoutes } from "./features/orders/routes";
+        export const appRoutes = [...userRoutes, ...orderRoutes];
+        export function AppRouter() { return useRoutes(appRoutes); }
+      `,
+    });
+
+    expect(routeByPath(result, "/users")).toBeDefined();
+    expect(routeByPath(result, "/orders")).toBeDefined();
+    // 两条路由各自连到自己的组件，说明展开没有串位
+    const users = routeByPath(result, "/users");
+    expect(result.edges.some((e) => e.from === users.id && e.to === "src/Pages.tsx#UserList")).toBe(
+      true,
+    );
+  });
+
+  it("路由常量经标识符 / as const 断言传入时仍能解析", () => {
+    const result = analyzeSynthetic({
+      "src/router.tsx": `
+        import { useRoutes } from "react-router-dom";
+        import { UserList } from "./Pages";
+        const routes = ([
+          { path: "/users", element: <UserList /> },
+        ] as const) satisfies unknown[];
+        export const appRoutes = routes;
+        export function AppRouter() { return useRoutes(appRoutes); }
+      `,
+    });
+
+    expect(routeByPath(result, "/users")).toBeDefined();
+  });
 });

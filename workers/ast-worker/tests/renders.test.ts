@@ -265,4 +265,45 @@ describe("renders 边的边界（合成项目）", () => {
     expect(result.componentIds.sort()).toEqual(["src/a.tsx#A", "src/b.tsx#B"]);
     expect(result.edges).toEqual([]);
   });
+
+  it("slot 组件（const Comp = asChild ? Slot : \"button\"）按分支连边，不报未解析", () => {
+    const result = analyzeSynthetic({
+      "src/Slot.tsx": `
+        import { Slot } from "@radix-ui/react-slot";
+        import * as React from "react";
+        export function Button({ asChild = false, ...props }: React.ComponentProps<"button"> & { asChild?: boolean }) {
+          const Comp = asChild ? Slot : "button";
+          return <Comp {...props} />;
+        }
+      `,
+    });
+
+    // 字符串分支 "button" 是宿主元素，不是组件；Slot 是外部组件，产薄节点
+    expect(result.edges).toHaveLength(1);
+    expect(result.edges[0]?.from).toBe("src/Slot.tsx#Button");
+    expect(result.edges[0]?.to).toBe("@radix-ui/react-slot#Slot");
+    // 分支级确定、整体取决于运行时 prop，置信度低于直接解析
+    expect(result.edges[0]?.evidence[0]?.confidence).toBeLessThan(0.9);
+    expect(result.warnings.some((w) => w.code === "unresolved_jsx_target")).toBe(false);
+  });
+
+  it("两个项目内组件作为分支时，两条边都产出", () => {
+    const result = analyzeSynthetic({
+      "src/Parts.tsx": `
+        export function Primary() { return <div />; }
+        export function Secondary() { return <span />; }
+      `,
+      "src/Maybe.tsx": `
+        import { Primary, Secondary } from "./Parts";
+        export function Maybe({ primary }: { primary: boolean }) {
+          const Comp = primary ? Primary : Secondary;
+          return <Comp />;
+        }
+      `,
+    });
+
+    const targets = result.edges.map((e) => e.to).sort();
+    expect(targets).toEqual(["src/Parts.tsx#Primary", "src/Parts.tsx#Secondary"]);
+    expect(result.warnings.some((w) => w.code === "unresolved_jsx_target")).toBe(false);
+  });
 });

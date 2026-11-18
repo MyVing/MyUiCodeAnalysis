@@ -25,8 +25,10 @@ from app.api.deps import (
     get_settings,
     get_worker_runner,
 )
+from app.contracts import EdgeKind, IRGraph, NodeKind
 from app.core.config import Settings
 from app.main import create_app
+from app.requirement.chains import derive_chains
 from app.requirement.llm import LLMCallError
 from app.requirement.service import RequirementLocateService
 from app.schemas import Project, RequirementLocateStart
@@ -37,10 +39,47 @@ from app.storage.memory import (
     InMemoryRuntimeRepository,
 )
 from tests.fakes import FakeLLMClient, FakeRuntimeWorkerRunner, FakeWorkerRunner
-from tests.graph_fixture import user_graph
+from tests.graph_fixture import edge, graph, node, page, user_graph
 
 _LIST_PAGE_ID = "src/pages/UserList.tsx#UserList"
 _QUOTE = "搜索用户"
+_EXPORT_PAGE_ID = "src/pages/OrderList.tsx#OrderList"
+
+
+def _chain_graph() -> IRGraph:
+    """一个带完整交互链路的页面：导出按钮 → handleExport → GET /api/orders/export。"""
+    order_list = page(_EXPORT_PAGE_ID, "OrderList", texts=["订单列表", "导出"])
+    button = node(
+        f"{_EXPORT_PAGE_ID}/jsx:button",
+        NodeKind.element,
+        "<button> 导出",
+        file="src/pages/OrderList.tsx",
+        attrs={"tag": "button", "viewRole": "control", "viewText": "导出"},
+    )
+    handler = node(
+        "src/pages/OrderList.tsx#handleExport",
+        NodeKind.fn,
+        "handleExport",
+        file="src/pages/OrderList.tsx",
+    )
+    api = node(
+        "api:GET:/api/orders/export",
+        NodeKind.api,
+        "GET /api/orders/export",
+        attrs={"method": "GET", "url": "/api/orders/export"},
+    )
+    route = node(
+        "src/router.tsx#/orders", NodeKind.route, "/orders", file="src/router.tsx", attrs={}
+    )
+    return graph(
+        [order_list, button, handler, api, route],
+        [
+            edge(route.id, order_list.id, EdgeKind.renders),
+            edge(order_list.id, button.id, EdgeKind.contains),
+            edge(button.id, handler.id, EdgeKind.calls),
+            edge(handler.id, api.id, EdgeKind.requests),
+        ],
+    )
 
 
 def _llm_response(**overrides: object) -> str:
@@ -223,6 +262,96 @@ async def test_invalid_model_output_lands_in_dropped(
     assert len(requirement_map.matches) == 1
     assert requirement_map.dropped is not None
     assert [dropped.nodeId for dropped in requirement_map.dropped] == ["src/pages/Fake.tsx#Fake"]
+
+
+async def test_llm_path_returns_interaction_chains(
+    requirement_repository: InMemoryRequirementRepository,
+    analysis_repository: InMemoryAnalysisRepository,
+) -> None:
+    """命中链路的定位必须把链路本身带进产物：前端要按它画逐段路径。
+
+    只回 chainId 不够——前端不该为了渲染再去拿一份全量链路（那是图的派生，
+    不属于某次定位的产物）。
+    """
+    project = _project()
+    await analysis_repository.save_graph(project.id, _chain_graph())
+    chains = derive_chains(_chain_graph())
+    export_chain = next(
+        chain for chain in chains.by_id.values() if chain.element.node_id.endswith("jsx:button")
+    )
+    llm = FakeLLMClient(
+        [
+            json.dumps(
+                {
+                    "matches": [
+                        {
+                            "featureId": "f1",
+                            "pageNodeId": _EXPORT_PAGE_ID,
+                            "chainId": export_chain.id,
+                            "quote": "导出",
+                            "confidence": 0.7,
+                        }
+                    ],
+                    "unmatched": [],
+                },
+                ensure_ascii=False,
+            )
+        ]
+    )
+    service = RequirementLocateService(
+        requirement_repository,
+        analysis_repository,
+        _settings(llm_enabled=True, llm_api_key="k"),
+        llm=llm,
+    )
+
+    task = await service.start(
+        project, RequirementLocateStart(requirement="订单列表支持导出", dry_run=False)
+    )
+    await _wait_task(service, task.id)
+
+    requirement_map = await service.get_map_by_task(task.id)
+    assert requirement_map is not None
+    match = requirement_map.matches[0]
+    assert match.chainId == export_chain.id
+    # targets 由服务端按引文归属算出
+    assert match.targets == [export_chain.element.node_id]
+
+    assert requirement_map.interactionChains
+    contract = requirement_map.interactionChains[0]
+    assert contract.id == export_chain.id
+    assert [step.role.value for step in contract.steps] == ["element", "handler", "api"]
+    assert contract.path.edgeIds, "链路要带上实际走过的那几条边，前端据此高亮"
+    assert all(step.file for step in contract.steps)
+
+
+async def test_dry_run_never_calls_the_model(
+    requirement_repository: InMemoryRequirementRepository,
+    analysis_repository: InMemoryAnalysisRepository,
+) -> None:
+    """dry-run 的语义是「不调模型，结论只看 candidates」——不能被链路路径破坏。"""
+    project = _project()
+    await analysis_repository.save_graph(project.id, _chain_graph())
+    llm = FakeLLMClient()
+    service = RequirementLocateService(
+        requirement_repository,
+        analysis_repository,
+        # 即使模型可用也不该调用：dry_run 是独立模式，不是降级
+        _settings(llm_enabled=True, llm_api_key="k"),
+        llm=llm,
+    )
+
+    task = await service.start(
+        project, RequirementLocateStart(requirement="订单列表支持导出", dry_run=True)
+    )
+    await _wait_task(service, task.id)
+
+    assert llm.calls == []
+    requirement_map = await service.get_map_by_task(task.id)
+    assert requirement_map is not None
+    assert requirement_map.dryRun is True
+    assert requirement_map.matches == []
+    assert requirement_map.interactionChains is None
 
 
 # --- API 层 ----------------------------------------------------------------

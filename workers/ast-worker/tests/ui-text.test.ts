@@ -242,6 +242,9 @@ describe("UI 文案的边界（合成项目）", () => {
     expect(result.byComponent.has("src/Columns.tsx#Columns")).toBe(false);
     const warning = result.warnings.find((item) => item.code === "ui_text_unassigned");
     expect(warning?.severity).toBe("info");
+    // 告警必须指到具体位置，否则用户无从核对是哪一处文案
+    expect(warning?.file).toBe("src/Columns.tsx");
+    expect(warning?.loc).toEqual({ line: 2, col: 28 });
   });
 
   it("HTML 实体解码后再入库", () => {

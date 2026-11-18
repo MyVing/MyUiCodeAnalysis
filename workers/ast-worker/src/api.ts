@@ -81,6 +81,8 @@ interface RequestSite {
   method: string;
   /** 该请求的全部证据 */
   evidence: Evidence[];
+  /** URL 来自源码里的原始写法；与 url 不同时前端可以并排展示 */
+  urlRaw?: string;
 }
 
 /** 请求封装器的签名：怎么从调用实参里取出 URL 与 method。 */
@@ -124,29 +126,234 @@ function normalizeUrlText(text: string): string | null {
  * 只认三种形态：
  *  - 字符串字面量 `"/api/users"`
  *  - 无插值模板 `` `/api/users` ``
- *  - 带插值的模板，取 head 的字面量部分（`` `/api/users/${id}` `` → `/api/users/${…}`）
+ *  - 带插值的模板，字面量骨架非空时保留插值形态
+ *
+ * 带插值时的两条规则彼此不同，很容易写错：
+ *
+ *  - **路径参数**（`` `/api/users/${id}` ``）保留原样：只有这样 `/users/1` 与
+ *    `/users/2` 才会归到同一个接口，反查时也才能按段归一化成 `:param`。
+ *  - **前缀常量**（`` `${API_PREFIX}/orders` ``）必须在读取阶段被求值：它决定
+ *    的是"这是哪个接口"，不是"哪一个资源实例"。求不出来时**不猜**——见
+ *    `resolveUrlExpression`。
  *
  * 认不出来的（变量、函数调用、拼接）一律返回 null，由上层退回符号追踪——
  * 禁止把变量名当成 URL 写进图里。
  */
 function readLiteralUrl(node: Node): string | null {
+  return readUrl(node).text;
+}
+
+/** URL 读取结果：除了文本，还要告诉调用方前缀有没有求出来。 */
+interface UrlReadResult {
+  /** 规范化后的 URL；无法确定时为 null */
+  text: string | null;
+  /** 模板里存在未能求值的插值，且位置在路径参数之前（URL 主体不确定） */
+  unresolvedPrefix: boolean;
+  /** 原始源码文本，供 attrs 回显（求值失败时用户能看到真实写法） */
+  raw: string;
+}
+
+function readUrl(node: Node): UrlReadResult {
   if (MorphNode.isStringLiteral(node) || MorphNode.isNoSubstitutionTemplateLiteral(node)) {
-    return normalizeUrlText(node.getLiteralText());
+    return { text: normalizeUrlText(node.getLiteralText()), unresolvedPrefix: false, raw: node.getText() };
   }
 
   if (MorphNode.isTemplateExpression(node)) {
-    const head = node.getHead().getLiteralText();
-    const spans = node.getTemplateSpans();
-    // 纯插值开头（`${url}${query}`）时 head 为空 → 无法确定
-    if (!normalizeUrlText(head)) return null;
-
-    // 保留插值形态，这样 `/api/users/1` 与 `/api/users/2` 会归到同一个接口
-    const tail = spans
-      .map((span) => `\${${span.getExpression().getText()}}${span.getLiteral().getLiteralText()}`)
-      .join("");
-    return normalizeUrlText(`${head}${tail}`);
+    return readTemplateUrl(node);
   }
 
+  return { text: null, unresolvedPrefix: false, raw: node.getText() };
+}
+
+/**
+ * 模板表达式 → URL。
+ *
+ * 把模板拆成「字面量段 + 插值段」后逐个插值尝试求值：
+ *
+ *  - 求出来的值拼进字面量骨架（`` `${API_PREFIX}/orders` `` → `/api/orders`）；
+ *  - **路径参数**原样保留成插值占位（`` ${id} `` → `${…}`），不展开也不丢弃；
+ *  - 求不出来且**位于路径参数之前**的插值视为前缀未解析：URL 主体不确定，
+ *    整个模板判为无法确定（返回 null），由调用方记告警。宁可缺一个接口节点，
+ *    也不能把 `${…}/orders` 当成一个真实接口参与反查——那会系统性误匹配。
+ */
+function readTemplateUrl(node: Node): UrlReadResult {
+  if (!MorphNode.isTemplateExpression(node)) {
+    return { text: null, unresolvedPrefix: false, raw: node.getText() };
+  }
+
+  const head = node.getHead().getLiteralText();
+  const spans = node.getTemplateSpans();
+
+  const parts: string[] = [];
+  let unresolvedPrefix = false;
+  // 尚未遇到任何「路径参数」插值：此前的插值都按前缀处理
+  let beforePathParam = true;
+
+  if (head.length > 0) parts.push(head);
+
+  for (const span of spans) {
+    const expression = span.getExpression();
+    const literal = span.getLiteral().getLiteralText();
+
+    const resolved = tryEvaluatePrefixExpression(expression);
+    if (resolved !== null) {
+      parts.push(resolved);
+    } else if (isUrlParameter(expression)) {
+      // 路径 / 查询参数：保留插值形态，后面的字面量一起拼回骨架
+      parts.push("${…}");
+      beforePathParam = false;
+    } else {
+      // 既不是路径参数、也求不出来：它就是 URL 里的一段未知前缀
+      if (beforePathParam) unresolvedPrefix = true;
+      parts.push(`\${${expression.getText()}}`);
+    }
+
+    if (literal.length > 0) parts.push(literal);
+  }
+
+  const skeleton = parts.join("");
+  if (!normalizeUrlText(skeleton)) {
+    return { text: null, unresolvedPrefix, raw: node.getText() };
+  }
+
+  // 前缀没求出来 → 整个 URL 主体不确定，不产节点
+  if (unresolvedPrefix) {
+    return { text: null, unresolvedPrefix: true, raw: node.getText() };
+  }
+
+  return {
+    text: normalizeUrlText(skeleton),
+    unresolvedPrefix: false,
+    raw: node.getText(),
+  };
+}
+
+/**
+ * 判断插值是不是「URL 里的一段动态值」，而不是「URL 主体」。
+ *
+ * 包括两种：路径参数（`/users/${id}`）与查询参数（`/users?status=${status}`）。
+ * 它们的共同点是**前一段字面量里已经有 `/`**，说明地址主体已经写死在源码里，
+ * 插值只是指向某个具体资源或筛选条件。
+ *
+ * 判据不是变量名（`id` / `userId` / `key` 这类名字全是业务约定），而是**位置与
+ * 上下文**。这条判据同时用在两个地方，含义必须一致：
+ *  - `readTemplateUrl`：这类插值保留为占位，不展开也不丢弃；
+ *  - `traceUrlToParameter`：这类插值**不能**让函数被误判成 URL 封装器。
+ */
+function isUrlParameter(expression: Node): boolean {
+  if (!MorphNode.isIdentifier(expression) && !MorphNode.isPropertyAccessExpression(expression)) {
+    return false;
+  }
+
+  // 取它在模板中的前一段字面量：有 `/` 才算地址主体已写死
+  const span = expression.getParent();
+  if (!span) return false;
+
+  const previousLiteral = previousTemplateLiteral(span);
+  return previousLiteral !== null && previousLiteral.includes("/");
+}
+
+/** 模板片段之前最近的一段字面量文本；在 head 处返回 head 文本。 */
+function previousTemplateLiteral(span: Node): string | null {
+  const template = span.getParent();
+  if (!template || !MorphNode.isTemplateExpression(template)) return null;
+
+  const spans = template.getTemplateSpans();
+  const index = spans.indexOf(span as (typeof spans)[number]);
+  if (index < 0) return null;
+  if (index === 0) return template.getHead().getLiteralText();
+  return spans[index - 1]?.getLiteral().getLiteralText() ?? null;
+}
+
+/**
+ * 尝试把插值表达式静态求值成字符串（用于 URL 前缀）。
+ *
+ * 支持三种企业项目里的常见形态，**只认能确定的值**：
+ *  - 字符串字面量：`const BASE = "/api"`（含跨文件 import，靠符号解析回溯）
+ *  - `import.meta.env.X ?? "/api"`：取 fallback 值，env 本身运行时才知道
+ *  - 纯字面量拼接：`const BASE = "/api" + "/v1"`
+ *
+ * 函数返回值、运行时计算、模板里嵌套的未解析变量一律返回 null——那是数据流
+ * 分析范畴，一期不做，也不该用猜测糊过去。
+ */
+function tryEvaluatePrefixExpression(node: Node, depth = 0): string | null {
+  if (depth > 3) return null;
+
+  if (MorphNode.isStringLiteral(node) || MorphNode.isNoSubstitutionTemplateLiteral(node)) {
+    return node.getLiteralText();
+  }
+
+  if (MorphNode.isParenthesizedExpression(node)) {
+    return tryEvaluatePrefixExpression(node.getExpression(), depth + 1);
+  }
+
+  // import.meta.env.X ?? "/api" —— env 运行时才知道，取显式 fallback
+  if (MorphNode.isBinaryExpression(node)) {
+    const operator = node.getOperatorToken().getText();
+    if (operator === "??" || operator === "||") {
+      const right = tryEvaluatePrefixExpression(node.getRight(), depth + 1);
+      if (right !== null) return right;
+      return tryEvaluatePrefixExpression(node.getLeft(), depth + 1);
+    }
+    if (operator === "+") {
+      const left = tryEvaluatePrefixExpression(node.getLeft(), depth + 1);
+      const right = tryEvaluatePrefixExpression(node.getRight(), depth + 1);
+      if (left !== null && right !== null) return left + right;
+      return null;
+    }
+  }
+
+  if (MorphNode.isIdentifier(node) || MorphNode.isPropertyAccessExpression(node)) {
+    return evaluateSymbol(node);
+  }
+
+  return null;
+}
+
+/**
+ * 沿符号声明回溯跨文件 / 同文件的前缀常量。
+ *
+ * 与 `resolveIdentifier` 的区别：那个只用于「找 URL 字面量节点」，这个要返回
+ * **求值后的字符串**，因此必须递归穿透中间变量与 import 别名。
+ *
+ * 两种声明形态都要认，它们在真实项目里同样常见：
+ *  - `const BASE = "/api"`         → VariableDeclaration
+ *  - `API_URLS.JSON_PLACEHOLDER`   → PropertyAssignment（`as const` 常量表）
+ *
+ * 常量表那条必须走符号解析而不是按名字猜：`API_URLS.FAKE_STORE` 里的
+ * `API_URLS` 可能来自任意一个文件，只有 TS 自己解析出的声明位置才可靠。
+ */
+function evaluateSymbol(node: Node): string | null {
+  const symbol = node.getSymbol();
+  if (!symbol) return null;
+
+  let target = symbol;
+  if (target.isAlias()) {
+    try {
+      const aliased = target.getAliasedSymbol();
+      // 别名链断裂（模块未解析）时 aliased 可能为 undefined：按「求不出来」处理
+      if (!aliased) return null;
+      target = aliased;
+    } catch {
+      return null;
+    }
+  }
+
+  for (const decl of target.getDeclarations() ?? []) {
+    // 只取初始化表达式：声明类型（`const x: string`）不含值
+    const init = MorphNode.isVariableDeclaration(decl)
+      ? decl.getInitializer()
+      : MorphNode.isPropertyAssignment(decl)
+        ? decl.getInitializer()
+        : undefined;
+    if (!init) continue;
+
+    // 防止自引用造成的无限递归：`const a = a`
+    if (init === node || init.containsRange(node.getStart(), node.getEnd())) continue;
+
+    const value = tryEvaluatePrefixExpression(init, 1);
+    if (value !== null) return value;
+  }
   return null;
 }
 
@@ -275,12 +482,30 @@ function findEnclosingFunction(node: Node): Node | null {
   return null;
 }
 
-/** 函数节点的名字；匿名函数返回 null。 */
+/**
+ * 函数节点的名字；匿名函数返回 null。
+ *
+ * 匿名内联回调是常见写法，但它在图里必须有个稳定身份，否则「请求发生在哪个
+ * 函数里」无从记录，整条接口链路会静默丢失：
+ *
+ *   const fetchPosts = useCallback(async () => { await fetch(...) }, [])
+ *
+ * 这里的 `useCallback(...)` 首参就是那个回调，语义上属于 `fetchPosts`。
+ * 判据是「函数是某个调用表达式的第一个实参，且该调用被赋给变量/属性」——
+ * 这是把回调绑定到名字的通用形态，不依赖 useCallback 这类具体 API 名。
+ */
 function getFunctionName(fn: Node): string | null {
   if (MorphNode.isFunctionDeclaration(fn)) return fn.getName() ?? null;
   const parent = fn.getParent();
   if (parent && MorphNode.isVariableDeclaration(parent)) return parent.getName();
   if (parent && MorphNode.isPropertyAssignment(parent)) return parent.getName();
+
+  // `const name = useCallback(fn)` / `const name = useMemo(() => ..., [])`
+  if (parent && MorphNode.isCallExpression(parent) && parent.getArguments()[0] === fn) {
+    const grandParent = parent.getParent();
+    if (grandParent && MorphNode.isVariableDeclaration(grandParent)) return grandParent.getName();
+    if (grandParent && MorphNode.isPropertyAssignment(grandParent)) return grandParent.getName();
+  }
   return null;
 }
 
@@ -301,6 +526,11 @@ function traceUrlToParameter(
 ): { paramIndex: number; propertyName: string | null } | null {
   if (MorphNode.isTemplateExpression(urlNode) || MorphNode.isBinaryExpression(urlNode)) {
     for (const operand of getUrlOperands(urlNode)) {
+      // 路径 / 查询参数不是 URL 主体：`fetch(`/api/users/${id}`)` 里的 `id`
+      // 之于这个 URL，就像 `/users/1` 里的 `1`。把它当成「URL 由调用方给」
+      // 会让这个函数被误判成封装器，真正的请求点被整条跳过——连告警都没有。
+      if (isUrlParameter(operand)) continue;
+
       const hit = traceUrlToParameter(operand, enclosing);
       if (hit) return hit;
     }
@@ -515,7 +745,7 @@ function findCallsExcludingNestedFunctions(fn: Node): CallExpression[] {
 function readWrapperCall(
   call: CallExpression,
   signature: WrapperSignature,
-): { url: string; node: Node; indirect: boolean; method: string } | null {
+): { url: string; urlRaw?: string; node: Node; indirect: boolean; method: string } | null {
   const args = call.getArguments();
   const urlArg = args[signature.urlSlot.paramIndex];
   if (!urlArg) return null;
@@ -530,18 +760,19 @@ function readWrapperCall(
   if (!target) return null;
 
   let indirect = false;
-  let url = readLiteralUrl(target);
+  let read = readUrl(target);
   let urlNode = target;
 
-  if (!url) {
+  if (!read.text) {
     const resolved = resolveIdentifier(target);
     if (resolved) {
-      url = readLiteralUrl(resolved.node);
+      read = readUrl(resolved.node);
       urlNode = resolved.node;
       indirect = true;
     }
   }
-  if (!url) return null;
+  if (!read.text) return null;
+  const url = read.text;
 
   // method：优先取调用点显式传入的，其次取封装器的解构默认值，
   // 最后落到 HTTP 语义的默认值 GET（不写 method 的请求就是 GET，这是事实不是猜测）
@@ -556,7 +787,13 @@ function readWrapperCall(
   }
   const resolvedMethod = method ?? methodSlot?.fallback ?? DEFAULT_METHOD;
 
-  return { url, node: urlNode, indirect, method: resolvedMethod };
+  return {
+    url,
+    ...(read.raw !== url ? { urlRaw: read.raw } : {}),
+    node: urlNode,
+    indirect,
+    method: resolvedMethod,
+  };
 }
 
 /** api 节点 id：同一接口被多处调用时合并成一个节点。 */
@@ -631,7 +868,15 @@ export function analyzeApi(input: ApiAnalysisInput): ApiAnalysisResult {
         ...(first.loc ? { loc: first.loc } : {}),
         // 只放数据。诸如「位置只是首次发现处」这类说明对所有 api 节点都一样，
         // 是展示逻辑，交给前端固定文案，不重复塞进每个节点的 attrs。
-        attrs: { method: site.method, url: site.url },
+        //
+        // urlRaw 只在「源码写法与解析结果不同」时才写：用户点开接口想核对的是
+        // `\`${API_PREFIX}/orders\`` 这个原文，而不是被求值后的 `/api/orders`。
+        // 两者相同时不必重复存一份。
+        attrs: {
+          method: site.method,
+          url: site.url,
+          ...(site.urlRaw ? { urlRaw: site.urlRaw } : {}),
+        },
         // 节点自身只承载一条证据；其余调用位置都进对应边的 evidence
         evidence: [first],
       });
@@ -685,12 +930,31 @@ export function analyzeApi(input: ApiAnalysisInput): ApiAnalysisResult {
 
   // --- 第二步：扫全部调用点 ---
   for (const file of project.getSourceFiles()) {
-    if (toProjectRelative(rootPath, file.getFilePath()) === null) continue;
+    const callFile = toProjectRelative(rootPath, file.getFilePath());
+    if (callFile === null) continue;
 
     for (const call of file.getDescendantsOfKind(SyntaxKind.CallExpression)) {
-      const site = readRequestAtCall(call, rootPath, wrappers);
-      if (!site) continue;
+      const result = readRequestAtCall(call, rootPath, wrappers);
 
+      if (result.kind === "unresolved") {
+        // 前缀求不出来 → 不产 api 节点，但必须让用户看到"这里有个接口没解析出来"。
+        // 静默跳过会让"该页面不调用此接口"变成一条错误结论。
+        const pos = file.getLineAndColumnAtPos(call.getStart());
+        warnings.push({
+          code: "api_url_prefix_unresolved",
+          severity: "warning",
+          stage: "static",
+          file: callFile,
+          loc: { line: pos.line, col: pos.column },
+          message:
+            `${result.method} ${result.raw} 的 URL 前缀无法静态求值，未计入接口清单；` +
+            "该页面可能存在未被记录的接口",
+        });
+        continue;
+      }
+      if (result.kind === "none") continue;
+
+      const site = result.site;
       const ownerComponent = findOwner(call, definitionIndex, rootPath);
       const fromId = ownerComponent ?? moduleFunctionIdOf(call, rootPath, file);
       if (!fromId) continue;
@@ -791,14 +1055,20 @@ function getCalleeName(call: CallExpression): string | null {
  *    URL 在那里只是参数，由封装器的调用点负责产出真正的接口。
  *  - 封装器调用点，按签名从实参里取 URL。
  */
+/** 请求点读取结果：要么是一个可建模的请求，要么是一条「前缀未解析」记录。 */
+type RequestReadResult =
+  | { kind: "site"; site: RequestSite }
+  | { kind: "unresolved"; call: CallExpression; method: string; raw: string }
+  | { kind: "none" };
+
 function readRequestAtCall(
   call: CallExpression,
   rootPath: string,
   wrappers: ReadonlyMap<string, WrapperSignature>,
-): RequestSite | null {
+): RequestReadResult {
   if (isHttpClientCall(call, rootPath)) {
     const urlArg = getUrlArgumentNode(call);
-    if (!urlArg) return null;
+    if (!urlArg) return { kind: "none" };
 
     // 封装器体内的请求点：URL 来自参数，此刻还定不下来
     const enclosing = findEnclosingFunction(urlArg);
@@ -806,37 +1076,57 @@ function readRequestAtCall(
       const enclosingFile = toProjectRelative(rootPath, enclosing.getSourceFile().getFilePath());
       const enclosingName = getFunctionName(enclosing);
       if (enclosingFile && enclosingName && wrappers.has(`${enclosingFile}#${enclosingName}`)) {
-        return null;
+        return { kind: "none" };
       }
     }
 
-    return buildDirectRequestSite(call, urlArg, rootPath);
+    const site = buildDirectRequestSite(call, urlArg, rootPath);
+    if (site) return { kind: "site", site };
+
+    // URL 定不下来：区分「前缀求不出来」与「压根没写 URL」。
+    // 前者是可解释的覆盖缺口（跨模块常量 / 运行时拼装），必须让用户看见；
+    // 后者是正常跳过（如 `fetch(input)` 把整个 Request 对象传进来）。
+    const resolved = resolveIdentifier(urlArg);
+    const read = readUrl(resolved?.node ?? urlArg);
+    if (read.unresolvedPrefix) {
+      return {
+        kind: "unresolved",
+        call,
+        method: getMethodFromOptions(call) ?? inferMethodFromCallee(call) ?? DEFAULT_METHOD,
+        raw: read.raw,
+      };
+    }
+    return { kind: "none" };
   }
 
   const calleeName = getCalleeName(call);
-  if (!calleeName) return null;
+  if (!calleeName) return { kind: "none" };
 
   const signature = findWrapperForCall(call, calleeName, wrappers, rootPath);
-  if (!signature) return null;
+  if (!signature) return { kind: "none" };
 
   const read = readWrapperCall(call, signature);
-  if (!read) return null;
+  if (!read) return { kind: "none" };
 
   const urlFile = toProjectRelative(rootPath, read.node.getSourceFile().getFilePath());
-  if (urlFile === null) return null;
+  if (urlFile === null) return { kind: "none" };
   const pos = read.node.getSourceFile().getLineAndColumnAtPos(read.node.getStart());
 
   return {
-    url: read.url,
-    method: read.method,
-    evidence: [
-      {
-        source: "static",
-        confidence: read.indirect ? LOCAL_VAR_CONFIDENCE : INDIRECT_CONFIDENCE,
-        file: urlFile,
-        loc: { line: pos.line, col: pos.column },
-      },
-    ],
+    kind: "site",
+    site: {
+      url: read.url,
+      method: read.method,
+      ...(read.urlRaw ? { urlRaw: read.urlRaw } : {}),
+      evidence: [
+        {
+          source: "static",
+          confidence: read.indirect ? LOCAL_VAR_CONFIDENCE : INDIRECT_CONFIDENCE,
+          file: urlFile,
+          loc: { line: pos.line, col: pos.column },
+        },
+      ],
+    },
   };
 }
 
@@ -882,8 +1172,8 @@ function buildDirectRequestSite(
 ): RequestSite | null {
   const resolved = resolveIdentifier(urlArg);
   const urlNode = resolved?.node ?? urlArg;
-  const url = readLiteralUrl(urlNode);
-  if (!url) return null;
+  const read = readUrl(urlNode);
+  if (!read.text) return null;
 
   const urlFile = toProjectRelative(rootPath, urlNode.getSourceFile().getFilePath());
   if (urlFile === null) return null;
@@ -895,7 +1185,7 @@ function buildDirectRequestSite(
   // 真写了」。URL 经变量转手时结论弱一档，位置也指向变量初始化处而非调用处，
   // 这样点开证据看到的就是真正决定 URL 的那一行。
   return {
-    url,
+    url: read.text,
     method,
     evidence: [
       {
@@ -905,6 +1195,7 @@ function buildDirectRequestSite(
         loc: { line: pos.line, col: pos.column },
       },
     ],
+    ...(read.raw !== read.text ? { urlRaw: read.raw } : {}),
   };
 }
 

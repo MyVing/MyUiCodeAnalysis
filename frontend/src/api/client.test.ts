@@ -77,6 +77,19 @@ describe("api client", () => {
     });
   });
 
+  it("builds the source excerpt query with encoded file paths", async () => {
+    const fetchMock = vi
+      .fn()
+      .mockResolvedValue({ ok: true, status: 200, json: async () => ({ file: "src/a b.tsx" }) });
+    vi.stubGlobal("fetch", fetchMock);
+
+    await api.getSourceExcerpt("prj_1", "src/a b.tsx", 12, 8);
+
+    expect(fetchMock.mock.calls[0]![0]).toBe(
+      "/api/v1/projects/prj_1/source?file=src%2Fa+b.tsx&line=12&radius=8",
+    );
+  });
+
   it("sends project payloads as JSON with camelCase fields", async () => {
     const fetchMock = vi
       .fn()

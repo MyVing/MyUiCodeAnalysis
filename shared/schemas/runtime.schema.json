@@ -24,8 +24,12 @@
     },
     "mode": {
       "type": "string",
-      "enum": ["passive"],
-      "description": "一期仅 passive（A 模式）；二期追加 ai-exploration"
+      "enum": ["passive", "ai-exploration"],
+      "description": "passive：A 模式被动采集；ai-exploration：B 模式 AI 自动探索页面、生成场景与用例"
+    },
+    "exploration": {
+      "$ref": "#/$defs/Exploration",
+      "description": "B 模式探索配置与结果；passive 模式缺省"
     },
     "devServer": { "$ref": "#/$defs/DevServer" },
     "componentTree": {
@@ -235,6 +239,16 @@
           "type": "array",
           "items": { "type": "string" },
           "description": "本次交互引发的 network / navigation 事件 id"
+        },
+        "screenshotRef": {
+          "type": "string",
+          "pattern": "^artifact://",
+          "description": "交互后的页面截图引用；B 模式每步必拍"
+        },
+        "result": {
+          "type": "string",
+          "enum": ["success", "failed", "no_change"],
+          "description": "交互执行结果：success 正常完成；failed 执行报错；no_change 页面无可见变化"
         }
       }
     },
@@ -282,6 +296,152 @@
           "enum": ["pending", "confirmed", "rejected"],
           "default": "pending",
           "description": "人工确认结果；与系统判定的 status 分离，确认后可跨分析复用"
+        }
+      }
+    },
+    "Exploration": {
+      "title": "Exploration",
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["goal", "steps"],
+      "properties": {
+        "goal": {
+          "type": "string",
+          "minLength": 1,
+          "description": "用户输入的探索目标，如「测试用户登录流程」"
+        },
+        "maxSteps": {
+          "type": "integer",
+          "minimum": 1,
+          "maximum": 50,
+          "default": 15,
+          "description": "探索步数上限，防止无限循环"
+        },
+        "steps": {
+          "type": "array",
+          "items": { "$ref": "#/$defs/ExplorationStep" },
+          "description": "AI 决策并执行的探索步骤序列"
+        },
+        "scenario": {
+          "$ref": "#/$defs/Scenario",
+          "description": "AI 根据探索过程归纳的用户场景"
+        },
+        "testCases": {
+          "type": "array",
+          "items": { "$ref": "#/$defs/TestCase" },
+          "description": "AI 生成的测试用例清单"
+        },
+        "screenshots": {
+          "type": "array",
+          "items": {
+            "type": "object",
+            "additionalProperties": false,
+            "required": ["ref", "stepIndex"],
+            "properties": {
+              "ref": { "type": "string", "pattern": "^artifact://" },
+              "stepIndex": { "type": "integer", "minimum": 0 },
+              "caption": { "type": "string" }
+            }
+          }
+        }
+      }
+    },
+    "ExplorationStep": {
+      "title": "ExplorationStep",
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["index", "action", "target", "result"],
+      "properties": {
+        "index": { "type": "integer", "minimum": 0 },
+        "action": {
+          "type": "string",
+          "enum": ["click", "input", "select", "navigate", "submit", "hover", "scroll", "other"]
+        },
+        "target": {
+          "type": "string",
+          "description": "目标元素的可读描述，如「登录按钮」或 selector 摘要"
+        },
+        "selector": {
+          "type": "string",
+          "description": "实际使用的 Playwright selector"
+        },
+        "valueSummary": {
+          "type": "string",
+          "description": "input/select 的值摘要；敏感字段脱敏"
+        },
+        "reasoning": {
+          "type": "string",
+          "description": "AI 选择该操作的理由（用于审计）"
+        },
+        "result": {
+          "type": "string",
+          "enum": ["success", "failed", "no_change"],
+          "description": "执行结果"
+        },
+        "error": {
+          "type": "string",
+          "description": "result=failed 时的错误信息"
+        },
+        "screenshotRef": {
+          "type": "string",
+          "pattern": "^artifact://",
+          "description": "本步执行后的截图引用"
+        },
+        "triggeredNetworkEvents": {
+          "type": "array",
+          "items": { "type": "string" },
+          "description": "本步引发的网络事件 id"
+        },
+        "pageTransitioned": {
+          "type": "boolean",
+          "description": "本步是否触发了页面跳转/路由变化"
+        }
+      }
+    },
+    "Scenario": {
+      "title": "Scenario",
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["title", "description"],
+      "properties": {
+        "title": { "type": "string", "minLength": 1 },
+        "description": { "type": "string" },
+        "preconditions": {
+          "type": "array",
+          "items": { "type": "string" },
+          "description": "场景前置条件"
+        },
+        "expectedOutcome": {
+          "type": "string",
+          "description": "场景预期结果"
+        }
+      }
+    },
+    "TestCase": {
+      "title": "TestCase",
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["title", "steps", "expected"],
+      "properties": {
+        "title": { "type": "string", "minLength": 1 },
+        "priority": {
+          "type": "string",
+          "enum": ["p0", "p1", "p2", "p3"]
+        },
+        "steps": {
+          "type": "array",
+          "items": { "type": "string" },
+          "description": "测试步骤的自然语言描述"
+        },
+        "expected": {
+          "type": "array",
+          "items": { "type": "string" },
+          "description": "预期断言"
+        },
+        "relatedSteps": {
+          "type": "array",
+          "items": { "type": "integer", "minimum": 0 },
+          "description": "关联的探索步骤 index"
         }
       }
     }

@@ -74,8 +74,8 @@ export function buildFlowGraph(graph: IRGraph): FlowGraph {
         strokeWidth: source === "runtime" ? 2 : 1.5,
         strokeDasharray: source === "ai" ? "6 4" : undefined,
       },
-      labelStyle: { fill: "#475569", fontSize: 10, fontFamily: "monospace" },
-      labelBgStyle: { fill: "#f8fafc", fillOpacity: 0.9 },
+      labelStyle: { fill: "#cbd5e1", fontSize: 10, fontFamily: "monospace" },
+      labelBgStyle: { fill: "#151b25", fillOpacity: 0.95 },
       data: { source },
     };
   });

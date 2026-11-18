@@ -196,7 +196,11 @@ describe("API 链路的边界（合成项目）", () => {
       `,
     });
 
-    expect(apiIds(result)).toEqual(["api:GET:/api/users/${id}"]);
+    // 插值名不进 URL：`${id}` / `${userId}` / `${key}` 指向的是同一个接口，
+    // 保留变量名反而会让同一接口按调用处的变量名分裂成多个节点。
+    // 原始写法记在 urlRaw，回查时仍能看到代码里到底写了什么。
+    expect(apiIds(result)).toEqual(["api:GET:/api/users/${…}"]);
+    expect(result.apiNodes[0]?.attrs.urlRaw).toBe("`/api/users/${id}`");
   });
 
   it("URL 完全由变量拼成、追不到字面量时不产节点", () => {
@@ -331,5 +335,157 @@ describe("API 链路的边界（合成项目）", () => {
     expect(result.apiNodes).toEqual([]);
     expect(result.fnNodes).toEqual([]);
     expect(result.edges).toEqual([]);
+  });
+});
+
+/**
+ * URL 前缀求值（设计文档 §6.11.1 L3）。
+ *
+ * 企业项目的 `fetch` 几乎不写完整路径，而是 `` `${API_PREFIX}/orders` ``，
+ * 常量还常常放在另一个模块、并带 `import.meta.env` 兜底。前缀决定的是
+ * 「这是哪个接口」，求不出来时整条边只能缺席——但必须告警，不能静默。
+ */
+describe("URL 前缀求值（跨模块常量）", () => {
+  it("同文件常量前缀：求值后进接口清单", () => {
+    const result = analyzeSynthetic({
+      "src/Orders.ts": `
+        const BASE = "/api";
+        export async function listOrders() {
+          return fetch(\`\${BASE}/orders\`);
+        }
+      `,
+    });
+
+    expect(apiIds(result)).toEqual(["api:GET:/api/orders"]);
+    expect(result.apiNodes[0]?.attrs.urlRaw).toBe("`${BASE}/orders`");
+  });
+
+  it("跨模块常量 + env 兜底：穿透 import 求值", () => {
+    const result = analyzeSynthetic({
+      "src/env.ts": `
+        export const API_PREFIX = import.meta.env.VITE_API_BASE ?? "/api";
+      `,
+      "src/Orders.ts": `
+        import { API_PREFIX } from "./env";
+        export async function listOrders() {
+          return fetch(\`\${API_PREFIX}/orders\`);
+        }
+      `,
+    });
+
+    // env 的值运行时才知道，取显式 fallback；不求值时宁可不算，也不能把
+    // `${API_PREFIX}/orders` 当成接口 url
+    expect(apiIds(result)).toEqual(["api:GET:/api/orders"]);
+    expect(result.warnings).toEqual([]);
+  });
+
+  it("import 别名不影响前缀求值", () => {
+    const result = analyzeSynthetic({
+      "src/env.ts": `export const BASE = "/v1";`,
+      "src/Orders.ts": `
+        import { BASE as ROOT } from "./env";
+        export async function listOrders() {
+          return fetch(\`\${ROOT}/orders\`);
+        }
+      `,
+    });
+
+    expect(apiIds(result)).toEqual(["api:GET:/v1/orders"]);
+  });
+
+  it("字面量拼接的前缀也能求值", () => {
+    const result = analyzeSynthetic({
+      "src/Orders.ts": `
+        const BASE = "/api" + "/v2";
+        export async function listOrders() {
+          return fetch(\`\${BASE}/orders\`);
+        }
+      `,
+    });
+
+    expect(apiIds(result)).toEqual(["api:GET:/api/v2/orders"]);
+  });
+
+  it("前缀求不出来时不产节点，但记 api_url_prefix_unresolved 告警", () => {
+    const result = analyzeSynthetic({
+      "src/Orders.ts": `
+        declare function buildBase(): string;
+        export async function listOrders() {
+          return fetch(\`\${buildBase()}/orders\`);
+        }
+      `,
+    });
+
+    // 函数返回值属于数据流分析，一期不求——求不出来就如实缺一条，不猜
+    expect(result.apiNodes).toEqual([]);
+    const warning = result.warnings.find((w) => w.code === "api_url_prefix_unresolved");
+    expect(warning).toBeDefined();
+    expect(warning?.severity).toBe("warning");
+    expect(warning?.file).toBe("src/Orders.ts");
+    // 告警里要能看到原始写法，否则用户不知道是哪个调用点没解析出来
+    expect(warning?.message).toContain("buildBase()");
+  });
+
+  it("前缀未求值且后面还有路径参数时，同样告警而不是产残片", () => {
+    const result = analyzeSynthetic({
+      "src/Orders.ts": `
+        declare const tenant: { base: string };
+        export async function getOrder(id: string) {
+          return fetch(\`\${tenant.base}/orders/\${id}\`);
+        }
+      `,
+    });
+
+    // `${tenant.base}` 是 URL 主体（前面没有 `/`，也不来自本函数参数），
+    // 主体定不下来就整条不进清单——不能把 `/orders/${…}` 当成一个真实接口
+    expect(result.apiNodes).toEqual([]);
+    expect(result.warnings.some((w) => w.code === "api_url_prefix_unresolved")).toBe(true);
+  });
+
+  it("路径参数不被误判成 URL 封装器", () => {
+    const result = analyzeSynthetic({
+      "src/Users.ts": `
+        export async function getUser(id: string) {
+          return fetch(\`/api/users/\${id}\`);
+        }
+      `,
+    });
+
+    // 这是请求点，不是封装器：`id` 之于这个 URL 就像 `/users/1` 里的 `1`。
+    // 若把它当封装器，真正的请求会被整条跳过且不告警。
+    expect(apiIds(result)).toEqual(["api:GET:/api/users/${…}"]);
+    expect(result.warnings).toEqual([]);
+  });
+
+  it("查询参数插值同样保留占位，不拆散 URL", () => {
+    const result = analyzeSynthetic({
+      "src/Users.ts": `
+        export async function searchUsers(status: string) {
+          return fetch(\`/api/users?status=\${status}\`);
+        }
+      `,
+    });
+
+    expect(apiIds(result)).toEqual(["api:GET:/api/users?status=${…}"]);
+  });
+
+  it("封装器的 URL 仍来自参数：路径参数修复不影响封装器识别", () => {
+    const result = analyzeSynthetic({
+      "src/http.ts": `
+        export function request(url: string) {
+          return fetch(\`\${url}?ts=\${Date.now()}\`);
+        }
+      `,
+      "src/Caller.tsx": `
+        import { request } from "./http";
+        export function Caller() {
+          request("/api/from-wrapper");
+          return <div />;
+        }
+      `,
+    });
+
+    // URL 主体是裸参数：调用点决定真实地址，接口产在调用点
+    expect(apiIds(result)).toEqual(["api:GET:/api/from-wrapper"]);
   });
 });
