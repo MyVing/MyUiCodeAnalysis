@@ -26,6 +26,7 @@ from app.git_client import GitClient, SubprocessGitClient
 from app.plugin_manager.registry import PluginRegistry, create_plugin_registry
 from app.requirement.llm import LLMClient, build_llm_client
 from app.requirement.service import RequirementLocateService
+from app.runtime.requirement_collect import RequirementCollectService
 from app.runtime.runner import RuntimeWorkerRunner, SubprocessRuntimeRunner
 from app.runtime.service import RuntimeService
 from app.services.project_service import ProjectService
@@ -169,3 +170,22 @@ RequirementLocateServiceDep = Annotated[
 ]
 RuntimeServiceDep = Annotated[RuntimeService, Depends(get_runtime_service)]
 ExploreServiceDep = Annotated[ExploreService, Depends(get_explore_service)]
+
+
+def get_requirement_collect_service(
+    requirements: Annotated[RequirementRepository, Depends(get_requirement_repository)],
+    analyses: Annotated[AnalysisRepository, Depends(get_analysis_repository)],
+    runtime_service: Annotated[RuntimeService, Depends(get_runtime_service)],
+    requirement_service: Annotated[
+        RequirementLocateService, Depends(get_requirement_locate_service)
+    ],
+    settings: SettingsDep,
+) -> RequirementCollectService:
+    return RequirementCollectService(
+        requirements, analyses, runtime_service, requirement_service, settings
+    )
+
+
+RequirementCollectServiceDep = Annotated[
+    RequirementCollectService, Depends(get_requirement_collect_service)
+]

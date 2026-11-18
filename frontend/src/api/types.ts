@@ -142,6 +142,29 @@ export interface RuntimeTaskList {
   items: RuntimeTask[];
 }
 
+/** 按需求采集输入：requirement 文本与 requirementTaskId 二选一；baseUrl 必填（页面需已在运行） */
+export interface RequirementCollectStart {
+  requirement?: string;
+  requirementTaskId?: string;
+  baseUrl: string;
+  dryRun?: boolean;
+  settleMs?: number;
+}
+
+/** 未能转成采集任务的页面，带机器可读原因（无路由 / 路由歧义 / 动态参数） */
+export interface SkippedRoute {
+  pageNodeId: string;
+  routePath?: string | null;
+  reason: string;
+  message: string;
+}
+
+export interface RequirementCollectResult {
+  requirementTaskId: string;
+  items: RuntimeTask[];
+  skipped: SkippedRoute[];
+}
+
 /** 需求定位输入：dryRun=true 只跑确定性召回（不调模型） */
 export interface RequirementLocateStart {
   requirement: string;

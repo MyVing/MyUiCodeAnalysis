@@ -86,6 +86,9 @@ class Settings(BaseSettings):
     # 即使打开，未配置 key 时也不会触发（llm_ready 为假）。
     llm_profile_enabled: bool = False
 
+    # 按需求采集：requirement 文本入口需要先等需求定位任务跑完（轮询间隔 0.3s）
+    requirement_collect_locate_timeout_seconds: float = 180.0
+
     @property
     def llm_ready(self) -> bool:
         return self.llm_enabled and bool(self.llm_api_key)

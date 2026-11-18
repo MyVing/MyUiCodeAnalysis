@@ -1,16 +1,27 @@
 """运行时采集 API，与 requirement 路由同构：
 
-  /projects/{id}/runtime-traces  项目维度：发起与列出
-  /runtime-tasks/{taskId}        任务维度：查询状态与采集产物
+/projects/{id}/runtime-traces  项目维度：发起与列出
+/runtime-tasks/{taskId}        任务维度：查询状态与采集产物
 """
 
 from fastapi import APIRouter, HTTPException, status
 
-from app.api.deps import ProjectServiceDep, RuntimeServiceDep
+from app.api.deps import (
+    ProjectServiceDep,
+    RequirementCollectServiceDep,
+    RuntimeServiceDep,
+)
 from app.api.v1.projects import require_project
 from app.contracts import RuntimeTrace
+from app.runtime.requirement_collect import RequirementCollectPreconditionError
 from app.runtime.service import RuntimePreconditionError
-from app.schemas import RuntimeStart, RuntimeTask, RuntimeTaskList
+from app.schemas import (
+    RequirementCollectResult,
+    RequirementCollectStart,
+    RuntimeStart,
+    RuntimeTask,
+    RuntimeTaskList,
+)
 
 router = APIRouter(tags=["runtime"])
 
@@ -18,6 +29,18 @@ _PRECONDITION_STATUS: dict[str, int] = {
     "missing_launch_source": status.HTTP_409_CONFLICT,
     "root_path_missing": status.HTTP_409_CONFLICT,
     "analysis_not_found": status.HTTP_404_NOT_FOUND,
+}
+
+_COLLECT_PRECONDITION_STATUS: dict[str, int] = {
+    "requirement_task_not_found": status.HTTP_404_NOT_FOUND,
+    "graph_missing": status.HTTP_404_NOT_FOUND,
+    "requirement_task_not_succeeded": status.HTTP_409_CONFLICT,
+    "requirement_locate_failed": status.HTTP_409_CONFLICT,
+    "requirement_locate_timeout": status.HTTP_409_CONFLICT,
+    "map_missing": status.HTTP_409_CONFLICT,
+    "missing_requirement_source": status.HTTP_409_CONFLICT,
+    "no_matched_pages": status.HTTP_409_CONFLICT,
+    "no_collectable_routes": status.HTTP_409_CONFLICT,
 }
 
 
@@ -46,9 +69,7 @@ async def start_runtime_collect(
         ) from None
 
 
-@router.get(
-    "/projects/{project_id}/runtime-traces", response_model=RuntimeTaskList
-)
+@router.get("/projects/{project_id}/runtime-traces", response_model=RuntimeTaskList)
 async def list_runtime_tasks(
     project_id: str,
     service: ProjectServiceDep,
@@ -58,14 +79,47 @@ async def list_runtime_tasks(
     return RuntimeTaskList(items=await runtime_service.list_tasks(project_id))
 
 
+@router.post(
+    "/projects/{project_id}/requirement-collects",
+    status_code=status.HTTP_200_OK,
+    response_model=RequirementCollectResult,
+    responses={
+        404: {"description": "项目 / 需求定位任务 / 静态图不存在"},
+        409: {"description": "需求定位未成功、没有匹配页面，或路由解析不出可访问 URL"},
+    },
+)
+async def start_requirement_collect(
+    project_id: str,
+    payload: RequirementCollectStart,
+    service: ProjectServiceDep,
+    collect_service: RequirementCollectServiceDep,
+) -> RequirementCollectResult:
+    """按需求采集：需求描述 → 定位页面 → 反查路由 → 逐页发起采集。
+
+    同步返回已创建的采集任务与被跳过的页面；每个采集任务在后台异步执行，
+    复用 /runtime-tasks/{taskId} 轮询。
+    """
+    project = await require_project(project_id, service)
+    try:
+        tasks, skipped, requirement_task_id = await collect_service.start(project, payload)
+    except RequirementCollectPreconditionError as error:
+        raise HTTPException(
+            status_code=_COLLECT_PRECONDITION_STATUS.get(error.code, status.HTTP_409_CONFLICT),
+            detail=error.message,
+        ) from None
+    return RequirementCollectResult(
+        requirementTaskId=requirement_task_id,
+        items=tasks,
+        skipped=skipped,
+    )
+
+
 @router.get(
     "/runtime-tasks/{task_id}",
     response_model=RuntimeTask,
     responses={404: {"description": "任务不存在"}},
 )
-async def get_runtime_task(
-    task_id: str, runtime_service: RuntimeServiceDep
-) -> RuntimeTask:
+async def get_runtime_task(task_id: str, runtime_service: RuntimeServiceDep) -> RuntimeTask:
     task = await runtime_service.get_task(task_id)
     if task is None:
         raise HTTPException(
@@ -83,9 +137,7 @@ async def get_runtime_task(
         409: {"description": "任务未成功完成"},
     },
 )
-async def get_runtime_trace(
-    task_id: str, runtime_service: RuntimeServiceDep
-) -> RuntimeTrace:
+async def get_runtime_trace(task_id: str, runtime_service: RuntimeServiceDep) -> RuntimeTrace:
     task = await runtime_service.get_task(task_id)
     if task is None:
         raise HTTPException(

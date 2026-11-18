@@ -16,6 +16,8 @@ import type {
   Project,
   ProjectCreate,
   ProjectGitCreate,
+  RequirementCollectStart,
+  RequirementCollectResult,
   RequirementLocateStart,
   RequirementTask,
   RequirementTaskList,
@@ -142,6 +144,13 @@ export const api = {
 
   getRuntimeTrace: (taskId: string) =>
     request<RuntimeTrace>(`/runtime-tasks/${taskId}/trace`),
+
+  /** 按需求采集：同步等待需求定位完成（可能较久），返回已创建的采集任务与被跳过的页面 */
+  startRequirementCollect: (projectId: string, payload: RequirementCollectStart) =>
+    request<RequirementCollectResult>(`/projects/${projectId}/requirement-collects`, {
+      method: "POST",
+      body: JSON.stringify(payload),
+    }),
 
   listPlugins: (projectId: string) =>
     request<PluginList>(`/projects/${projectId}/plugins`),

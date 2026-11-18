@@ -19,7 +19,13 @@ import { Link, useParams } from "react-router-dom";
 
 import { api } from "@/api/client";
 import { useAnalysisTask, useProject, useProjectGraph, useRuntimeTask } from "@/api/queries";
-import type { AnalysisStart, Framework, RuntimeStart } from "@/api/types";
+import type {
+  AnalysisStart,
+  Framework,
+  RequirementCollectResult,
+  RequirementCollectStart,
+  RuntimeStart,
+} from "@/api/types";
 import { ExplorePanel } from "@/components/ExplorePanel";
 import { GraphSidebar } from "@/components/GraphSidebar";
 import { NodeInspector } from "@/components/NodeInspector";
@@ -65,6 +71,10 @@ export default function WorkbenchPage() {
     settleMs: 3000,
   });
   const [activeRuntimeTaskId, setActiveRuntimeTaskId] = useState<string | null>(null);
+  // 运行时采集有两种入口：直接给地址，或给需求描述让后端定位页面再逐页采集
+  const [runtimeMode, setRuntimeMode] = useState<"direct" | "requirement">("direct");
+  const [reqCollectForm, setReqCollectForm] = useState({ requirement: "", baseUrl: "" });
+  const [reqCollectResult, setReqCollectResult] = useState<RequirementCollectResult | null>(null);
 
   const project = projectQuery.data;
   const isGitProject = project?.source === "git";
@@ -138,6 +148,25 @@ export default function WorkbenchPage() {
   const runtimeTaskQuery = useRuntimeTask(activeRuntimeTaskId);
   const runtimeTask = runtimeTaskQuery.data;
   const runtimeActive = runtimeTask?.status === "queued" || runtimeTask?.status === "running";
+
+  // 按需求采集：同步等待需求定位完成（可能数十秒），再逐页发起采集任务
+  const requirementCollect = useMutation({
+    mutationFn: () => {
+      const payload: RequirementCollectStart = {
+        requirement: reqCollectForm.requirement.trim(),
+        baseUrl: reqCollectForm.baseUrl.trim(),
+      };
+      return api.startRequirementCollect(projectId, payload);
+    },
+    onSuccess: (result) => {
+      setReqCollectResult(result);
+      // 跟踪第一个采集任务，复用既有的状态横幅与图刷新
+      const firstTask = result.items[0];
+      if (firstTask) {
+        setActiveRuntimeTaskId(firstTask.id);
+      }
+    },
+  });
 
   useEffect(() => {
     // 采集成功后后端已自动产出合并图（kind=merged），刷新即可看到运行时证据
@@ -369,78 +398,190 @@ export default function WorkbenchPage() {
 
       {showRuntime && (
         <div className="shrink-0 border-b border-white/[0.09] bg-[#151b25]/70 px-4 py-3">
-          <div className="grid gap-3 md:grid-cols-4">
-            <label className="flex flex-col gap-1 md:col-span-2">
-              <span className="app-label">
-                启动命令（托管 dev server，采集完自动停止）
-              </span>
-              <input
-                value={runtimeOptions.command ?? ""}
-                onChange={(event) =>
-                  setRuntimeOptions((current) => ({ ...current, command: event.target.value }))
-                }
-                placeholder="npm run dev"
-                className={`${INPUT_CLASS} font-mono`}
-              />
-            </label>
-            <label className="flex flex-col gap-1 md:col-span-1">
-              <span className="app-label">或页面地址（已在运行的页面）</span>
-              <input
-                value={runtimeOptions.url ?? ""}
-                onChange={(event) =>
-                  setRuntimeOptions((current) => ({ ...current, url: event.target.value }))
-                }
-                placeholder="http://localhost:5199/"
-                className={`${INPUT_CLASS} font-mono`}
-              />
-            </label>
-            <label className="flex flex-col gap-1">
-              <span className="app-label">静默观察窗口（ms）</span>
-              <input
-                type="number"
-                min={100}
-                max={120000}
-                step={100}
-                value={runtimeOptions.settleMs ?? 3000}
-                onChange={(event) =>
-                  setRuntimeOptions((current) => ({
-                    ...current,
-                    settleMs: event.target.valueAsNumber,
-                  }))
-                }
-                className={INPUT_CLASS}
-              />
-            </label>
+          <div className="mb-2 flex items-center gap-1">
+            {(
+              [
+                ["direct", "直接采集"],
+                ["requirement", "按需求采集"],
+              ] as const
+            ).map(([mode, label]) => (
+              <button
+                key={mode}
+                type="button"
+                onClick={() => setRuntimeMode(mode)}
+                className={`rounded-lg border px-2.5 py-1 text-[11px] transition ${
+                  runtimeMode === mode
+                    ? "border-indigo-400/30 bg-indigo-400/10 text-indigo-200"
+                    : "border-white/[0.09] text-slate-400 hover:text-slate-200"
+                }`}
+              >
+                {label}
+              </button>
+            ))}
           </div>
-          <div className="mt-2 flex flex-wrap items-center gap-2">
-            <button
-              type="button"
-              disabled={
-                runtimeCollect.isPending ||
-                runtimeActive ||
-                ((runtimeOptions.command ?? "").trim() === "" &&
-                  (runtimeOptions.url ?? "").trim() === "")
-              }
-              onClick={() => runtimeCollect.mutate()}
-              className="app-btn-ghost"
-            >
-              {runtimeCollect.isPending || runtimeActive ? (
-                <Loader2 size={13} className="animate-spin" />
-              ) : (
-                <Radar size={13} />
+
+          {runtimeMode === "direct" ? (
+            <>
+              <div className="grid gap-3 md:grid-cols-4">
+                <label className="flex flex-col gap-1 md:col-span-2">
+                  <span className="app-label">
+                    启动命令（托管 dev server，采集完自动停止）
+                  </span>
+                  <input
+                    value={runtimeOptions.command ?? ""}
+                    onChange={(event) =>
+                      setRuntimeOptions((current) => ({ ...current, command: event.target.value }))
+                    }
+                    placeholder="npm run dev"
+                    className={`${INPUT_CLASS} font-mono`}
+                  />
+                </label>
+                <label className="flex flex-col gap-1 md:col-span-1">
+                  <span className="app-label">或页面地址（已在运行的页面）</span>
+                  <input
+                    value={runtimeOptions.url ?? ""}
+                    onChange={(event) =>
+                      setRuntimeOptions((current) => ({ ...current, url: event.target.value }))
+                    }
+                    placeholder="http://localhost:5199/"
+                    className={`${INPUT_CLASS} font-mono`}
+                  />
+                </label>
+                <label className="flex flex-col gap-1">
+                  <span className="app-label">静默观察窗口（ms）</span>
+                  <input
+                    type="number"
+                    min={100}
+                    max={120000}
+                    step={100}
+                    value={runtimeOptions.settleMs ?? 3000}
+                    onChange={(event) =>
+                      setRuntimeOptions((current) => ({
+                        ...current,
+                        settleMs: event.target.valueAsNumber,
+                      }))
+                    }
+                    className={INPUT_CLASS}
+                  />
+                </label>
+              </div>
+              <div className="mt-2 flex flex-wrap items-center gap-2">
+                <button
+                  type="button"
+                  disabled={
+                    runtimeCollect.isPending ||
+                    runtimeActive ||
+                    ((runtimeOptions.command ?? "").trim() === "" &&
+                      (runtimeOptions.url ?? "").trim() === "")
+                  }
+                  onClick={() => runtimeCollect.mutate()}
+                  className="app-btn-ghost"
+                >
+                  {runtimeCollect.isPending || runtimeActive ? (
+                    <Loader2 size={13} className="animate-spin" />
+                  ) : (
+                    <Radar size={13} />
+                  )}
+                  开始采集
+                </button>
+                <span className="text-[11px] text-slate-400">
+                  启动浏览器访问页面，记录网络 / Console / 组件挂载，产物与静态图合并
+                </span>
+              </div>
+              {runtimeCollect.isError && (
+                <p className="mt-2 text-[11px] text-rose-300">
+                  {runtimeCollect.error instanceof Error
+                    ? runtimeCollect.error.message
+                    : "发起采集失败"}
+                </p>
               )}
-              开始采集
-            </button>
-            <span className="text-[11px] text-slate-400">
-              启动浏览器访问页面，记录网络 / Console / 组件挂载，产物与静态图合并
-            </span>
-          </div>
-          {runtimeCollect.isError && (
-            <p className="mt-2 text-[11px] text-rose-300">
-              {runtimeCollect.error instanceof Error
-                ? runtimeCollect.error.message
-                : "发起采集失败"}
-            </p>
+            </>
+          ) : (
+            <>
+              <div className="grid gap-3 md:grid-cols-4">
+                <label className="flex flex-col gap-1 md:col-span-2">
+                  <span className="app-label">
+                    需求描述（先定位页面，再按 IR 路由逐页采集）
+                  </span>
+                  <textarea
+                    value={reqCollectForm.requirement}
+                    onChange={(event) =>
+                      setReqCollectForm((current) => ({
+                        ...current,
+                        requirement: event.target.value,
+                      }))
+                    }
+                    placeholder="例如：验证用户列表的搜索交互"
+                    rows={2}
+                    className={INPUT_CLASS}
+                  />
+                </label>
+                <label className="flex flex-col gap-1">
+                  <span className="app-label">站点地址（已在运行，作为路由拼接前缀）</span>
+                  <input
+                    value={reqCollectForm.baseUrl}
+                    onChange={(event) =>
+                      setReqCollectForm((current) => ({
+                        ...current,
+                        baseUrl: event.target.value,
+                      }))
+                    }
+                    placeholder="http://localhost:5199"
+                    className={`${INPUT_CLASS} font-mono`}
+                  />
+                </label>
+              </div>
+              <div className="mt-2 flex flex-wrap items-center gap-2">
+                <button
+                  type="button"
+                  disabled={
+                    requirementCollect.isPending ||
+                    runtimeActive ||
+                    reqCollectForm.requirement.trim() === "" ||
+                    reqCollectForm.baseUrl.trim() === ""
+                  }
+                  onClick={() => requirementCollect.mutate()}
+                  className="app-btn-ghost"
+                >
+                  {requirementCollect.isPending ? (
+                    <Loader2 size={13} className="animate-spin" />
+                  ) : (
+                    <Radar size={13} />
+                  )}
+                  定位并采集
+                </button>
+                <span className="text-[11px] text-slate-400">
+                  需求定位可能需要较长时间；无路由 / 动态参数的页面会跳过并说明原因
+                </span>
+              </div>
+              {requirementCollect.isPending && (
+                <p className="mt-2 text-[11px] text-indigo-300">正在定位需求对应的页面…</p>
+              )}
+              {requirementCollect.isError && (
+                <p className="mt-2 text-[11px] text-rose-300">
+                  {requirementCollect.error instanceof Error
+                    ? requirementCollect.error.message
+                    : "发起按需求采集失败"}
+                </p>
+              )}
+              {reqCollectResult && (
+                <div className="mt-2 space-y-1 text-[11px] text-slate-300">
+                  <p>
+                    已创建 {reqCollectResult.items.length} 个采集任务
+                    {reqCollectResult.skipped.length > 0 &&
+                      `，跳过 ${reqCollectResult.skipped.length} 个页面`}
+                    （首个任务进度见下方横幅）
+                  </p>
+                  {reqCollectResult.skipped.map((item) => (
+                    <p key={item.pageNodeId} className="text-amber-300/80">
+                      跳过 {item.pageNodeId}
+                      {item.routePath ? `（${item.routePath}）` : ""}：{item.reason} —{" "}
+                      {item.message}
+                    </p>
+                  ))}
+                </div>
+              )}
+            </>
           )}
         </div>
       )}

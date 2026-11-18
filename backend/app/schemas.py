@@ -242,6 +242,58 @@ class RuntimeTaskList(ApiModel):
     items: list[RuntimeTask] = Field(default_factory=list)
 
 
+class RequirementCollectStart(ApiModel):
+    """按需求采集：需求描述 → 定位页面 → 反查路由 → 逐页发起运行时采集。
+
+    requirement 与 requirement_task_id 二选一：前者先跑一次需求定位（需配置模型），
+    后者复用已完成定位任务的 RequirementMap。注意 `dryRun=True` 的定位只跑
+    确定性召回、`matches` 必为空，会导致 no_matched_pages——文本入口请保持
+    dryRun=False。
+
+    baseUrl 必填且服务需已在运行——采集走 url 直连模式；托管 dev server
+    模式（command）Worker 只会访问根路径，无法定位到具体路由，不在本入口范围。
+    """
+
+    requirement: str | None = Field(default=None, max_length=10000)
+    requirement_task_id: str | None = Field(default=None, max_length=128)
+    base_url: str = Field(max_length=2048)
+    dry_run: bool = False
+    settle_ms: int | None = Field(default=None, ge=100, le=120_000)
+
+    @field_validator("requirement")
+    @classmethod
+    def strip_requirement(cls, value: str | None) -> str | None:
+        if value is None:
+            return None
+        stripped = value.strip()
+        return stripped or None
+
+    @field_validator("base_url")
+    @classmethod
+    def validate_base_url(cls, value: str) -> str:
+        stripped = value.strip()
+        if not stripped.startswith(("http://", "https://")):
+            raise ValueError("baseUrl 必须以 http:// 或 https:// 开头")
+        return stripped
+
+
+class SkippedRoute(ApiModel):
+    """未能转成采集任务的目标页面，带机器可读原因。"""
+
+    page_node_id: str
+    route_path: str | None = None
+    reason: str
+    message: str
+
+
+class RequirementCollectResult(ApiModel):
+    """一次按需求采集的编排结果：已发起的任务 + 被跳过的页面（各自带原因）。"""
+
+    requirement_task_id: str
+    items: list[RuntimeTask] = Field(default_factory=list)
+    skipped: list[SkippedRoute] = Field(default_factory=list)
+
+
 class ExploreStart(ApiModel):
     """一次 AI 自动探索的输入。url 与 command 至少给一个（与 RuntimeStart 同一约定）。
 
