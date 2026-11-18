@@ -471,3 +471,112 @@ describe("路由节点的边界（合成项目）", () => {
     expect(routeByPath(result, "/users")).toBeDefined();
   });
 });
+
+describe("路由标题提取（差距表 #4）", () => {
+  it("对象式路由表的 title 字面量进 attrs.title", () => {
+    const result = analyzeSynthetic({
+      "src/router.tsx": `
+        import { createBrowserRouter } from "react-router-dom";
+        import { UserList } from "./Pages";
+        export const router = createBrowserRouter([
+          { path: "/users", element: <UserList />, title: "用户列表" },
+        ]);
+      `,
+    });
+
+    expect(routeByPath(result, "/users").attrs.title).toBe("用户列表");
+  });
+
+  it("react-router 的 handle.title 约定被识别", () => {
+    const result = analyzeSynthetic({
+      "src/router.tsx": `
+        import { createBrowserRouter } from "react-router-dom";
+        import { UserList } from "./Pages";
+        export const router = createBrowserRouter([
+          { path: "/users", element: <UserList />, handle: { title: "订单管理" } },
+        ]);
+      `,
+    });
+
+    expect(routeByPath(result, "/users").attrs.title).toBe("订单管理");
+  });
+
+  it("label / name 是菜单配置里常见的标题键，同样收", () => {
+    const result = analyzeSynthetic({
+      "src/router.tsx": `
+        import { createBrowserRouter } from "react-router-dom";
+        import { UserList, UserDetail } from "./Pages";
+        export const router = createBrowserRouter([
+          { path: "/users", element: <UserList />, label: "用户管理" },
+          { path: "/users/detail", element: <UserDetail />, name: "用户详情" },
+        ]);
+      `,
+    });
+
+    expect(routeByPath(result, "/users").attrs.title).toBe("用户管理");
+    expect(routeByPath(result, "/users/detail").attrs.title).toBe("用户详情");
+  });
+
+  it("标题不是字符串字面量时跳过，不编造也不告警", () => {
+    const result = analyzeSynthetic({
+      "src/router.tsx": `
+        import { createBrowserRouter } from "react-router-dom";
+        import { UserList } from "./Pages";
+        const menu = { users: "用户列表" };
+        export const router = createBrowserRouter([
+          { path: "/users", element: <UserList />, title: menu.users },
+        ]);
+      `,
+    });
+
+    expect(routeByPath(result, "/users").attrs.title).toBeUndefined();
+    expect(
+      result.warnings.some((warning) => warning.message.includes("标题")),
+    ).toBe(false);
+  });
+
+  it("JSX 式 <Route title> 被提取", () => {
+    const result = analyzeSynthetic({
+      "src/router.tsx": `
+        import { Routes, Route } from "react-router-dom";
+        import { UserList } from "./Pages";
+        export function AppRouter() {
+          return (
+            <Routes>
+              <Route path="/users" element={<UserList />} title="用户列表" />
+            </Routes>
+          );
+        }
+      `,
+    });
+
+    expect(routeByPath(result, "/users").attrs.title).toBe("用户列表");
+  });
+
+  it("index 声明带标题而主声明没有时，合并后标题补上", () => {
+    const result = analyzeSynthetic({
+      "src/router.tsx": `
+        import { createBrowserRouter } from "react-router-dom";
+        import { Layout, UserList } from "./Pages";
+        export const router = createBrowserRouter([
+          {
+            path: "/users",
+            element: <Layout />,
+            children: [{ path: "index", element: <UserList />, title: "用户列表" }],
+          },
+        ]);
+      `,
+    });
+
+    expect(routeByPath(result, "/users").attrs.title).toBe("用户列表");
+  });
+
+  it("Next 文件约定产出的路由没有 title 属性", () => {
+    const result = analyzeSynthetic(
+      { "app/users/page.tsx": "export default function Users() { return null; }" },
+      "next",
+    );
+
+    expect(routeByPath(result, "/users").attrs.title).toBeUndefined();
+  });
+});

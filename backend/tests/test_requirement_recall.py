@@ -245,6 +245,52 @@ def test_recall_explains_every_point_with_signals(user_graph: IRGraph) -> None:
     assert SignalKind.uiText in kinds
 
 
+def test_recall_uses_route_title_as_identity_signal() -> None:
+    """差距表 #4：「订单管理页」对不上 /order/list，但能对上路由标题。
+
+    标题以 routeTitle 信号参与打分，并进入 quote_corpus——模型可以把标题
+    作为引文，服务端照样能校验。
+    """
+    page_node = _page("src/pages/OrderList.tsx#OrderList", "OrderList", texts=["订单列表"])
+    route_node = _node(
+        "src/router.tsx#/order/list",
+        NodeKind.route,
+        "/order/list",
+        file="src/router.tsx",
+        attrs={"path": "/order/list", "title": "订单管理"},
+    )
+    result = recall(
+        _graph([page_node, route_node], [_edge(route_node.id, page_node.id, EdgeKind.renders)]),
+        decompose("订单管理")[0].terms,
+    )
+
+    assert result.candidates, "路由标题命中时应当召回页面"
+    detail = result.candidates[0]
+    assert (SignalKind.routeTitle, "订单管理") in {
+        (signal.kind, signal.value) for signal in detail.candidate.signals
+    }
+    assert "订单管理" in detail.quote_corpus
+
+
+def test_recall_ignores_blank_route_title() -> None:
+    """空标题 / 非字符串不产信号——ast-worker 只收字面量，这里不做二次推断。"""
+    page_node = _page("src/pages/OrderList.tsx#OrderList", "OrderList", texts=["订单列表"])
+    route_node = _node(
+        "src/router.tsx#/order/list",
+        NodeKind.route,
+        "/order/list",
+        file="src/router.tsx",
+        attrs={"path": "/order/list", "title": "   "},
+    )
+    result = recall(
+        _graph([page_node, route_node], [_edge(route_node.id, page_node.id, EdgeKind.renders)]),
+        decompose("订单管理")[0].terms,
+    )
+
+    detail = next(item for item in result.candidates if item.candidate.nodeId == page_node.id)
+    assert all(signal.kind is not SignalKind.routeTitle for signal in detail.candidate.signals)
+
+
 def test_recall_uses_props_description_as_evidence(user_graph: IRGraph) -> None:
     """`是否显示筛选栏` 是 props 的 JSDoc，只有它能证明 showFilter 与「筛选」相关。"""
     result = recall(user_graph, decompose("筛选")[0].terms)

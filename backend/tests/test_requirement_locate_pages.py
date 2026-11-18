@@ -434,6 +434,11 @@ async def test_locate_flags_shared_quote_as_not_discriminative() -> None:
     assert flagged
     assert second.id in flagged[0].message
 
+    # 差距表 #24：歧义引文降权（与 judge 路径同一份规则）
+    match = outcome.matches[0]
+    assert match.confidence == pytest.approx(0.6 * 0.8)
+    assert match.modelConfidence == 0.6
+
 
 async def test_locate_defers_on_non_retryable_error() -> None:
     source = _orders_graph()

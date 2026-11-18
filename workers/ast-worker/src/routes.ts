@@ -199,6 +199,12 @@ interface CollectedRoute {
   loc: { line: number; col: number };
   /** 解析到的页面组件 id；null 表示只产节点不产边 */
   pageComponentId: string | null;
+  /**
+   * 路由 / 菜单标题（`title` / `label` / `name` 属性，或 react-router 的
+   * `handle.title`）。需求写的是「订单管理页」，代码里只有 `/order/list`，
+   * 没有标题就永远对不上。取不到时为 null——标题是可选信息，不编造。
+   */
+  title: string | null;
 }
 
 /** 同一 nodeId 下累积的声明。 */
@@ -231,6 +237,10 @@ class RouteCollector {
     if (existing) {
       if (route.index) existing.index = true;
       if (route.pageComponentId !== null) existing.pageComponentIds.add(route.pageComponentId);
+      // 同一路径的 index 声明可能带标题而主声明没有：标题补上，不互相覆盖
+      if (existing.primary.title === null && route.title !== null) {
+        existing.primary.title = route.title;
+      }
       return;
     }
 
@@ -292,6 +302,7 @@ class RouteCollector {
           framework: route.framework,
           params: extractParams(route.path),
           ...(bucket.index ? { index: true } : {}),
+          ...(bucket.primary.title !== null ? { title: bucket.primary.title } : {}),
         },
         evidence: [evidence],
       });
@@ -365,6 +376,33 @@ function resolveRouteArray(node: Node, depth = 0): ArrayLiteralExpression | null
     }
   }
 
+  return null;
+}
+
+/**
+ * 从路由对象里取标题字面量。
+ *
+ * 三个属性名都认：`title` 最通用，`label` / `name` 常出现在「路由表顺带当
+ * 菜单配置用」的项目里；react-router 的官方约定 `handle.title` 也一并收。
+ * 只收字符串字面量——`t("menu.order")` 这类表达式静态求不出值，不编造。
+ * 标题是可选信息，取不到就返回 null，不告警。
+ */
+function routeTitleLiteral(element: Node): string | null {
+  if (!MorphNode.isObjectLiteralExpression(element)) return null;
+  for (const key of ["title", "label", "name"] as const) {
+    const prop = element.getProperty(key);
+    if (MorphNode.isPropertyAssignment(prop)) {
+      const literal = literalString(prop.getInitializer() ?? null);
+      if (literal !== null) return literal;
+    }
+  }
+  const handleProp = element.getProperty("handle");
+  if (MorphNode.isPropertyAssignment(handleProp)) {
+    const handle = handleProp.getInitializer();
+    if (handle && MorphNode.isObjectLiteralExpression(handle)) {
+      return routeTitleLiteral(handle);
+    }
+  }
   return null;
 }
 
@@ -465,6 +503,7 @@ function walkRouteObjects(
       file: relativeFile,
       loc: locOf(pathProp ?? element),
       pageComponentId,
+      title: routeTitleLiteral(element),
     });
 
     if (childrenProp !== undefined && MorphNode.isPropertyAssignment(childrenProp)) {
@@ -591,6 +630,8 @@ function walkRouteElements(
 
     const elementAttr = jsxAttribute(node, "element");
     const componentAttr = jsxAttribute(node, "component") ?? jsxAttribute(node, "Component");
+    // JSX 形态没有 handle 约定，只认 title 属性（有的项目把菜单名写在 <Route> 上）
+    const titleAttr = jsxAttribute(node, "title");
 
     const pageComponentId =
       resolvePageComponent(
@@ -611,6 +652,7 @@ function walkRouteElements(
       file: relativeFile,
       loc: locOf(pathAttr ?? node),
       pageComponentId,
+      title: titleAttr ? literalString(attributeValueNode(titleAttr)) : null,
     });
   }
 }
@@ -760,6 +802,8 @@ export function analyzeRoutes(input: RouteAnalysisInput): RouteAnalysisResult {
         // Next 没有 path 字面量，位置取页面组件声明处；组件缺失时退回文件头
         loc: pageComponent?.loc ?? { line: 1, col: 1 },
         pageComponentId,
+        // Next 的标题在 metadata / generateMetadata 里，是另一个分析器的活，这里不猜
+        title: null,
       });
     }
   }

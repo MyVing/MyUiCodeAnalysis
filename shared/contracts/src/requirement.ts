@@ -6,10 +6,10 @@
  */
 
 /**
- * 召回信号来源。前端按此分类展示「为什么这个页面被选为候选」。semanticRank 是 AI 定位给出的名次（value 形如 rank=2）——只落名次不落分数：语义分的绝对值没有解释力，「语义路排第 2」才能被人理解和质疑
+ * 召回信号来源。前端按此分类展示「为什么这个页面被选为候选」。routeTitle 是路由 / 菜单标题（route.attrs.title，来自路由表的 title / label / name 字面量或 react-router 的 handle.title）。semanticRank 是 AI 定位给出的名次（value 形如 rank=2）——只落名次不落分数：语义分的绝对值没有解释力，「语义路排第 2」才能被人理解和质疑
  */
 export type SignalKind =
-  "routePath" | "componentName" | "uiText" | "apiUrl" | "propName" | "propDescription" | "semanticRank";
+  "routePath" | "routeTitle" | "componentName" | "uiText" | "apiUrl" | "propName" | "propDescription" | "semanticRank";
 export type Severity = "error" | "warning" | "info";
 /**
  * 该段在链路里的语义角色。起点恒为 element；元素的事件处理函数是 handler；处理函数写入的状态、调用的接口、跳转的路由分别是 state / api / route；hook 是 handler 写到 hook 内部状态的情形

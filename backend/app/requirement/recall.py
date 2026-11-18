@@ -32,11 +32,14 @@ from app.requirement.text import ascii_words, contains_cjk, normalize
 
 # 各信号的权重。排序依据：越贴近「这个页面在做什么」的信号权重越高。
 #   route path / 组件名 —— 页面身份的声明式来源
+#   路由标题            —— 菜单名 / handle.title，同为身份来源；但可能过时或与
+#                          实际内容漂移（改了路由没改标题），比路径低半档
 #   文案 / API url    —— 页面行为的直接证据
 #   props 描述        —— 作者写的注释，最接近需求原文
 #   props 字段名      —— 页面能力的间接证据
 SIGNAL_WEIGHTS: dict[SignalKind, float] = {
     SignalKind.routePath: 1.0,
+    SignalKind.routeTitle: 0.9,
     SignalKind.componentName: 1.0,
     SignalKind.uiText: 0.9,
     SignalKind.apiUrl: 0.8,
@@ -298,7 +301,13 @@ def _neighbor_evidences(
     if node is None:
         return []
     if node.kind is NodeKind.route:
-        return [_node_evidence(node, SignalKind.routePath, node.name)]
+        evidences = [_node_evidence(node, SignalKind.routePath, node.name)]
+        # 路由 / 菜单标题：需求写「订单管理页」时，路径对不上但标题对得上。
+        # 标题由 ast-worker 只收字面量得来，这里不再做任何推断。
+        title = node.attrs.get("title")
+        if isinstance(title, str) and title.strip():
+            evidences.append(_node_evidence(node, SignalKind.routeTitle, title))
+        return evidences
     # 页面 calls 的工具函数背后可能还有接口：页面 → fn → api，只多走这一跳
     return [
         _node_evidence(api, SignalKind.apiUrl, api.attrs["url"])

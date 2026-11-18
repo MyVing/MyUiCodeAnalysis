@@ -9,7 +9,8 @@
 未通过校验的输出进 dropped 而不是静默丢弃——审核模型是否在幻想，只能靠这份记录。
 
 模型自报的置信度不透传：落库置信度硬上限 0.6（AI 推断永远不等于语法事实），
-原始值记在 modelConfidence 里供比对封顶是否生效。
+引文歧义（同段原文命中多个候选）时再按 0.8 系数降权——排序直接分辨强弱，
+原始值记在 modelConfidence 里供比对封顶与降权是否生效。
 
 ## 本模块现在的角色
 
@@ -50,6 +51,11 @@ _UNMATCHED_CANDIDATES = 3
 
 # 落库置信度硬上限，与契约约定一致
 MAX_CONFIDENCE = 0.6
+
+# 引文歧义的降权系数：同段原文命中多个候选时，引文只能证明「这句话存在」，
+# 不能证明归属。乘 0.8 把这类匹配压到同置信度的非歧义匹配之下，审核者看排序
+# 就能分辨强弱，不必逐条读 quote_not_discriminative 告警（差距表 #24）。
+AMBIGUOUS_QUOTE_SCALE = 0.8
 
 # 子串兜底的最小长度。更短的片段（「列表」「状态」「的」）能命中几乎一切语料，
 # 这样的"校验"等于不校验。
@@ -204,6 +210,17 @@ def _build_user_prompt(
         f"功能点：\n{feature_lines}\n\n"
         f"页面候选（按召回得分降序）：\n{candidates_json}"
     )
+
+
+def capped_confidence(model_confidence: float, *, quote_ambiguous: bool) -> float:
+    """落库置信度：硬上限 0.6；引文歧义时再按系数降权（差距表 #24）。
+
+    降权发生在封顶之后，结果必然仍在 0.6 以内，不与「AI 推断封顶 0.6」冲突；
+    模型原始值始终记在 modelConfidence 里，降权幅度可审计。
+    两条判定路径（页面级 judge / 链路级 locate）共用本函数——降权规则只能有一份。
+    """
+    value = min(model_confidence, MAX_CONFIDENCE)
+    return value * AMBIGUOUS_QUOTE_SCALE if quote_ambiguous else value
 
 
 def parse_json(text: str) -> dict[str, object] | None:
@@ -466,7 +483,8 @@ def _validate_match(
                 severity=Severity.warning,
                 message=(
                     f"引文「{quote_match.corpus_text}」同样出现在其他候选里，"
-                    f"不能单独证明页面归属：{', '.join(shared_with)}"
+                    f"不能单独证明页面归属：{', '.join(shared_with)}；"
+                    f"已按 {AMBIGUOUS_QUOTE_SCALE} 系数对该匹配降权"
                 ),
                 featureId=feature_id,
             )
@@ -489,7 +507,7 @@ def _validate_match(
             featureId=feature_id,
             pageNodeId=node_id,
             routeId=detail.candidate.routeId,
-            confidence=min(model_confidence, MAX_CONFIDENCE),
+            confidence=capped_confidence(model_confidence, quote_ambiguous=bool(shared_with)),
             modelConfidence=model_confidence,
             # 落库的是语料原文，不是模型写的片段：证据必须能在代码里原样找到
             quote=quote_match.corpus_text,

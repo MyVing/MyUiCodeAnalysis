@@ -473,7 +473,7 @@ element（有 viewText / columns / tag）
 | 信号 | 来源 | 现状 | 设计 |
 | --- | --- | --- | --- |
 | `route.path` | 路由配置 / Next 文件约定 | 已有 | 归一化后作为主键 |
-| `route.title` | react-router `handle.title` / `meta.title`；Next `metadata.title` / `generateMetadata` | **未提取** | 加入 `route.attrs.title`，作为需求召回的高权重信号 |
+| `route.title` | react-router `handle.title` / `meta.title`；Next `metadata.title` / `generateMetadata` | **已提取**（路由表 `title` / `label` / `name` 字面量与 `handle.title`；JSX 收 `title` 属性） | 加入 `route.attrs.title`，作为需求召回的高权重信号（`routeTitle`，0.9）；Next 的 `metadata` 提取仍待做 |
 | 菜单名 | 项目菜单配置（antd `Menu items`、`menu.json` 等） | **未提取** | 通过 `mapping.json` 的 `menuFiles` 白名单声明后提取 `label → path`，补「菜单名 ↔ 路由」映射 |
 | 页面标题 | 首个 `<h1>`、`<title>`、`document.title = ...` | `view.ts` 已收 `<h1>` 元素 | 聚合为 `component.attrs.pageTitle` |
 | layout / page | 路由 element 是否含 `<Outlet>`；嵌套路由层级 | **未区分** | route 增加 `pageComponentId` 与 `layoutComponentIds`；优先取不含 `Outlet` 的叶子路由组件 |
@@ -971,7 +971,7 @@ f2: ...
 >
 > 命中后落库的是**语料里那段原文**而非模型写的片段：`Match.quote` 与 `VerifiedEvidence.quote` 必须能在代码里原样找到，否则前端点开证据看到的是一句代码里不存在的话。截取命中附一条 `quote_partial_match`（info）留痕，便于复核模型究竟引了哪一段。
 
-**边界情况显式处理**：同一段原文在多个候选里都存在时（例如多个页面都有「状态」），命中只能证明这句话存在过，不能证明归属。此时匹配**保留**（模型还有 reason 与自报置信度），但附 `quote_not_discriminative`（warning）列出共享该引文的其他候选。降置信度会与「AI 统一封顶 0.6」的规则冲突、让排序不可解释，故选择「保留 + 标注」。
+**边界情况显式处理**：同一段原文在多个候选里都存在时（例如多个页面都有「状态」），命中只能证明这句话存在过，不能证明归属。此时匹配**保留**（模型还有 reason 与自报置信度），但附 `quote_not_discriminative`（warning）列出共享该引文的其他候选，并**对该匹配置信度按 0.8 系数降权**（`judge.capped_confidence`，judge / locate 两条路径共用）：降权发生在 0.6 封顶之后，不与「AI 统一封顶 0.6」冲突；`modelConfidence` 保留原始值，降权幅度可审计。这样审核者看排序就能分辨强弱，不必逐条读告警。
 
 被拒输出**进 `dropped` 而不是静默丢弃**：审核模型是否在幻想，只能靠这份记录。
 
@@ -1585,7 +1585,7 @@ dry-run 默认开启：模型产出的计划先给用户审阅，再决定是否
 | 1 | 需求文档只支持纯文本 | `features.py` 按行/句切分，无标题层级、表格、字符偏移、验收标准 | 文档里的接口表、字段表、页面名被当成普通中文词，最可靠的定位信息丢失 | 6.13 |
 | 2 | 没有锚点抽取 | 路由 / 接口 / 组件名 / 字段名没有在拆解前被结构化识别 | 本可 0.95 的确定性定位退化成 ≤0.6 的语义猜测 | 6.13 |
 | 3 | 没有接口反向索引 | 6.11 此前只有交叉引用、没有正文 | 无法回答「这个接口在哪个页面被调用」 | 6.11 |
-| 4 | `route.title` / 菜单名未提取 | `route` 只有 `path` / `params` | 「订单管理页」无法命中 `/order/list` | 4.1.6 |
+| 4 | ~~route.title~~ / 菜单名未提取 | **已修（route.title）**：`routes.ts` 从路由表提取 `title` / `label` / `name` 字面量与 react-router `handle.title`（JSX 形态收 `title` 属性），写入 `route.attrs.title`；召回新增 `routeTitle` 信号（0.9）并进引文语料，「订单管理页」可命中带标题的路由。菜单配置提取（`mapping.json` 的 `menuFiles` 白名单）仍待做 | 4.1.6 |
 | 5 | layout / page 未区分 | 同一 path 下按遍历顺序取页面组件 | 可能把布局组件当成页面，0.9 置信度也救不回来 | 4.1.6 / 6.12 |
 | 6 | ~~没有 `navigates` 边~~ | **已修**：`navigate.ts` 产出 `navigates` 边 | — | 4.1.5 / 6.14 |
 | 7 | 元素级匹配缺失 | `Match` 只有 `pageNodeId` | 只能回答「哪个页面」，不能回答「哪个按钮 / 哪一列」 | 6.14 / 6.15 |
@@ -1605,7 +1605,7 @@ dry-run 默认开启：模型产出的计划先给用户审阅，再决定是否
 | 21 | 无任务队列 | `asyncio.create_task` + boot recovery 置 failed | 重启丢任务，用户需手工重跑；长任务无排队与背压 | P1 延伸 |
 | 22 | P4 图对齐的 id 稳定性未定义 | 节点 id = 文件路径 + 组件名 | 目录重构 / 组件重命名会让所有节点在 diff 中"全删全增" | P4 设计前置 |
 | 23 | ~~组件内 hook 处理函数的请求归属错位~~ | **已修**：`ownership.ts::findNearestOwner` 支持多层归属范围，`hooks.ts` 产出 `callbackOwners`（有名 hook 的回调体位置 → hook 节点 id），`api.ts::resolveOwner` 按祖先就近判定，请求归 hook 而非组件 | — | 6.11.3 / 6.14 |
-| 24 | quote 校验的多候选歧义只标注、不降权 | 同段原文出现在多个候选时附 `quote_not_discriminative`，但置信度不变 | 审核者需自己读告警才能分辨弱匹配 | 6.5 |
+| 24 | ~~quote 校验的多候选歧义只标注、不降权~~ | **已修**：judge / locate 两条路径共用 `judge.capped_confidence`——歧义命中在 0.6 封顶后再乘 0.8 系数，排序直接分辨强弱；`quote_not_discriminative` 告警注明降权幅度，`modelConfidence` 保留原值供审计 | — | 6.5 |
 | 25 | ~~URL 归一化只做了 L3~~ | **已修**：`normalizeUrlText` 实现 L1（去 origin / query / hash、折叠斜杠、去尾斜杠）与 L2（数字 / UUID / `${…}` / `${id}` / `:id` / `{id}` 段统一成 `:param`），整体小写化，原文保留在 `attrs.urlRaw`；method 读取改走 `readMethodLiteral` 不被 URL 归一化波及 | — | 6.11.1 |
 
 **建议优先级**：

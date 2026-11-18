@@ -101,6 +101,7 @@ class Feature(BaseModel):
 
 class SignalKind(StrEnum):
     routePath = 'routePath'
+    routeTitle = 'routeTitle'
     componentName = 'componentName'
     uiText = 'uiText'
     apiUrl = 'apiUrl'

@@ -17,6 +17,7 @@ import type { ActionChain, ChainStep, RequirementMap } from "@uicodeanalysis/con
 
 const SIGNAL_LABEL: Record<string, string> = {
   routePath: "路由",
+  routeTitle: "路由标题",
   componentName: "组件名",
   uiText: "界面文案",
   apiUrl: "接口",

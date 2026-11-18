@@ -69,7 +69,13 @@ from app.contracts.requirement import (
 )
 from app.requirement.chains import ActionChain, ChainIndex
 from app.requirement.features import DecomposedFeature
-from app.requirement.judge import MAX_CONFIDENCE, QuoteMatch, match_quote, parse_json
+from app.requirement.judge import (
+    AMBIGUOUS_QUOTE_SCALE,
+    QuoteMatch,
+    capped_confidence,
+    match_quote,
+    parse_json,
+)
 from app.requirement.llm import LLMCallError, LLMClient
 from app.requirement.page_profile import ProfilePayload
 from app.requirement.recall import (
@@ -613,7 +619,8 @@ def _validate(
                 severity=Severity.warning,
                 message=(
                     f"引文「{quote_match.corpus_text}」同样出现在其他页面里，"
-                    f"不能单独证明页面归属：{', '.join(shared)}"
+                    f"不能单独证明页面归属：{', '.join(shared)}；"
+                    f"已按 {AMBIGUOUS_QUOTE_SCALE} 系数对该匹配降权"
                 ),
                 featureId=feature_id,
             )
@@ -628,7 +635,7 @@ def _validate(
             chainId=chain_id,
             targets=chains.targets_of(chain_id, quote_match.corpus_text) if chain_id else None,
             routeId=route_id,
-            confidence=min(model_confidence, MAX_CONFIDENCE),
+            confidence=capped_confidence(model_confidence, quote_ambiguous=bool(shared)),
             modelConfidence=model_confidence,
             quote=quote_match.corpus_text,
             reason=reason if isinstance(reason, str) and reason.strip() else None,

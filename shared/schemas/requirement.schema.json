@@ -129,6 +129,7 @@
       "type": "string",
       "enum": [
         "routePath",
+        "routeTitle",
         "componentName",
         "uiText",
         "apiUrl",
@@ -136,7 +137,7 @@
         "propDescription",
         "semanticRank"
       ],
-      "description": "召回信号来源。前端按此分类展示「为什么这个页面被选为候选」。semanticRank 是 AI 定位给出的名次（value 形如 rank=2）——只落名次不落分数：语义分的绝对值没有解释力，「语义路排第 2」才能被人理解和质疑"
+      "description": "召回信号来源。前端按此分类展示「为什么这个页面被选为候选」。routeTitle 是路由 / 菜单标题（route.attrs.title，来自路由表的 title / label / name 字面量或 react-router 的 handle.title）。semanticRank 是 AI 定位给出的名次（value 形如 rank=2）——只落名次不落分数：语义分的绝对值没有解释力，「语义路排第 2」才能被人理解和质疑"
     },
     "Signal": {
       "title": "Signal",
