@@ -21,6 +21,7 @@ import type { IREdge } from "@uicodeanalysis/contracts";
 
 import { analyzeApi, type ApiAnalysisResult } from "../src/api.js";
 import { discoverComponents } from "../src/components.js";
+import { analyzeHooks } from "../src/hooks.js";
 import { createFullProject } from "../src/project.js";
 
 const here = path.dirname(fileURLToPath(import.meta.url));
@@ -30,10 +31,17 @@ const FIXTURE_ROOT = path.join(REPO_ROOT, "tests", "fixtures", "enterprise-react
 function analyze(rootPath: string): ApiAnalysisResult {
   const { project } = createFullProject(rootPath);
   const discovery = discoverComponents(rootPath, project);
+  // 与 index.ts 同序：hooks 先于 api，api 才能读到 hook 回调体归属
+  const hooks = analyzeHooks({
+    rootPath,
+    components: discovery.components,
+    declarations: discovery.declarations,
+  });
   return analyzeApi({
     rootPath,
     project,
     definitionIndex: discovery.definitionIndex,
+    hookCallbackOwners: hooks.callbackOwners,
   });
 }
 
@@ -199,8 +207,41 @@ describe("API 链路的边界（合成项目）", () => {
     // 插值名不进 URL：`${id}` / `${userId}` / `${key}` 指向的是同一个接口，
     // 保留变量名反而会让同一接口按调用处的变量名分裂成多个节点。
     // 原始写法记在 urlRaw，回查时仍能看到代码里到底写了什么。
-    expect(apiIds(result)).toEqual(["api:GET:/api/users/${…}"]);
+    expect(apiIds(result)).toEqual(["api:GET:/api/users/:param"]);
     expect(result.apiNodes[0]?.attrs.urlRaw).toBe("`/api/users/${id}`");
+  });
+
+  it("URL 归一化：origin / query / hash / 尾斜杠去掉，数字与 UUID 段归一成 :param", () => {
+    const result = analyzeSynthetic({
+      "src/Normalize.tsx": `
+        export function Normalize({ id }: { id: string }) {
+          fetch("https://api.example.com/api/users/42?page=1#top");
+          fetch("/api//users/7/");
+          fetch("/api/users/123");
+          fetch("/api/users/550e8400-e29b-41d4-a716-446655440000");
+          fetch(\`/api/users/\${id}\`);
+          return <div />;
+        }
+      `,
+    });
+
+    // 五种写法全部指向同一个接口：绝对地址、查询串、锚点、重复斜杠、尾斜杠
+    // 都不改变接口身份；数字 / UUID / 插值都是同一资源的不同实例
+    expect(apiIds(result)).toEqual(["api:GET:/api/users/:param"]);
+  });
+
+  it("大写路径按比较不敏感口径归一，与原写法共用原始回显", () => {
+    const result = analyzeSynthetic({
+      "src/Cased.tsx": `
+        export function Cased() {
+          fetch("/API/Users");
+          return <div />;
+        }
+      `,
+    });
+
+    expect(apiIds(result)).toEqual(["api:GET:/api/users"]);
+    expect(result.apiNodes[0]?.attrs.urlRaw).toBe('"/API/Users"');
   });
 
   it("URL 完全由变量拼成、追不到字面量时不产节点", () => {
@@ -339,6 +380,171 @@ describe("API 链路的边界（合成项目）", () => {
 });
 
 /**
+ * 请求归属（设计文档 §6.11.3，缺陷 #23）。
+ *
+ * `findOwner` 只认组件定义位置时，`const handleExport = useCallback(() => fetch(...), [])`
+ * 体内的请求会被记到组件名下：图上呈现成「页面加载时请求」，而事实是「点击才请求」。
+ * 这不只是少一条边，是把交互链的语义说反了。
+ */
+describe("请求归属到 hook 回调体", () => {
+  it("useCallback 体内的请求归 hook 节点，不归组件", () => {
+    const result = analyzeSynthetic({
+      "src/Export.tsx": `
+        import { useCallback } from "react";
+
+        export function Export() {
+          const handleExport = useCallback(async () => {
+            await fetch("/api/orders/export");
+          }, []);
+
+          return <button onClick={handleExport}>导出</button>;
+        }
+      `,
+    });
+
+    const requests = result.edges.find((e) => e.kind === "requests");
+    expect(requests?.from).toBe("src/Export.tsx#Export/handleExport");
+    // 不要再出现一条从组件指向同一接口的 requests 边
+    expect(result.edges.some((e) => e.kind === "requests" && e.from === "src/Export.tsx#Export")).toBe(
+      false,
+    );
+  });
+
+  it("hook 回调体是图上已有节点，不补 fn 节点", () => {
+    const result = analyzeSynthetic({
+      "src/Export.tsx": `
+        import { useCallback } from "react";
+
+        export function Export() {
+          const handleExport = useCallback(async () => {
+            await fetch("/api/orders/export");
+          }, []);
+          return <button onClick={handleExport}>导出</button>;
+        }
+      `,
+    });
+
+    // 补一个同名 fn 会让同一个函数在图上出现两次
+    expect(result.fnNodes).toEqual([]);
+  });
+
+  it("useEffect 体内的请求仍归组件：挂载即执行，不是具名动作", () => {
+    const result = analyzeSynthetic({
+      "src/Loading.tsx": `
+        import { useEffect } from "react";
+
+        export function Loading() {
+          useEffect(() => {
+            fetch("/api/users");
+          }, []);
+          return <div />;
+        }
+      `,
+    });
+
+    const requests = result.edges.find((e) => e.kind === "requests");
+    expect(requests?.from).toBe("src/Loading.tsx#Loading");
+    expect(result.fnNodes).toEqual([]);
+  });
+
+  it("useMemo 回调体与 useCallback 同样归 hook 节点", () => {
+    const result = analyzeSynthetic({
+      "src/Memo.tsx": `
+        import { useMemo } from "react";
+
+        export function Memo({ id }: { id: string }) {
+          const load = useMemo(
+            () => () => fetch(\`/api/users/\${id}\`),
+            [id],
+          );
+          return <button onClick={load}>加载</button>;
+        }
+      `,
+    });
+
+    const requests = result.edges.find((e) => e.kind === "requests");
+    expect(requests?.from).toBe("src/Memo.tsx#Memo/load");
+  });
+
+  it("hook 回调体里调用模块级函数时，calls 边从 hook 节点出发", () => {
+    const result = analyzeSynthetic({
+      "src/services/users.ts": `
+        export async function fetchUsers() {
+          return fetch("/api/users");
+        }
+      `,
+      "src/Refresh.tsx": `
+        import { useCallback } from "react";
+        import { fetchUsers } from "./services/users";
+
+        export function Refresh() {
+          const handleRefresh = useCallback(() => {
+            void fetchUsers();
+          }, []);
+          return <button onClick={handleRefresh}>刷新</button>;
+        }
+      `,
+    });
+
+    const calls = result.edges.find(
+      (e) => e.kind === "calls" && e.to === "src/services/users.ts#fetchUsers",
+    );
+    expect(calls?.from).toBe("src/Refresh.tsx#Refresh/handleRefresh");
+  });
+
+  it("回调体内部定义的局部函数，其请求仍归宿主 hook（局部函数没有独立身份）", () => {
+    const result = analyzeSynthetic({
+      "src/Nested.tsx": `
+        import { useCallback } from "react";
+
+        export function Nested() {
+          const handleSave = useCallback(async () => {
+            async function buildPayload() {
+              return fetch("/api/payload");
+            }
+            await buildPayload();
+          }, []);
+          return <button onClick={handleSave}>保存</button>;
+        }
+      `,
+    });
+
+    const requests = result.edges.find((e) => e.kind === "requests");
+    // buildPayload 只能在这个回调体里被调用，不构成独立节点；给它补 fn 节点会
+    // 造出一个谁也无法从外部引用到的孤立节点
+    expect(requests?.from).toBe("src/Nested.tsx#Nested/handleSave");
+    expect(result.fnNodes).toEqual([]);
+  });
+
+  it("同一组件的多个回调各自归属，不被合并到同一个 hook", () => {
+    const result = analyzeSynthetic({
+      "src/Actions.tsx": `
+        import { useCallback } from "react";
+
+        export function Actions({ id }: { id: string }) {
+          const handleExport = useCallback(async () => {
+            await fetch("/api/orders/export");
+          }, []);
+          const handleDelete = useCallback(async () => {
+            await fetch(\`/api/orders/\${id}\`, { method: "DELETE" });
+          }, [id]);
+          return <div />;
+        }
+      `,
+    });
+
+    const fromHooks = result.edges
+      .filter((e) => e.kind === "requests")
+      .map((e) => e.from)
+      .sort();
+    expect(fromHooks).toEqual([
+      "src/Actions.tsx#Actions/handleDelete",
+      "src/Actions.tsx#Actions/handleExport",
+    ]);
+  });
+});
+
+/**
  * URL 前缀求值（设计文档 §6.11.1 L3）。
  *
  * 企业项目的 `fetch` 几乎不写完整路径，而是 `` `${API_PREFIX}/orders` ``，
@@ -453,11 +659,11 @@ describe("URL 前缀求值（跨模块常量）", () => {
 
     // 这是请求点，不是封装器：`id` 之于这个 URL 就像 `/users/1` 里的 `1`。
     // 若把它当封装器，真正的请求会被整条跳过且不告警。
-    expect(apiIds(result)).toEqual(["api:GET:/api/users/${…}"]);
+    expect(apiIds(result)).toEqual(["api:GET:/api/users/:param"]);
     expect(result.warnings).toEqual([]);
   });
 
-  it("查询参数插值同样保留占位，不拆散 URL", () => {
+  it("查询参数插值不拆散 URL：query 整体归一掉，接口身份只看路径", () => {
     const result = analyzeSynthetic({
       "src/Users.ts": `
         export async function searchUsers(status: string) {
@@ -466,7 +672,8 @@ describe("URL 前缀求值（跨模块常量）", () => {
       `,
     });
 
-    expect(apiIds(result)).toEqual(["api:GET:/api/users?status=${…}"]);
+    // `?status=${…}` 与 `?page=2` 是同一接口的不同查询，L1 把 query 整段去掉
+    expect(apiIds(result)).toEqual(["api:GET:/api/users"]);
   });
 
   it("封装器的 URL 仍来自参数：路径参数修复不影响封装器识别", () => {

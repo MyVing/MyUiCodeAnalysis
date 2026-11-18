@@ -34,7 +34,7 @@ import { Node as MorphNode, SyntaxKind } from "ts-morph";
 
 import type { Evidence, IREdge, IRNode, Warning } from "@uicodeanalysis/contracts";
 
-import { findOwner } from "./ownership.js";
+import { findNearestOwner } from "./ownership.js";
 import { isProjectSource, toProjectRelative } from "./paths.js";
 import { positionKey } from "./positions.js";
 
@@ -109,15 +109,66 @@ export interface ApiAnalysisInput {
   project: Project;
   /** 定义位置键 → 组件 id，与 renders 共用 */
   definitionIndex: ReadonlyMap<string, string>;
+  /**
+   * 「hook 回调体位置 → hook 节点 id」，来自 hooks 分析结果。
+   *
+   * 没有它时，`const handleExport = useCallback(() => fetch("/api/export"))` 体内的
+   * 请求会归到组件名下，图上变成「页面加载时请求」；事实是「点击后才请求」。
+   * 缺省视为空：单测里只关心 API 层时不必造 hooks 结果。
+   */
+  hookCallbackOwners?: ReadonlyMap<string, string>;
 }
 
-/** 去重后的 URL 文本；空串视为无法确定。 */
+/**
+ * UUID（8-4-4-4-12 十六进制）：与纯数字段一样都是「具体资源实例」，不是接口身份。
+ */
+const UUID_SEGMENT_PATTERN = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
+/** 路径参数段的各种写法：`${…}`（模板骨架占位）、`${id}`、`:id`、`{id}`。 */
+const PLACEHOLDER_SEGMENT_PATTERNS: RegExp[] = [/^\$\{[^}]*\}$/, /^:.+$/, /^\{[^}]+\}$/];
+/** 纯数字段：`/users/123` 与 `/users/456` 是同一个接口的不同实例。 */
+const NUMERIC_SEGMENT_PATTERN = /^\d+$/;
+
+/** 单个路径段的 L2 归一：参数/数字/UUID 段统一成 `:param`，其余保留。 */
+function normalizeSegment(segment: string): string {
+  if (PLACEHOLDER_SEGMENT_PATTERNS.some((pattern) => pattern.test(segment))) return ":param";
+  if (NUMERIC_SEGMENT_PATTERN.test(segment)) return ":param";
+  if (UUID_SEGMENT_PATTERN.test(segment)) return ":param";
+  return segment;
+}
+
+/**
+ * URL 归一化（L3 + L1 + L2）：
+ *
+ *  - **L3**：压缩空白——模板里可能有前导空白，URL 内部空格不是合法字符；
+ *  - **L1**：去 origin / query / hash、折叠重复斜杠、去尾斜杠——`https://x/api/a`
+ *    与 `/api/a` 是同一个接口，`?page=1` 与 `?page=2` 也是；
+ *  - **L2**：路径段归一——纯数字、UUID、各种参数写法（`${…}` / `${id}` / `:id` /
+ *    `{id}`）统一成 `:param`，让 `` `/api/users/${id}` `` 与 `/api/users/123`
+ *    归到同一个接口节点。
+ *
+ * 结果整体小写化（比较大小写不敏感）；原始写法保留在 attrs.raw 里回显。
+ * 全部归一化后剩不下路径（只有 origin / query 的 URL）视为无法确定。
+ */
 function normalizeUrlText(text: string): string | null {
-  const trimmed = text.trim();
-  if (trimmed.length === 0) return null;
-  // 模板里可能有前导空白，但 URL 内部空格不是合法字符
-  const compact = trimmed.replace(/\s+/g, "");
-  return compact.length === 0 ? null : compact;
+  const compact = text.trim().replace(/\s+/g, "");
+  if (compact.length === 0) return null;
+
+  let rest = compact;
+  const origin = /^https?:\/\//i.exec(rest);
+  if (origin) {
+    rest = rest.slice(origin[0].length);
+    // origin 后保留路径部分；没有路径（`https://x.com`）就没有接口身份
+    const slash = rest.indexOf("/");
+    rest = slash === -1 ? "" : rest.slice(slash);
+  }
+  const hash = rest.indexOf("#");
+  if (hash !== -1) rest = rest.slice(0, hash);
+  const query = rest.indexOf("?");
+  if (query !== -1) rest = rest.slice(0, query);
+  rest = rest.replace(/\/{2,}/g, "/").replace(/\/+$/, "");
+  if (rest.length === 0) return null;
+
+  return rest.split("/").map(normalizeSegment).join("/").toLowerCase();
 }
 
 /**
@@ -130,8 +181,9 @@ function normalizeUrlText(text: string): string | null {
  *
  * 带插值时的两条规则彼此不同，很容易写错：
  *
- *  - **路径参数**（`` `/api/users/${id}` ``）保留原样：只有这样 `/users/1` 与
- *    `/users/2` 才会归到同一个接口，反查时也才能按段归一化成 `:param`。
+ *  - **路径参数**（`` `/api/users/${id}` ``）保留插值形态进入归一化，最终统一成
+ *    `:param`：只有这样 `/users/1` 与 `/users/2` 才会归到同一个接口，反查时也
+ *    才能按段归一化。
  *  - **前缀常量**（`` `${API_PREFIX}/orders` ``）必须在读取阶段被求值：它决定
  *    的是"这是哪个接口"，不是"哪一个资源实例"。求不出来时**不猜**——见
  *    `resolveUrlExpression`。
@@ -171,7 +223,8 @@ function readUrl(node: Node): UrlReadResult {
  * 把模板拆成「字面量段 + 插值段」后逐个插值尝试求值：
  *
  *  - 求出来的值拼进字面量骨架（`` `${API_PREFIX}/orders` `` → `/api/orders`）；
- *  - **路径参数**原样保留成插值占位（`` ${id} `` → `${…}`），不展开也不丢弃；
+ *  - **路径参数**进入骨架时保留成占位（`` ${id} `` → `${…}`），归一化后统一为
+ *    `:param`，不展开也不丢弃；
  *  - 求不出来且**位于路径参数之前**的插值视为前缀未解析：URL 主体不确定，
  *    整个模板判为无法确定（返回 null），由调用方记告警。宁可缺一个接口节点，
  *    也不能把 `${…}/orders` 当成一个真实接口参与反查——那会系统性误匹配。
@@ -456,13 +509,22 @@ function getUrlArgumentNode(call: CallExpression): Node | null {
   return first;
 }
 
+/** method 等非 URL 字面量的读取：只压缩空白，不参与 URL 的 L1/L2 归一化。 */
+function readMethodLiteral(node: Node): string | null {
+  if (MorphNode.isStringLiteral(node) || MorphNode.isNoSubstitutionTemplateLiteral(node)) {
+    const text = node.getLiteralText().trim();
+    return text.length === 0 ? null : text;
+  }
+  return null;
+}
+
 /** 从 HTTP 客户端的第二个实参（options 对象）里取 method。 */
 function getMethodFromOptions(call: CallExpression): string | null {
   const [, options] = call.getArguments();
   if (!options) return null;
   const found = findPropertyInitializer(options, METHOD_PROPERTY_NAMES);
   if (!found) return null;
-  return readLiteralUrl(found.node);
+  return readMethodLiteral(found.node);
 }
 
 /** 一个 AST 节点所属的最内层函数节点；不在函数内返回 null。 */
@@ -782,7 +844,7 @@ function readWrapperCall(
     const methodArg = args[methodSlot.paramIndex];
     if (methodArg && methodSlot.propertyName) {
       const found = findPropertyInitializer(methodArg, [methodSlot.propertyName]);
-      if (found) method = readLiteralUrl(found.node);
+      if (found) method = readMethodLiteral(found.node);
     }
   }
   const resolvedMethod = method ?? methodSlot?.fallback ?? DEFAULT_METHOD;
@@ -801,12 +863,42 @@ function apiNodeId(method: string, url: string): string {
   return `api:${method}:${url}`;
 }
 
+/** 请求归属判定的结果。 */
+interface OwnerResolution {
+  /** 归属节点 id（组件 / hook 回调体） */
+  id: string;
+  /** true 表示是组件；false 表示是 hook 回调体——后者不是「模块级函数」，不补 fn 节点 */
+  isComponent: boolean;
+}
+
+/**
+ * 一次请求（或一次函数调用）归属给谁。
+ *
+ * 两层的就近判定：
+ *  - 落在具名 hook 的回调体里（`const handleExport = useCallback(() => {...})`）
+ *    → 归 hook 节点。这条链路是「元素 --calls--> hook --requests--> 接口」，
+ *      与事件层把 onClick 连到 hook 节点用的是同一个 id，链路才接得上。
+ *  - 其余情况落在组件体内 → 归组件（与既有行为一致）。
+ *
+ * 都不命中时退回到模块级函数；模块级函数里的请求照旧补 fn 节点。
+ */
+function resolveOwner(
+  node: Node,
+  definitionIndex: ReadonlyMap<string, string>,
+  hookCallbackOwners: ReadonlyMap<string, string>,
+  rootPath: string,
+): OwnerResolution | null {
+  const hit = findNearestOwner(node, [definitionIndex, hookCallbackOwners], rootPath);
+  if (!hit) return null;
+  return { id: hit.id, isComponent: hit.scope === 0 };
+}
+
 /**
  * 分析入口。
  *
  * 分成三步，每步只做一件事：
  *  1. 找出项目内所有「请求封装器」（体内有直接请求点、URL 来自自己参数的函数）
- *  2. 扫全部调用点，把请求归到「组件」或「模块级函数」名下
+ *  2. 扫全部调用点，把请求归到「组件 / hook 回调体 / 模块级函数」名下
  *  3. 为出现在请求链上的模块级函数补 fn 节点，以及「谁调用了它」的 calls 边
  *
  * 第 3 步单独做，是因为第一遍扫描时还不知道哪些函数最终连到了请求上；
@@ -814,6 +906,7 @@ function apiNodeId(method: string, url: string): string {
  */
 export function analyzeApi(input: ApiAnalysisInput): ApiAnalysisResult {
   const { rootPath, project, definitionIndex } = input;
+  const hookCallbackOwners = input.hookCallbackOwners ?? new Map<string, string>();
 
   const warnings: Warning[] = [];
   const apiNodes = new Map<string, IRNode>();
@@ -955,11 +1048,13 @@ export function analyzeApi(input: ApiAnalysisInput): ApiAnalysisResult {
       if (result.kind === "none") continue;
 
       const site = result.site;
-      const ownerComponent = findOwner(call, definitionIndex, rootPath);
-      const fromId = ownerComponent ?? moduleFunctionIdOf(call, rootPath, file);
+      const owner = resolveOwner(call, definitionIndex, hookCallbackOwners, rootPath);
+      const fromId = owner?.id ?? moduleFunctionIdOf(call, rootPath, file);
       if (!fromId) continue;
 
-      if (!ownerComponent) {
+      // 只有「模块级函数」才需要补 fn 节点：组件与 hook 回调体都已在图上
+      // （hook 节点由 hooks 分析器产出），再补一个 fn 会变成同名的两个节点。
+      if (!owner) {
         const enclosing = findEnclosingFunction(call);
         if (enclosing) registerFn(fromId, enclosing);
       }
@@ -999,7 +1094,7 @@ export function analyzeApi(input: ApiAnalysisInput): ApiAnalysisResult {
         if (!fnId) continue;
 
         const callerId =
-          findOwner(call, definitionIndex, rootPath) ??
+          resolveOwner(call, definitionIndex, hookCallbackOwners, rootPath)?.id ??
           moduleFunctionIdOf(call, rootPath, file);
         // 自调用（递归）不产边；调用方不认识时也不编造
         if (!callerId || callerId === fnId) continue;

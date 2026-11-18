@@ -117,6 +117,9 @@ async function analyze(request: WorkerRequest): Promise<WorkerResponse> {
     rootPath,
     project,
     definitionIndex: discovery.definitionIndex,
+    // hook 回调体归属：`const handleExport = useCallback(() => request(...), [])`
+    // 里的请求归 hook 节点，不归组件——否则图上显示成「加载时请求」
+    hookCallbackOwners: hooksResult.callbackOwners,
   });
   warnings.push(...apiResult.warnings);
 

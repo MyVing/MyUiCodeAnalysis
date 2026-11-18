@@ -34,6 +34,45 @@ export function buildOwnerIndex(
   return index;
 }
 
+/** 归属命中：命中的节点 id，以及它来自哪一层范围。 */
+export interface OwnerHit {
+  id: string;
+  /** 命中的是 `scopes` 里的第几项；调用方据此区分「组件」与「hook 回调体」 */
+  scope: number;
+}
+
+/**
+ * 向上找最近的、落在任一归属范围里的祖先节点。
+ *
+ * 判断按**祖先就近**进行，而不是先查完第一层范围再查第二层：两个范围在源码里
+ * 可以嵌套（`const handleExport = useCallback(() => {...})` 写在组件函数体内），
+ * 此时应该落在更内层的那个。就近判定顺带处理了「hook 回调体里又定义了子组件」
+ * 这类情况——子组件里的请求归子组件，不归外层回调。
+ *
+ * 遇到 SourceFile 仍未命中就停止：模块顶层的代码不归任何范围。
+ */
+export function findNearestOwner(
+  node: Node,
+  scopes: readonly ReadonlyMap<string, string>[],
+  rootPath: string,
+): OwnerHit | null {
+  let current: Node | undefined = node.getParent() ?? undefined;
+  while (current) {
+    if (MorphNode.isSourceFile(current)) return null;
+
+    const relativeFile = toProjectRelative(rootPath, current.getSourceFile().getFilePath());
+    if (relativeFile !== null) {
+      const key = positionKey(relativeFile, current.getStart());
+      for (let scope = 0; scope < scopes.length; scope += 1) {
+        const hit = scopes[scope]?.get(key);
+        if (hit) return { id: hit, scope };
+      }
+    }
+    current = current.getParent() ?? undefined;
+  }
+  return null;
+}
+
 /**
  * 向上找最近的、属于某个组件的祖先节点，返回组件 id；不在任何组件内返回 null。
  *
@@ -47,16 +86,5 @@ export function findOwner(
   ownerIndex: ReadonlyMap<string, string>,
   rootPath: string,
 ): string | null {
-  let current: Node | undefined = node.getParent() ?? undefined;
-  while (current) {
-    if (MorphNode.isSourceFile(current)) return null;
-
-    const relativeFile = toProjectRelative(rootPath, current.getSourceFile().getFilePath());
-    if (relativeFile !== null) {
-      const hit = ownerIndex.get(positionKey(relativeFile, current.getStart()));
-      if (hit) return hit;
-    }
-    current = current.getParent() ?? undefined;
-  }
-  return null;
+  return findNearestOwner(node, [ownerIndex], rootPath)?.id ?? null;
 }

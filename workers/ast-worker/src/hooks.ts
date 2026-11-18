@@ -33,6 +33,7 @@ import type { Evidence, IREdge, IRNode, Warning } from "@uicodeanalysis/contract
 
 import type { DiscoveredComponent } from "./components.js";
 import { toProjectRelative } from "./paths.js";
+import { positionKey } from "./positions.js";
 
 /** 组件里的 hook 调用是语法事实。 */
 const CALL_CONFIDENCE = 1;
@@ -56,6 +57,15 @@ export interface HooksAnalysisResult {
   stateNodes: IRNode[];
   /** 组件 → hook / state 的 uses / reads / writes 边 */
   edges: IREdge[];
+  /**
+   * 「hook 回调体位置 → hook 节点 id」索引，供 `api.ts` 判断请求归属。
+   *
+   * 键是回调函数节点的定义位置（`文件@起始偏移`），值是 hook 节点 id。只收录
+   * 绑定了名字的 hook（`const handleExport = useCallback(...)`）——没有名字的
+   * `useEffect(() => {...})` 没有可归属的节点身份，回调体里的请求仍归组件，
+   * 这是事实：它是组件挂载时执行的，不是某个人手动触发的动作。
+   */
+  callbackOwners: ReadonlyMap<string, string>;
   warnings: Warning[];
 }
 
@@ -263,6 +273,21 @@ function nodeIdForState(componentId: string, stateName: string): string {
 }
 
 /**
+ * 取 hook 调用的回调函数节点（第一个实参，且必须是箭头 / 函数表达式）。
+ *
+ * `useCallback` / `useMemo` / `useEffect` / 自定义 `useXxx` 的回调都在第一个
+ * 位置，这是 React 生态的语言级约定（与 `HOOK_NAME_PATTERN` 同一性质）。
+ * 第一实参不是函数的（`useTable({ columns })`）返回 null——那不是回调体，
+ * 里面的请求属于组件本身。
+ */
+function callbackFunctionOf(call: CallExpression): Node | null {
+  const [first] = call.getArguments();
+  if (!first) return null;
+  if (MorphNode.isArrowFunction(first) || MorphNode.isFunctionExpression(first)) return first;
+  return null;
+}
+
+/**
  * hook 节点 id 的后缀：优先用绑定的变量名（`handleSelect`），没有绑定时
  * 用「hook 名 + 组件内序号」（`useEffect#1`）。
  *
@@ -292,6 +317,7 @@ export function analyzeHooks(input: HooksAnalysisInput): HooksAnalysisResult {
   const edges = new Map<string, IREdge>();
   const warnings: Warning[] = [];
   const hookCounters = new Map<string, number>();
+  const callbackOwners = new Map<string, string>();
 
   for (const component of components) {
     const decl = declarations.get(component.id);
@@ -365,6 +391,16 @@ export function analyzeHooks(input: HooksAnalysisInput): HooksAnalysisResult {
         ],
       });
 
+      // 回调体归属：只有绑定了名字的 hook 才有节点身份可归属。
+      // `useEffect(() => { fetch() })` 的请求仍归组件——它在挂载时执行，
+      // 不是某个具名动作触发的，挂到匿名 hook 上反而让人误以为可以单独触发。
+      if (boundName) {
+        const callback = callbackFunctionOf(call);
+        if (callback) {
+          callbackOwners.set(positionKey(relativeFile, callback.getStart()), nodeId);
+        }
+      }
+
       addEdge(edges, {
         id: `e_uses_${component.id}__${nodeId}`,
         from: component.id,
@@ -382,7 +418,7 @@ export function analyzeHooks(input: HooksAnalysisInput): HooksAnalysisResult {
     }
   }
 
-  return { hookNodes, stateNodes, edges: [...edges.values()], warnings };
+  return { hookNodes, stateNodes, edges: [...edges.values()], callbackOwners, warnings };
 }
 
 /** 沿父链找包住调用表达式的变量声明；只走 3 层以内（初始化表达式 → 声明）。 */
