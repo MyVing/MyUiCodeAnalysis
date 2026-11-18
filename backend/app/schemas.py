@@ -242,6 +242,70 @@ class RuntimeTaskList(ApiModel):
     items: list[RuntimeTask] = Field(default_factory=list)
 
 
+class ExploreStart(ApiModel):
+    """一次 AI 自动探索的输入。url 与 command 至少给一个（与 RuntimeStart 同一约定）。
+
+    - `dryRun=True`：只枚举元素并生成探索计划（含场景与用例清单），不在浏览器里
+      执行交互——不花钱即可审阅计划质量；
+    - `dryRun=False`：生成计划后立即确定性执行，产出逐步结果与截图。
+    """
+
+    goal: str = Field(min_length=1, max_length=2000)
+    command: str | None = Field(default=None, max_length=500)
+    url: str | None = Field(default=None, max_length=2048)
+    analysis_id: str | None = Field(default=None, max_length=128)
+    dry_run: bool = False
+    max_steps: int | None = Field(default=None, ge=1, le=50)
+
+    @field_validator("goal")
+    @classmethod
+    def strip_goal(cls, value: str) -> str:
+        stripped = value.strip()
+        if not stripped:
+            raise ValueError("探索目标不能为空")
+        return stripped
+
+    @field_validator("command", "url")
+    @classmethod
+    def strip_text(cls, value: str | None) -> str | None:
+        if value is None:
+            return None
+        stripped = value.strip()
+        return stripped or None
+
+
+class ExploreTask(ApiModel):
+    """探索任务的状态。字段形状与 RuntimeTask 对齐，前端可复用同一套轮询逻辑。
+
+    计数聚合来自探索产物：elementCount 是 discovery 的元素数，stepCount /
+    successCount / failedCount 来自计划执行结果，screenshotCount 是截图数。
+    """
+
+    id: str
+    project_id: str
+    goal: str
+    status: TaskStatus
+    command: str | None = None
+    url: str | None = None
+    analysis_id: str | None = None
+    dry_run: bool
+    max_steps: int | None = None
+    created_at: datetime
+    started_at: datetime | None = None
+    finished_at: datetime | None = None
+    error_code: str | None = None
+    error_message: str | None = None
+    element_count: int | None = None
+    step_count: int | None = None
+    success_count: int | None = None
+    failed_count: int | None = None
+    screenshot_count: int | None = None
+
+
+class ExploreTaskList(ApiModel):
+    items: list[ExploreTask] = Field(default_factory=list)
+
+
 class SourceExcerpt(ApiModel):
     """源码片段：前端点开「文件:行」时读这一段。"""
 

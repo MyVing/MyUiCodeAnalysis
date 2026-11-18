@@ -1,0 +1,323 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://uicodeanalysis.local/schemas/explore.schema.json",
+  "title": "ExploreArtifact",
+  "description": "AI 自动探索单页面的产物（B 模式）：先由模型基于真实可交互元素生成确定性探索计划，再由 Playwright 执行，最终产出探索轨迹、场景清单与 Playwright 测试脚本。执行只认计划中的 selector，不允许模型在执行期间自由决策。",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "schemaVersion",
+    "taskId",
+    "projectId",
+    "goal",
+    "pageUrl",
+    "dryRun",
+    "discovery",
+    "plan",
+    "results",
+    "scenario",
+    "testCases",
+    "screenshots",
+    "warnings"
+  ],
+  "properties": {
+    "schemaVersion": {
+      "type": "string",
+      "pattern": "^\\d+\\.\\d+$",
+      "description": "探索产物契约版本，独立于 IR / runtime schema 演进"
+    },
+    "taskId": { "type": "string", "minLength": 1 },
+    "projectId": { "type": "string", "minLength": 1 },
+    "analysisId": {
+      "type": "string",
+      "description": "关联的静态分析产物标识；缺省表示与某次静态分析无绑定"
+    },
+    "goal": {
+      "type": "string",
+      "minLength": 1,
+      "description": "用户输入的探索目标，如「验证用户登录流程」"
+    },
+    "pageUrl": {
+      "type": "string",
+      "minLength": 1,
+      "description": "本次探索的起始页面 URL"
+    },
+    "title": {
+      "type": "string",
+      "description": "页面标题（来自浏览器）"
+    },
+    "dryRun": {
+      "type": "boolean",
+      "description": "true 表示只枚举元素并生成计划，不在浏览器中执行交互"
+    },
+    "discovery": {
+      "type": "array",
+      "items": { "$ref": "#/$defs/DiscoveredElement" },
+      "description": "页面上真实存在的可交互元素；计划中的 targetIndex 必须指向其中一项"
+    },
+    "plan": { "$ref": "#/$defs/ExplorePlan" },
+    "results": {
+      "type": "array",
+      "items": { "$ref": "#/$defs/ExploreStepResult" },
+      "description": "确定性执行的逐步结果；dry-run 时为空"
+    },
+    "scenario": { "$ref": "#/$defs/Scenario" },
+    "testCases": {
+      "type": "array",
+      "items": { "$ref": "#/$defs/TestCase" },
+      "description": "模型归纳的场景清单；relatedSteps 指向实际执行的步骤"
+    },
+    "script": { "$ref": "#/$defs/GeneratedScript" },
+    "screenshots": {
+      "type": "array",
+      "items": { "$ref": "#/$defs/Screenshot" }
+    },
+    "warnings": {
+      "type": "array",
+      "items": { "$ref": "#/$defs/ExploreWarning" }
+    }
+  },
+  "$defs": {
+    "Selector": {
+      "title": "Selector",
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["strategy", "value"],
+      "properties": {
+        "strategy": {
+          "type": "string",
+          "enum": ["role", "testId", "css", "text"],
+          "description": "定位策略，按可靠性从高到低：testId > role > text > css"
+        },
+        "value": {
+          "type": "string",
+          "minLength": 1,
+          "description": "testId / css / text 的目标值；strategy=role 时为 ARIA role"
+        },
+        "name": {
+          "type": "string",
+          "description": "strategy=role 时的可访问名称"
+        }
+      }
+    },
+    "DiscoveredElement": {
+      "title": "DiscoveredElement",
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["index", "tag", "role", "name", "visible", "selector"],
+      "properties": {
+        "index": {
+          "type": "integer",
+          "minimum": 0,
+          "description": "元素在本次发现结果中的稳定序号；计划用 targetIndex 引用它"
+        },
+        "tag": { "type": "string", "minLength": 1 },
+        "role": {
+          "type": "string",
+          "minLength": 1,
+          "description": "推断的 ARIA 角色或原生控件语义，如 button / link / textbox / combobox"
+        },
+        "name": {
+          "type": "string",
+          "description": "可访问名称或可见文案；可能为空串（无文本图标按钮）"
+        },
+        "type": { "type": "string", "description": "input 的 type 属性" },
+        "testId": { "type": "string" },
+        "href": { "type": "string" },
+        "visible": { "type": "boolean" },
+        "selector": { "$ref": "#/$defs/Selector" }
+      }
+    },
+    "PlanStep": {
+      "title": "PlanStep",
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["index", "action"],
+      "properties": {
+        "index": { "type": "integer", "minimum": 0 },
+        "action": {
+          "type": "string",
+          "enum": ["click", "fill", "select", "press", "wait", "screenshot", "assert", "navigate"]
+        },
+        "targetIndex": {
+          "type": "integer",
+          "minimum": 0,
+          "description": "目标元素在 discovery 中的序号；click/fill/select/press 必填"
+        },
+        "selector": { "$ref": "#/$defs/Selector" },
+        "value": {
+          "type": "string",
+          "description": "fill 的输入值、select 的选项值、press 的按键、navigate 的目标地址"
+        },
+        "assertion": {
+          "type": "string",
+          "description": "assert 的目标文案；执行时断言该文案可见"
+        },
+        "reasoning": {
+          "type": "string",
+          "description": "模型选择该步骤的理由，用于审计"
+        },
+        "optional": {
+          "type": "boolean",
+          "default": false,
+          "description": "可选步骤失败后继续执行；非可选步骤失败则跳过后续步骤"
+        }
+      }
+    },
+    "ExplorePlan": {
+      "title": "ExplorePlan",
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["goal", "steps", "scenario", "testCases"],
+      "properties": {
+        "goal": { "type": "string", "minLength": 1 },
+        "summary": { "type": "string", "description": "模型对整体探索路径的一句话说明" },
+        "maxSteps": {
+          "type": "integer",
+          "minimum": 1,
+          "maximum": 50,
+          "description": "计划允许的最大步数；超出部分的步骤在生成阶段被截断"
+        },
+        "steps": {
+          "type": "array",
+          "items": { "$ref": "#/$defs/PlanStep" }
+        },
+        "scenario": { "$ref": "#/$defs/Scenario" },
+        "testCases": {
+          "type": "array",
+          "items": { "$ref": "#/$defs/TestCase" }
+        }
+      }
+    },
+    "ExploreStepResult": {
+      "title": "ExploreStepResult",
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["index", "action", "target", "result"],
+      "properties": {
+        "index": { "type": "integer", "minimum": 0 },
+        "action": {
+          "type": "string",
+          "enum": ["click", "fill", "select", "press", "wait", "screenshot", "assert", "navigate"]
+        },
+        "target": {
+          "type": "string",
+          "description": "目标元素的可读描述，如「登录按钮」或 selector 摘要"
+        },
+        "selector": { "$ref": "#/$defs/Selector" },
+        "valueSummary": {
+          "type": "string",
+          "description": "input/select 的值摘要；敏感字段必须脱敏"
+        },
+        "result": {
+          "type": "string",
+          "enum": ["success", "failed", "skipped", "no_change"],
+          "description": "success 正常完成；failed 执行报错；skipped 因前序失败被跳过；no_change 执行成功但页面无可见变化"
+        },
+        "error": { "type": "string", "description": "result=failed 时的错误信息" },
+        "screenshotRef": {
+          "type": "string",
+          "description": "本步截图的相对文件名，由后端拼成可下载地址"
+        },
+        "triggeredNetworkEvents": {
+          "type": "array",
+          "items": { "type": "string" },
+          "description": "本步引发的网络请求 id，格式 METHOD URL"
+        },
+        "pageTransitioned": {
+          "type": "boolean",
+          "description": "本步是否触发了 URL 变化"
+        },
+        "url": { "type": "string", "description": "本步执行后的页面地址" }
+      }
+    },
+    "Scenario": {
+      "title": "Scenario",
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["title", "description"],
+      "properties": {
+        "title": { "type": "string", "minLength": 1 },
+        "description": { "type": "string" },
+        "preconditions": {
+          "type": "array",
+          "items": { "type": "string" }
+        },
+        "expectedOutcome": { "type": "string" }
+      }
+    },
+    "TestCase": {
+      "title": "TestCase",
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["title", "steps", "expected"],
+      "properties": {
+        "title": { "type": "string", "minLength": 1 },
+        "priority": {
+          "type": "string",
+          "enum": ["p0", "p1", "p2", "p3"]
+        },
+        "steps": {
+          "type": "array",
+          "items": { "type": "string" },
+          "description": "测试步骤的自然语言描述"
+        },
+        "expected": {
+          "type": "array",
+          "items": { "type": "string" },
+          "description": "预期断言"
+        },
+        "relatedSteps": {
+          "type": "array",
+          "items": { "type": "integer" },
+          "description": "关联的探索步骤 index；缺省表示使用全部成功步骤"
+        }
+      }
+    },
+    "GeneratedScript": {
+      "title": "GeneratedScript",
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["fileName", "content", "testCount", "stepCount"],
+      "properties": {
+        "fileName": {
+          "type": "string",
+          "pattern": "\\.spec\\.ts$",
+          "description": "生成的 Playwright 测试文件名"
+        },
+        "content": { "type": "string", "description": "完整的 .spec.ts 源码" },
+        "testCount": { "type": "integer", "minimum": 0 },
+        "stepCount": { "type": "integer", "minimum": 0 }
+      }
+    },
+    "Screenshot": {
+      "title": "Screenshot",
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["stepIndex", "fileName"],
+      "properties": {
+        "stepIndex": { "type": "integer", "minimum": 0 },
+        "fileName": {
+          "type": "string",
+          "pattern": "^step-\\d{3}\\.png$",
+          "description": "任务产物目录下的截图文件名"
+        },
+        "caption": { "type": "string" }
+      }
+    },
+    "ExploreWarning": {
+      "title": "ExploreWarning",
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["code", "severity", "message"],
+      "properties": {
+        "code": { "type": "string", "minLength": 1 },
+        "severity": {
+          "type": "string",
+          "enum": ["info", "warning", "error"]
+        },
+        "message": { "type": "string", "minLength": 1 }
+      }
+    }
+  }
+}

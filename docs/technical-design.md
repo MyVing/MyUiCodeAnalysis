@@ -1542,6 +1542,17 @@ SQLAlchemy Core + aiomysql
 
 ## 八、迭代路线图
 
+### 8.1 P5 AI 自动探索（Playwright B 模式）的设计要点
+
+P5 在 [runtime 采集](#四ui-组件--逻辑信息是怎么收集到的)（被动观察）之上增加**主动探索**：AI 自动探索一个页面内的交互，产出探索轨迹、场景/用例清单与 Playwright 测试脚本。核心决策是「**AI 决策与 Playwright 执行严格分离**」（B 模式）：
+
+1. **discovery**：runtime-worker 新增 `discover` 模式，枚举页面上真实存在的可交互元素（role / name / tag / testId / href + Playwright 定位策略），这是计划的唯一素材——从协议上杜绝模型幻觉出不存在的控件。
+2. **plan**：模型基于元素清单**预生成完整计划**（ExplorePlan：click / fill / select / press / wait / assert / screenshot / navigate 步骤 + 场景 + 用例），服务端逐条校验——targetIndex 必须命中 discovery、动作与元素语义匹配（fill 只能指向 textbox）、步数截断、越界步骤丢弃并记 warning；不可用/不合规时退到确定性兜底计划（填文本框 + 点首个按钮），任务不因模型故障不可用。
+3. **execute**：runtime-worker 新增 `explore` 模式**确定性执行**计划——执行只认计划里的 selector，不做页面内容驱动的自由决策；逐步截图、网络请求按步归因、URL 变化检测（no_change）、非可选步骤失败后剩余步骤全部 skipped。
+4. **产物**：ExploreArtifact（`shared/schemas/explore.schema.json`）整体落库——轨迹 + 计划 + 场景/用例 + 自动生成的 `.spec.ts`（从计划确定性生成，dry-run 也有脚本草稿）+ 截图文件；前端 ExplorePanel 支持 dry-run（先审计划再执行）与截图预览/脚本下载。
+
+dry-run 默认开启：模型产出的计划先给用户审阅，再决定是否真实执行——探索是「计划先行的确定性回放」，不是「让 Agent 在页面里自由发挥」。
+
 | 阶段 | 状态 | 交付 |
 | --- | --- | --- |
 | **M1 核心静态分析** | ✅ 已完成 | ast-worker 全模块 + 编排层 + 前端工作台 + 内存持久化 |
@@ -1551,7 +1562,7 @@ SQLAlchemy Core + aiomysql
 | **P3.5 定位增强** | 🔶 进行中 | 已完成：`contains` / `navigates` 边、`view.ts` 视图层、`jsx-inventory` 统一元素 id、前端 `ViewPanel`。待做：需求文档结构化 + 锚点抽取、`route.title` / 菜单名、接口 → 页面反向索引、页面画像物化、`ActionChain` 契约与链路视图、召回语义路（见 [chain-semantic-design.md](./chain-semantic-design.md)） |
 | **P3.6 正确性修复** | 🔶 进行中 | 已完成：跨模块 URL 前缀求值（6.11.1）、事件处理函数跨文件符号解析（6.11.3）、quote 校验严格优先 + 子串兜底（6.5）。待做：用户确认闭环与术语表（6.13.1）、组件内 hook 处理函数的请求归属（第十节 #23） |
 | **P4 Diff 影响分析** | ⬜ 待开始 | base→head 两棵 IR 图集合差 + 反向影响传播 + 回归建议；前置：节点 id 稳定性方案（第十节 #22） |
-| **P5 Playwright B 模式** | ⬜ 待开始 | AI 自动探索页面、场景与用例生成 |
+| **P5 Playwright B 模式** | ✅ 已完成 | AI 自动探索页面、场景与用例生成（单页面内交互；跨页面遍历与路由守卫建模不在 P5 范围） |
 
 ---
 

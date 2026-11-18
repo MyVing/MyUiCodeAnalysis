@@ -150,4 +150,94 @@ describe("parseRequest", () => {
   it("非法 JSON 抛 SyntaxError", () => {
     expect(() => parseRequest("{bad json")).toThrow();
   });
+
+  describe("explore 模式", () => {
+    const url = { url: "http://localhost:5173/" };
+    const exploreBase = { ...base, ...url, mode: "explore", artifactsDir: process.cwd() };
+    const step = {
+      index: 0,
+      action: "click",
+      selector: { strategy: "role", value: "button", name: "查询" },
+    };
+
+    it("explore 缺 steps 报错", () => {
+      expect(() => parseRequest(JSON.stringify(exploreBase))).toThrow("steps");
+    });
+
+    it("explore 缺 artifactsDir 报错", () => {
+      const { artifactsDir: _dir, ...withoutDir } = exploreBase;
+      expect(() =>
+        parseRequest(JSON.stringify({ ...withoutDir, steps: [step] })),
+      ).toThrow("artifactsDir");
+    });
+
+    it("合法计划解析成功并保留 mode", () => {
+      const request = parseRequest(
+        JSON.stringify({ ...exploreBase, steps: [step, { index: 1, action: "wait", value: "500" }] }),
+      );
+      expect(request.mode).toBe("explore");
+      expect(request.steps).toHaveLength(2);
+    });
+
+    it("目标动作缺 selector 报错", () => {
+      expect(() =>
+        parseRequest(
+          JSON.stringify({ ...exploreBase, steps: [{ index: 0, action: "click" }] }),
+        ),
+      ).toThrow("selector");
+    });
+
+    it("fill 缺 value 报错", () => {
+      expect(() =>
+        parseRequest(
+          JSON.stringify({
+            ...exploreBase,
+            steps: [
+              {
+                index: 0,
+                action: "fill",
+                selector: { strategy: "role", value: "textbox", name: "搜索" },
+              },
+            ],
+          }),
+        ),
+      ).toThrow("value");
+    });
+
+    it("assert 缺 assertion 报错", () => {
+      expect(() =>
+        parseRequest(
+          JSON.stringify({ ...exploreBase, steps: [{ index: 0, action: "assert" }] }),
+        ),
+      ).toThrow("assertion");
+    });
+
+    it("非法 action 报错", () => {
+      expect(() =>
+        parseRequest(
+          JSON.stringify({ ...exploreBase, steps: [{ index: 0, action: "hover" }] }),
+        ),
+      ).toThrow("action");
+    });
+
+    it("步数超过 50 报错", () => {
+      const steps = Array.from({ length: 51 }, (_, i) => ({ index: i, action: "wait", value: "10" }));
+      expect(() => parseRequest(JSON.stringify({ ...exploreBase, steps }))).toThrow("上限");
+    });
+  });
+
+  describe("discover 模式", () => {
+    it("合法 discover 请求不需要 steps", () => {
+      const request = parseRequest(
+        JSON.stringify({ ...base, url: "http://localhost:5173/", mode: "discover" }),
+      );
+      expect(request.mode).toBe("discover");
+    });
+
+    it("非法 mode 报错", () => {
+      expect(() =>
+        parseRequest(JSON.stringify({ ...base, url: "http://x/", mode: "aggressive" })),
+      ).toThrow("mode");
+    });
+  });
 });

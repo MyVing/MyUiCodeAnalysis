@@ -53,6 +53,11 @@ TARGETS: dict[str, tuple[Path, Path]] = {
         REPO_ROOT / "backend" / "app" / "contracts" / "chain.py",
         REPO_ROOT / "shared" / "contracts" / "src" / "chain.ts",
     ),
+    # P5：AI 自动探索的计划、执行轨迹、场景清单与生成脚本。
+    "explore": (
+        REPO_ROOT / "backend" / "app" / "contracts" / "explore.py",
+        REPO_ROOT / "shared" / "contracts" / "src" / "explore.ts",
+    ),
 }
 
 # datamodel-code-generator 0.96.0 的参数，已用现有 contracts.py 逐字节验证还原。

@@ -6,14 +6,17 @@ from dataclasses import dataclass
 from sqlalchemy.ext.asyncio import AsyncEngine
 
 from app.core.config import Settings
+from app.storage.explore import ExploreRepository
 from app.storage.memory import (
     create_analysis_repository,
+    create_explore_repository,
     create_project_repository,
     create_requirement_repository,
     create_runtime_repository,
 )
 from app.storage.mysql import (
     MySqlAnalysisRepository,
+    MySqlExploreRepository,
     MySqlProjectRepository,
     MySqlRequirementRepository,
     MySqlRuntimeRepository,
@@ -34,6 +37,7 @@ class Storage:
     analyses: AnalysisRepository
     requirements: RequirementRepository
     runtimes: RuntimeRepository
+    explores: "ExploreRepository"
     engine: AsyncEngine | None = None  # memory 分支为 None
 
 
@@ -45,6 +49,7 @@ def create_storage(settings: Settings) -> Storage:
             analyses=create_analysis_repository(),
             requirements=create_requirement_repository(),
             runtimes=create_runtime_repository(),
+            explores=create_explore_repository(),
         )
     engine = create_engine_from_url(settings)
     return Storage(
@@ -52,6 +57,7 @@ def create_storage(settings: Settings) -> Storage:
         analyses=MySqlAnalysisRepository(engine),
         requirements=MySqlRequirementRepository(engine),
         runtimes=MySqlRuntimeRepository(engine),
+        explores=MySqlExploreRepository(engine),
         engine=engine,
     )
 

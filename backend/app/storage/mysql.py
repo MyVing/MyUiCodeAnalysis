@@ -12,6 +12,7 @@
 - 不做内存实现那种「每项目 5 张图」的有界淘汰：持久化的意义就是保留历史。
 """
 
+import json
 import logging
 from datetime import UTC, datetime
 from typing import Any
@@ -23,7 +24,13 @@ from sqlalchemy.ext.asyncio import AsyncEngine, create_async_engine
 from app.contracts import IRGraph, RequirementMap, RuntimeTrace
 from app.core.config import Settings
 from app.requirement.page_profile import ProfilePayload
-from app.schemas import AnalysisTask, Project, RequirementTask, RuntimeTask
+from app.schemas import (
+    AnalysisTask,
+    ExploreTask,
+    Project,
+    RequirementTask,
+    RuntimeTask,
+)
 from app.storage.checkpoint import CHECKPOINT_DDL_STATEMENTS
 from app.storage.repositories import DuplicateRemoteUrlError
 
@@ -169,6 +176,45 @@ DDL_STATEMENTS: tuple[str, ...] = (
     """,
     # LangGraph checkpointer 的两张表：需求定位中间状态的审计落盘（P3 起）
     *CHECKPOINT_DDL_STATEMENTS,
+    # P5 AI 自动探索：任务状态 + 整包产物（JSON）+ 产物目录
+    """
+    CREATE TABLE IF NOT EXISTS explore_tasks (
+      id VARCHAR(32) PRIMARY KEY,
+      project_id VARCHAR(32) NOT NULL,
+      goal TEXT NOT NULL,
+      status ENUM('queued','running','succeeded','failed') NOT NULL,
+      command VARCHAR(500) NULL,
+      url VARCHAR(2048) NULL,
+      analysis_id VARCHAR(32) NULL,
+      dry_run BOOLEAN NOT NULL DEFAULT FALSE,
+      max_steps INT NULL,
+      created_at DATETIME(6) NOT NULL,
+      started_at DATETIME(6) NULL,
+      finished_at DATETIME(6) NULL,
+      error_code VARCHAR(64) NULL,
+      error_message TEXT NULL,
+      element_count INT NULL,
+      step_count INT NULL,
+      success_count INT NULL,
+      failed_count INT NULL,
+      screenshot_count INT NULL,
+      CONSTRAINT fk_explores_project FOREIGN KEY (project_id)
+        REFERENCES projects(id) ON DELETE CASCADE,
+      KEY idx_explore_tasks_project (project_id, created_at)
+    ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4
+    """,
+    """
+    CREATE TABLE IF NOT EXISTS explore_artifacts (
+      task_id VARCHAR(32) PRIMARY KEY,
+      project_id VARCHAR(32) NOT NULL,
+      payload JSON NOT NULL,
+      artifacts_dir VARCHAR(512) NOT NULL,
+      created_at DATETIME(6) NOT NULL,
+      CONSTRAINT fk_explore_artifacts_task FOREIGN KEY (task_id)
+        REFERENCES explore_tasks(id) ON DELETE CASCADE,
+      KEY idx_explore_artifacts_project (project_id, created_at)
+    ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4
+    """,
 )
 
 _RESTARTED_MESSAGE = "服务重启时任务仍在进行中，无法恢复子进程状态，已标记为失败。"
@@ -895,3 +941,142 @@ class MySqlRuntimeRepository:
         async with self._engine.connect() as conn:
             row = (await conn.execute(query, {"pid": project_id})).first()
         return RuntimeTrace.model_validate_json(row.payload) if row else None
+
+
+class MySqlExploreRepository:
+    """探索任务 + 整包产物（JSON）+ 产物目录。形状与 runtime 仓储同构。"""
+
+    def __init__(self, engine: AsyncEngine) -> None:
+        self._engine = engine
+
+    def _task(self, row: Row[Any]) -> ExploreTask:
+        return ExploreTask(
+            id=row.id,
+            project_id=row.project_id,
+            goal=row.goal,
+            status=row.status,
+            command=row.command,
+            url=row.url,
+            analysis_id=row.analysis_id,
+            dry_run=bool(row.dry_run),
+            max_steps=row.max_steps,
+            created_at=_from_db(row.created_at),
+            started_at=_from_db(row.started_at),
+            finished_at=_from_db(row.finished_at),
+            error_code=row.error_code,
+            error_message=row.error_message,
+            element_count=row.element_count,
+            step_count=row.step_count,
+            success_count=row.success_count,
+            failed_count=row.failed_count,
+            screenshot_count=row.screenshot_count,
+        )
+
+    async def add_task(self, task: ExploreTask) -> ExploreTask:
+        query = text(
+            """
+            INSERT INTO explore_tasks
+              (id, project_id, goal, status, command, url, analysis_id, dry_run,
+               max_steps, created_at)
+            VALUES
+              (:id, :pid, :goal, 'queued', :command, :url, :aid, :dry_run,
+               :max_steps, :created_at)
+            """
+        )
+        async with self._engine.begin() as conn:
+            await conn.execute(
+                query,
+                {
+                    "id": task.id,
+                    "pid": task.project_id,
+                    "goal": task.goal,
+                    "command": task.command,
+                    "url": task.url,
+                    "aid": task.analysis_id,
+                    "dry_run": task.dry_run,
+                    "max_steps": task.max_steps,
+                    "created_at": _to_db(task.created_at),
+                },
+            )
+        return task
+
+    async def get_task(self, task_id: str) -> ExploreTask | None:
+        query = text("SELECT * FROM explore_tasks WHERE id = :id")
+        async with self._engine.connect() as conn:
+            row = (await conn.execute(query, {"id": task_id})).first()
+        return self._task(row) if row else None
+
+    async def update_task(self, task: ExploreTask) -> ExploreTask:
+        query = text(
+            """
+            UPDATE explore_tasks
+            SET status = :status, started_at = :started_at, finished_at = :finished_at,
+                error_code = :error_code, error_message = :error_message,
+                element_count = :element_count, step_count = :step_count,
+                success_count = :success_count, failed_count = :failed_count,
+                screenshot_count = :screenshot_count
+            WHERE id = :id
+            """
+        )
+        async with self._engine.begin() as conn:
+            await conn.execute(
+                query,
+                {
+                    "id": task.id,
+                    "status": task.status,
+                    "started_at": _to_db(task.started_at) if task.started_at else None,
+                    "finished_at": _to_db(task.finished_at) if task.finished_at else None,
+                    "error_code": task.error_code,
+                    "error_message": task.error_message,
+                    "element_count": task.element_count,
+                    "step_count": task.step_count,
+                    "success_count": task.success_count,
+                    "failed_count": task.failed_count,
+                    "screenshot_count": task.screenshot_count,
+                },
+            )
+        return task
+
+    async def list_by_project(self, project_id: str) -> list[ExploreTask]:
+        query = text(
+            "SELECT * FROM explore_tasks WHERE project_id = :pid ORDER BY created_at DESC"
+        )
+        async with self._engine.connect() as conn:
+            rows = (await conn.execute(query, {"pid": project_id})).all()
+        return [self._task(row) for row in rows]
+
+    async def save_artifact(self, artifact: dict[str, Any], artifacts_dir: str) -> None:
+        query = text(
+            """
+            INSERT INTO explore_artifacts (task_id, project_id, payload, artifacts_dir, created_at)
+            VALUES (:tid, :pid, :payload, :dir, :created_at)
+            ON DUPLICATE KEY UPDATE payload = VALUES(payload),
+              artifacts_dir = VALUES(artifacts_dir)
+            """
+        )
+        payload = json.dumps(artifact, ensure_ascii=False)
+        async with self._engine.begin() as conn:
+            await conn.execute(
+                query,
+                {
+                    "tid": artifact["taskId"],
+                    "pid": artifact["projectId"],
+                    "payload": payload,
+                    "dir": artifacts_dir,
+                    "created_at": _to_db(datetime.now(UTC)),
+                },
+            )
+
+    async def get_artifact(self, task_id: str) -> dict[str, Any] | None:
+        query = text("SELECT payload FROM explore_artifacts WHERE task_id = :tid")
+        async with self._engine.connect() as conn:
+            row = (await conn.execute(query, {"tid": task_id})).first()
+        if not row:
+            return None
+        return json.loads(row.payload)
+
+    async def get_artifacts_dir(self, task_id: str) -> str | None:
+        query = text("SELECT artifacts_dir FROM explore_artifacts WHERE task_id = :tid")
+        async with self._engine.connect() as conn:
+            row = (await conn.execute(query, {"tid": task_id})).first()
+        return str(row.artifacts_dir) if row else None

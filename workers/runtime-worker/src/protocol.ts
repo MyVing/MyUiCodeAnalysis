@@ -37,12 +37,81 @@ export interface RuntimeWorkerRequest {
   settleMs?: number;
   /** 视口，缺省 1280x800 */
   viewport?: { width: number; height: number };
+  /**
+   * 采集模式：passive（缺省，被动采集 RuntimeTrace）| discover（枚举可交互
+   * 元素）| explore（确定性执行探索计划）。discover 与 explore 是 P5 的
+   * AI 自动探索链路，产物形状由 shared/schemas/explore.schema.json 约定。
+   */
+  mode?: WorkerMode;
+  /** discover：可交互元素枚举上限，缺省 200 */
+  maxElements?: number;
+  /** explore：要执行的确定性计划步骤（selector 已由后端从 discovery 解析） */
+  steps?: PlanStepRequest[];
+  /** explore：截图产物目录（绝对路径）；Worker 写 step-NNN.png 并回传文件名 */
+  artifactsDir?: string;
 }
 
-/** Worker 成功响应。trace 形状由 shared/schemas/runtime.schema.json 约定。 */
+export type WorkerMode = "passive" | "discover" | "explore";
+
+/** explore 计划步骤的执行形态（契约 PlanStep 的裁剪版，只留执行所需字段）。 */
+export interface PlanStepRequest {
+  index: number;
+  action: "click" | "fill" | "select" | "press" | "wait" | "screenshot" | "assert" | "navigate";
+  /** 与契约 Selector 对齐 */
+  selector?: { strategy: "role" | "testId" | "css" | "text"; value: string; name?: string };
+  value?: string;
+  assertion?: string;
+  optional?: boolean;
+}
+
+/** discover 模式的响应产物：页面上真实存在的可交互元素清单。 */
+export interface DiscoverOutcome {
+  pageUrl: string;
+  title?: string;
+  elements: DiscoverElement[];
+}
+
+export interface DiscoverElement {
+  index: number;
+  tag: string;
+  role: string;
+  name: string;
+  type?: string;
+  testId?: string;
+  href?: string;
+  visible: boolean;
+  selector: { strategy: "role" | "testId" | "css" | "text"; value: string; name?: string };
+}
+
+/** explore 模式的响应产物：逐步执行结果与截图文件名。 */
+export interface ExploreOutcome {
+  pageUrl: string;
+  title?: string;
+  results: ExploreStepOutcome[];
+  screenshots: { stepIndex: number; fileName: string }[];
+}
+
+export interface ExploreStepOutcome {
+  index: number;
+  action: PlanStepRequest["action"];
+  target: string;
+  selector?: PlanStepRequest["selector"];
+  valueSummary?: string;
+  result: "success" | "failed" | "skipped" | "no_change";
+  error?: string;
+  screenshotRef?: string;
+  triggeredNetworkEvents?: string[];
+  pageTransitioned?: boolean;
+  url?: string;
+}
+
+/** Worker 成功响应。trace / discovery / explore 的形状分别由
+ * runtime.schema.json 与 explore.schema.json 约定。 */
 export interface RuntimeWorkerSuccess {
   ok: true;
-  trace: unknown;
+  trace?: unknown;
+  discovery?: unknown;
+  explore?: unknown;
 }
 
 /** Worker 失败响应；失败也走正常退出码，避免编排层只能靠 kill 判断。 */
@@ -62,4 +131,6 @@ export type RuntimeWorkerErrorCode =
   | "dev_server_failed"
   | "browser_unavailable"
   | "page_load_failed"
-  | "collect_failed";
+  | "collect_failed"
+  | "plan_invalid"
+  | "explore_failed";

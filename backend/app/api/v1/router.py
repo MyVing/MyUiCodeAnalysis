@@ -4,6 +4,7 @@ from fastapi import APIRouter
 
 from app.api.v1 import (
     analyses,
+    explore,
     graph,
     health,
     plugins,
@@ -23,4 +24,5 @@ api_router.include_router(tasks.router)
 api_router.include_router(plugins.router)
 api_router.include_router(requirements.router)
 api_router.include_router(runtime.router)
+api_router.include_router(explore.router)
 api_router.include_router(source.router)

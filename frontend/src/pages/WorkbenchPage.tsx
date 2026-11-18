@@ -20,6 +20,7 @@ import { Link, useParams } from "react-router-dom";
 import { api } from "@/api/client";
 import { useAnalysisTask, useProject, useProjectGraph, useRuntimeTask } from "@/api/queries";
 import type { AnalysisStart, Framework, RuntimeStart } from "@/api/types";
+import { ExplorePanel } from "@/components/ExplorePanel";
 import { GraphSidebar } from "@/components/GraphSidebar";
 import { NodeInspector } from "@/components/NodeInspector";
 import { RequirementPanel } from "@/components/RequirementPanel";
@@ -533,6 +534,8 @@ export default function WorkbenchPage() {
           onSelectNode={focusNode}
         />
       )}
+
+      <ExplorePanel projectId={projectId} />
 
       <div className="flex min-h-0 flex-1">
         <aside className="hidden w-64 shrink-0 flex-col border-r border-white/[0.09] bg-[#10151e] lg:flex">

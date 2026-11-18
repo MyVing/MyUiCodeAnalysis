@@ -65,6 +65,27 @@ export const useRequirementTask = (taskId: string | null) =>
     },
   });
 
+/** 轮询 AI 探索任务：discovery + 计划 + 执行三段，节奏同上 */
+export const useExploreTask = (taskId: string | null) =>
+  useQuery({
+    queryKey: ["explore-tasks", taskId],
+    queryFn: () => api.getExploreTask(taskId as string),
+    enabled: taskId !== null,
+    refetchInterval: (query) => {
+      const status = query.state.data?.status;
+      return status === "queued" || status === "running" ? 1000 : false;
+    },
+  });
+
+/** 探索产物（轨迹 / 计划 / 场景 / 脚本）：任务成功后才请求 */
+export const useExploreArtifact = (taskId: string | null) =>
+  useQuery({
+    queryKey: ["explore-artifact", taskId],
+    queryFn: () => api.getExploreArtifact(taskId as string),
+    enabled: taskId !== null,
+    staleTime: 60_000,
+  });
+
 /** 节点源码片段：只有拿到文件路径才请求，同一文件的不同行分开缓存 */
 export const useSourceExcerpt = (projectId: string, file: string | null, line?: number) =>
   useQuery({

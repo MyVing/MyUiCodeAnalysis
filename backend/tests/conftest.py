@@ -8,7 +8,10 @@ from fastapi.testclient import TestClient
 
 from app.api.deps import (
     get_analysis_repository,
+    get_explore_repository,
+    get_explore_worker_runner,
     get_git_client,
+    get_llm_client,
     get_project_repository,
     get_requirement_repository,
     get_runtime_repository,
@@ -19,11 +22,17 @@ from app.core.config import Settings, get_settings
 from app.main import create_app
 from app.storage.memory import (
     InMemoryAnalysisRepository,
+    InMemoryExploreRepository,
     InMemoryProjectRepository,
     InMemoryRequirementRepository,
     InMemoryRuntimeRepository,
 )
-from tests.fakes import FakeGitClient, FakeRuntimeWorkerRunner, FakeWorkerRunner
+from tests.fakes import (
+    FakeExploreWorkerRunner,
+    FakeGitClient,
+    FakeRuntimeWorkerRunner,
+    FakeWorkerRunner,
+)
 
 
 @pytest.fixture
@@ -42,6 +51,11 @@ def runtime_repository() -> InMemoryRuntimeRepository:
 
 
 @pytest.fixture
+def explore_repository() -> InMemoryExploreRepository:
+    return InMemoryExploreRepository()
+
+
+@pytest.fixture
 def fake_runner() -> FakeWorkerRunner:
     return FakeWorkerRunner()
 
@@ -49,6 +63,11 @@ def fake_runner() -> FakeWorkerRunner:
 @pytest.fixture
 def fake_runtime_runner() -> FakeRuntimeWorkerRunner:
     return FakeRuntimeWorkerRunner()
+
+
+@pytest.fixture
+def fake_explore_runner() -> FakeExploreWorkerRunner:
+    return FakeExploreWorkerRunner()
 
 
 @pytest.fixture
@@ -62,13 +81,18 @@ def client(
     analysis_repository: InMemoryAnalysisRepository,
     requirement_repository: InMemoryRequirementRepository,
     runtime_repository: InMemoryRuntimeRepository,
+    explore_repository: InMemoryExploreRepository,
     fake_runner: FakeWorkerRunner,
     fake_runtime_runner: FakeRuntimeWorkerRunner,
+    fake_explore_runner: FakeExploreWorkerRunner,
     fake_git: FakeGitClient,
 ) -> Iterator[TestClient]:
     # 测试必须与开发者本地 .env 隔离：显式传不读 .env 的配置，
     # 并覆盖 get_settings，防止 DI 路径读到本地 APP_DB_URL（如 MySQL）
-    settings = settings_with(repos_dir=tmp_path / "repos")
+    settings = settings_with(
+        repos_dir=tmp_path / "repos",
+        explore_artifacts_dir=tmp_path / "explore",
+    )
     app = create_app(settings)
     app.dependency_overrides[get_settings] = lambda: settings
     repository = InMemoryProjectRepository()
@@ -76,9 +100,14 @@ def client(
     app.dependency_overrides[get_analysis_repository] = lambda: analysis_repository
     app.dependency_overrides[get_requirement_repository] = lambda: requirement_repository
     app.dependency_overrides[get_runtime_repository] = lambda: runtime_repository
+    app.dependency_overrides[get_explore_repository] = lambda: explore_repository
     app.dependency_overrides[get_worker_runner] = lambda: fake_runner
     app.dependency_overrides[get_runtime_worker_runner] = lambda: fake_runtime_runner
+    app.dependency_overrides[get_explore_worker_runner] = lambda: fake_explore_runner
     app.dependency_overrides[get_git_client] = lambda: fake_git
+    # 默认禁用 LLM（get_llm_client 直接读本地 .env，会打到真实服务）；
+    # 需要 LLM 的用例在测试内自行覆盖为 FakeLLMClient
+    app.dependency_overrides[get_llm_client] = lambda: None
     with TestClient(app) as test_client:
         yield test_client
     app.dependency_overrides.clear()

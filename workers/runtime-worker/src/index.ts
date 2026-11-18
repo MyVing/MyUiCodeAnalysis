@@ -10,11 +10,20 @@
  *  - 任何失败都以 { ok: false, error } 形式回传，并退出码 0。
  *  - stdout 只输出一行业务 JSON；日志一律走 stderr。
  *  - 无论成功失败，托管启动的 dev server 都会被杀掉，浏览器都会关闭。
+ *
+ * 三种模式：passive（被动采集 RuntimeTrace）| discover（枚举可交互元素）|
+ * explore（确定性执行探索计划），由 request.mode 分发，缺省 passive。
  */
 
 import { collectTrace, launchBrowserWithFallback } from "./collect.js";
+import { discoverElements } from "./discover.js";
+import { executeExplorePlan } from "./explore.js";
 import { parseRequest } from "./parse-request.js";
-import type { RuntimeWorkerRequest, RuntimeWorkerResponse } from "./protocol.js";
+import type {
+  RuntimeWorkerRequest,
+  RuntimeWorkerResponse,
+  RuntimeWorkerSuccess,
+} from "./protocol.js";
 import { startDevServer, type DevServerHandle } from "./vite-server.js";
 
 function log(message: string): void {
@@ -30,17 +39,23 @@ function readStdin(): Promise<string> {
   });
 }
 
-interface CollectOutcome {
+type BrowserHandle = Awaited<ReturnType<typeof launchBrowserWithFallback>>["browser"];
+
+interface ModeOutcome {
   ok: boolean;
-  trace?: unknown;
+  payload?: Partial<RuntimeWorkerSuccess>;
   error?: { code: string; message: string };
 }
 
-async function run(request: RuntimeWorkerRequest): Promise<CollectOutcome> {
+/** 打开页面（含 dev server 托管与浏览器启动），执行完回调后由调用方负责清理。 */
+async function withPage(
+  request: RuntimeWorkerRequest,
+  log0: (message: string) => void,
+  run: (browser: BrowserHandle, baseUrl: string, server: DevServerHandle | null) => Promise<Partial<RuntimeWorkerSuccess>>,
+): Promise<ModeOutcome> {
   let server: DevServerHandle | null = null;
-  let browser: Awaited<ReturnType<typeof launchBrowserWithFallback>>["browser"] | null = null;
+  let browser: BrowserHandle | null = null;
   try {
-    // 1. 页面来源：url 直连，或托管 dev server（close 保证 finally 必杀）
     let baseUrl: string;
     if (request.url !== undefined) {
       baseUrl = request.url;
@@ -49,26 +64,21 @@ async function run(request: RuntimeWorkerRequest): Promise<CollectOutcome> {
         request.command as string,
         request.rootPath,
         request.serverTimeoutMs ?? 60_000,
-        log,
+        log0,
       );
       baseUrl = server.baseUrl;
     }
 
-    // 2. 浏览器与采集
     const launched = await launchBrowserWithFallback();
     browser = launched.browser;
-    log(`浏览器：${launched.channel ?? "bundled chromium"}`);
-
-    const devServerInfo: { port: number; command?: string } | null =
-      server !== null
-        ? request.command !== undefined
-          ? { port: server.port, command: request.command }
-          : { port: server.port }
-        : null;
-    const collected = await collectTrace(browser, request, baseUrl, devServerInfo, log);
-    return { ok: true, trace: collected.trace };
+    log0(`浏览器：${launched.channel ?? "bundled chromium"}`);
+    const payload = await run(browser, baseUrl, server);
+    return { ok: true, payload };
   } catch (error) {
-    const code = typeof (error as { code?: unknown })?.code === "string" ? (error as { code: string }).code : "collect_failed";
+    const code =
+      typeof (error as { code?: unknown })?.code === "string"
+        ? (error as { code: string }).code
+        : "collect_failed";
     return {
       ok: false,
       error: { code, message: error instanceof Error ? error.message : String(error) },
@@ -80,6 +90,92 @@ async function run(request: RuntimeWorkerRequest): Promise<CollectOutcome> {
     if (server !== null) {
       await server.close().catch(() => undefined);
     }
+  }
+}
+
+async function runPassive(request: RuntimeWorkerRequest): Promise<ModeOutcome> {
+  return withPage(request, log, async (browser, baseUrl, server) => {
+    const devServerInfo: { port: number; command?: string } | null =
+      server !== null
+        ? request.command !== undefined
+          ? { port: server.port, command: request.command }
+          : { port: server.port }
+        : null;
+    const collected = await collectTrace(browser, request, baseUrl, devServerInfo, log);
+    return { trace: collected.trace };
+  });
+}
+
+async function runDiscover(request: RuntimeWorkerRequest): Promise<ModeOutcome> {
+  return withPage(request, log, async (browser, baseUrl) => {
+    const context = await browser.newContext({ viewport: request.viewport ?? { width: 1280, height: 800 } });
+    try {
+      const page = await context.newPage();
+      try {
+        await page.goto(baseUrl, { waitUntil: "load", timeout: 30_000 });
+      } catch (error) {
+        throw Object.assign(
+          new Error(`页面加载失败（${baseUrl}）：${String(error)}`),
+          { code: "page_load_failed" },
+        );
+      }
+      const settleMs = request.settleMs ?? 3000;
+      await page
+        .waitForLoadState("networkidle", { timeout: Math.max(settleMs, 1000) })
+        .catch(() => log("networkidle 未在观察窗口内达成，按已加载内容继续枚举"));
+      await page.waitForTimeout(settleMs / 2);
+
+      const discovered = await discoverElements(page, request.maxElements ?? 200);
+      log(`发现 ${discovered.elements.length} 个可交互元素`);
+      return {
+        discovery: {
+          pageUrl: discovered.pageUrl,
+          ...(discovered.title !== undefined ? { title: discovered.title } : {}),
+          elements: discovered.elements,
+        },
+      };
+    } finally {
+      await context.close().catch(() => undefined);
+    }
+  });
+}
+
+async function runExplore(request: RuntimeWorkerRequest): Promise<ModeOutcome> {
+  const steps = request.steps ?? [];
+  return withPage(request, log, async (browser, baseUrl) => {
+    const context = await browser.newContext({ viewport: request.viewport ?? { width: 1280, height: 800 } });
+    try {
+      const page = await context.newPage();
+      try {
+        await page.goto(baseUrl, { waitUntil: "load", timeout: 30_000 });
+      } catch (error) {
+        throw Object.assign(
+          new Error(`页面加载失败（${baseUrl}）：${String(error)}`),
+          { code: "page_load_failed" },
+        );
+      }
+      await page.waitForLoadState("networkidle", { timeout: 5000 }).catch(() => undefined);
+      const outcome = await executeExplorePlan(
+        page,
+        steps,
+        { artifactsDir: request.artifactsDir as string },
+        log,
+      );
+      return { explore: outcome };
+    } finally {
+      await context.close().catch(() => undefined);
+    }
+  });
+}
+
+async function run(request: RuntimeWorkerRequest): Promise<ModeOutcome> {
+  switch (request.mode ?? "passive") {
+    case "discover":
+      return runDiscover(request);
+    case "explore":
+      return runExplore(request);
+    default:
+      return runPassive(request);
   }
 }
 
@@ -101,13 +197,12 @@ async function main(): Promise<void> {
 
   const response = await run(request);
   const payload: RuntimeWorkerResponse =
-    response.ok && response.trace !== undefined
-      ? { ok: true, trace: response.trace }
+    response.ok && response.payload !== undefined
+      ? { ok: true, ...response.payload }
       : {
           ok: false,
           error:
-            response.error ??
-            ({ code: "collect_failed", message: "采集未产出结果" } as const),
+            response.error ?? ({ code: "collect_failed", message: "采集未产出结果" } as const),
         };
   process.stdout.write(JSON.stringify(payload));
   process.stdout.write("\n");

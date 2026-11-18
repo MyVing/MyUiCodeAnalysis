@@ -10,17 +10,28 @@ from pathlib import Path
 
 from app.analysis.runner import WorkerOutcome, WorkerRequest
 from app.contracts import (
+    Action,
     ComponentNode,
+    DiscoveredElement,
     EdgeKind,
     Evidence,
+    ExploreStepResult,
     IREdge,
     IRGraph,
     IRNode,
     Location,
     NodeKind,
     PageInfo,
+    Result,
     RuntimeTrace,
+    Screenshot,
     Source,
+)
+from app.explore.runner import (
+    DiscoverOutcome,
+    DiscoverWorkerRequest,
+    ExploreOutcome,
+    ExploreWorkerRequest,
 )
 from app.git_client import GitError, GitSnapshot
 from app.requirement.llm import LLMCallError
@@ -217,4 +228,107 @@ class FakeRuntimeWorkerRunner:
         return RuntimeWorkerOutcome(
             ok=True,
             trace=mini_trace(request.trace_id, request.project_id, request.analysis_id),
+        )
+
+
+def _mini_elements() -> list[dict[str, object]]:
+    """与 worker discover 输出对齐的最小元素集：文本框 + 按钮 + 链接。"""
+    return [
+        {
+            "index": 0,
+            "tag": "input",
+            "role": "textbox",
+            "name": "搜索关键词",
+            "type": "text",
+            "visible": True,
+            "selector": {"strategy": "role", "value": "textbox", "name": "搜索关键词"},
+        },
+        {
+            "index": 1,
+            "tag": "button",
+            "role": "button",
+            "name": "查询",
+            "visible": True,
+            "selector": {"strategy": "role", "value": "button", "name": "查询"},
+        },
+        {
+            "index": 2,
+            "tag": "a",
+            "role": "link",
+            "name": "登录",
+            "href": "http://localhost:5199/login",
+            "visible": True,
+            "selector": {"strategy": "role", "value": "link", "name": "登录"},
+        },
+    ]
+
+
+class FakeExploreWorkerRunner:
+    """探索 Worker 的假实现：discover / explore 都返回脚本化的成功或失败。"""
+
+    def __init__(
+        self,
+        mode: str = "success",
+        error_code: str = "browser_unavailable",
+        error_message: str = "模拟的探索失败",
+    ) -> None:
+        self.mode = mode
+        self.error_code = error_code
+        self.error_message = error_message
+        self.discover_requests: list[DiscoverWorkerRequest] = []
+        self.explore_requests: list[ExploreWorkerRequest] = []
+        self.timeouts: list[float] = []
+
+    async def discover(
+        self, request: DiscoverWorkerRequest, timeout_seconds: float
+    ) -> DiscoverOutcome:
+        self.discover_requests.append(request)
+        self.timeouts.append(timeout_seconds)
+        if self.mode == "failure":
+            return DiscoverOutcome(
+                ok=False,
+                error_code=self.error_code,
+                error_message=self.error_message,
+            )
+        return DiscoverOutcome(
+            ok=True,
+            page_url="http://localhost:5199/",
+            title="订单平台",
+            elements=[
+                DiscoveredElement.model_validate(el) for el in _mini_elements()
+            ],
+        )
+
+    async def explore(
+        self, request: ExploreWorkerRequest, timeout_seconds: float
+    ) -> ExploreOutcome:
+        self.explore_requests.append(request)
+        self.timeouts.append(timeout_seconds)
+        if self.mode == "failure":
+            return ExploreOutcome(
+                ok=False,
+                error_code=self.error_code,
+                error_message=self.error_message,
+            )
+        results: list[ExploreStepResult] = []
+        screenshots: list[Screenshot] = []
+        for position, step in enumerate(request.steps):
+            results.append(
+                ExploreStepResult(
+                    index=step.index,
+                    action=Action(step.action),
+                    target=str(step.selector or step.action),
+                    result=Result.success,
+                    url="http://localhost:5199/",
+                    pageTransitioned=False,
+                )
+            )
+            file_name = f"step-{position:03d}.png"
+            screenshots.append(Screenshot(stepIndex=step.index, fileName=file_name))
+        return ExploreOutcome(
+            ok=True,
+            page_url="http://localhost:5199/",
+            title="订单平台",
+            results=results,
+            screenshots=screenshots,
         )

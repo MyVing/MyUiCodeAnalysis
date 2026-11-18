@@ -1,4 +1,4 @@
-import type { RequirementMap } from "@uicodeanalysis/contracts";
+import type { ExploreArtifact, RequirementMap } from "@uicodeanalysis/contracts";
 
 export type Framework = "react" | "next";
 
@@ -172,3 +172,41 @@ export interface RequirementTaskList {
 }
 
 export type RequirementMapArtifact = RequirementMap;
+
+/** AI 自动探索输入：url 与 command 二选一；dryRun=true 只产出计划不执行 */
+export interface ExploreStart {
+  goal: string;
+  command?: string;
+  url?: string;
+  analysisId?: string;
+  dryRun: boolean;
+  maxSteps?: number;
+}
+
+export interface ExploreTask {
+  id: string;
+  projectId: string;
+  goal: string;
+  status: TaskStatus;
+  command?: string | null;
+  url?: string | null;
+  analysisId?: string | null;
+  dryRun: boolean;
+  maxSteps?: number | null;
+  createdAt: string;
+  startedAt?: string | null;
+  finishedAt?: string | null;
+  errorCode?: string | null;
+  errorMessage?: string | null;
+  elementCount?: number | null;
+  stepCount?: number | null;
+  successCount?: number | null;
+  failedCount?: number | null;
+  screenshotCount?: number | null;
+}
+
+export interface ExploreTaskList {
+  items: ExploreTask[];
+}
+
+export type ExploreArtifactData = ExploreArtifact;

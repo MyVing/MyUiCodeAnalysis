@@ -1,8 +1,16 @@
-import type { IRGraph, RequirementMap, RuntimeTrace } from "@uicodeanalysis/contracts";
+import type {
+  ExploreArtifact,
+  IRGraph,
+  RequirementMap,
+  RuntimeTrace,
+} from "@uicodeanalysis/contracts";
 import type {
   AnalysisStart,
   AnalysisTask,
   AnalysisTaskList,
+  ExploreStart,
+  ExploreTask,
+  ExploreTaskList,
   HealthStatus,
   PluginList,
   Project,
@@ -151,4 +159,24 @@ export const api = {
 
   getRequirementMap: (taskId: string) =>
     request<RequirementMap>(`/requirements/${taskId}/map`),
+
+  startExplore: (projectId: string, payload: ExploreStart) =>
+    request<ExploreTask>(`/projects/${projectId}/explores`, {
+      method: "POST",
+      body: JSON.stringify(payload),
+    }),
+
+  listExploreTasks: (projectId: string) =>
+    request<ExploreTaskList>(`/projects/${projectId}/explores`),
+
+  getExploreTask: (taskId: string) => request<ExploreTask>(`/explore-tasks/${taskId}`),
+
+  getExploreArtifact: (taskId: string) =>
+    request<ExploreArtifact>(`/explore-tasks/${taskId}/artifact`),
+
+  /** 截图与脚本是二进制/文本下载，直接给 URL（window.open / <img>） */
+  exploreScreenshotUrl: (taskId: string, fileName: string) =>
+    `${API_BASE_URL}/explore-tasks/${taskId}/screenshots/${fileName}`,
+
+  exploreScriptUrl: (taskId: string) => `${API_BASE_URL}/explore-tasks/${taskId}/script`,
 };

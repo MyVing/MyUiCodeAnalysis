@@ -5,16 +5,19 @@
 """
 
 import asyncio
+import json
 from collections import deque
+from typing import Any
 
 from app.contracts import IRGraph, RequirementMap, RuntimeTrace
 from app.requirement.page_profile import ProfilePayload
-from app.schemas import AnalysisTask, Project, RequirementTask, RuntimeTask
+from app.schemas import AnalysisTask, ExploreTask, Project, RequirementTask, RuntimeTask
 from app.storage.repositories import DuplicateRemoteUrlError
 
 MAX_GRAPHS_PER_PROJECT = 5
 MAX_MAPS_PER_PROJECT = 20
 MAX_TRACES_PER_PROJECT = 20
+MAX_ARTIFACTS_PER_PROJECT = 20
 
 
 class InMemoryProjectRepository:
@@ -278,3 +281,59 @@ class InMemoryRuntimeRepository:
 
 def create_runtime_repository() -> InMemoryRuntimeRepository:
     return InMemoryRuntimeRepository()
+
+
+class InMemoryExploreRepository:
+    def __init__(self) -> None:
+        self._tasks: dict[str, ExploreTask] = {}
+        # (artifact JSON, artifacts_dir)；artifact 按 task_id 一比一，按项目有界淘汰
+        self._artifacts: dict[str, tuple[dict[str, Any], str]] = {}
+        self._artifact_order: dict[str, deque[str]] = {}
+        self._lock = asyncio.Lock()
+
+    async def add_task(self, task: ExploreTask) -> ExploreTask:
+        async with self._lock:
+            self._tasks[task.id] = task
+        return task
+
+    async def get_task(self, task_id: str) -> ExploreTask | None:
+        async with self._lock:
+            return self._tasks.get(task_id)
+
+    async def update_task(self, task: ExploreTask) -> ExploreTask:
+        async with self._lock:
+            self._tasks[task.id] = task
+            return task
+
+    async def list_by_project(self, project_id: str) -> list[ExploreTask]:
+        async with self._lock:
+            items = [item for item in self._tasks.values() if item.project_id == project_id]
+        return sorted(items, key=lambda item: item.created_at, reverse=True)
+
+    async def save_artifact(self, artifact: dict[str, Any], artifacts_dir: str) -> None:
+        async with self._lock:
+            task_id = str(artifact["taskId"])
+            project_id = str(artifact["projectId"])
+            self._artifacts[task_id] = (artifact, artifacts_dir)
+            order = self._artifact_order.setdefault(project_id, deque())
+            if task_id in order:
+                order.remove(task_id)
+            order.append(task_id)
+            while len(order) > MAX_ARTIFACTS_PER_PROJECT:
+                oldest = order.popleft()
+                self._artifacts.pop(oldest, None)
+
+    async def get_artifact(self, task_id: str) -> dict[str, Any] | None:
+        async with self._lock:
+            stored = self._artifacts.get(task_id)
+            # 深拷贝语义：返回后调用方可自由修改，不影响仓储内状态
+            return json.loads(json.dumps(stored[0])) if stored else None
+
+    async def get_artifacts_dir(self, task_id: str) -> str | None:
+        async with self._lock:
+            stored = self._artifacts.get(task_id)
+            return stored[1] if stored else None
+
+
+def create_explore_repository() -> InMemoryExploreRepository:
+    return InMemoryExploreRepository()

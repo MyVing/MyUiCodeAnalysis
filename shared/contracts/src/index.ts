@@ -68,3 +68,17 @@ export type {
   Unmatched,
   VerifiedEvidence,
 } from "./requirement.js";
+
+export type {
+  DiscoveredElement,
+  ExploreArtifact,
+  ExplorePlan,
+  ExploreStepResult,
+  ExploreWarning,
+  GeneratedScript,
+  PlanStep,
+  Scenario,
+  Screenshot,
+  Selector,
+  TestCase,
+} from "./explore.js";
