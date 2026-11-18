@@ -1232,7 +1232,7 @@ acceptanceCriteria: [{ text, charRange }]
 
 功能点不再只按行切，而是「有动作描述的 section / 列表项」；验收标准挂到所属功能点下。字符偏移的作用是让最终证据能精确回跳到需求原文，而不是只给一句 quote。
 
-**第二步：锚点抽取（词典之前）。**（**已实现**（`app/requirement/anchors.py::extract_anchors`）；「界面原文」锚点依赖文档结构化，待第一步落地后补）用确定性规则从原文里抽出结构化锚点：
+**第二步：锚点抽取（词典之前）。**（**已实现**（`app/requirement/anchors.py::extract_anchors`）；界面词锚点已随差距表 #7 落地——引号内非路由 / 组件 / 字段的文本收作 `uiText` 锚点，单字符与两字母小写词不认；依赖文档结构化的「界面原文」批量抽取仍待第一步落地）用确定性规则从原文里抽出结构化锚点：
 
 | 锚点 | 识别规则（示例，不是最终正则） | 归一化 | 直连节点 |
 | --- | --- | --- | --- |
@@ -1245,7 +1245,7 @@ acceptanceCriteria: [{ text, charRange }]
 
 每个锚点记录 `kind / raw / normalized / charRange / featureId`。抽取时宁缺毋滥：把文件路径误当路由、把普通英文单词误当字段，都会制造高置信度误匹配。
 
-**第三步：锚点直连。**（**已实现**（`anchor_direct_connect`））精确命中给 0.95；模糊命中（后缀、参数通配）给 0.85；找不到对应节点时记 `anchor_unresolved` 并降级为普通文本，不硬凑。接口锚点复用 6.11 反向索引，置信度沿路径取最小值再乘锚点系数；路由锚点经 `:param` 归一化通配动态段；字段锚点只在唯一页面命中时直连，多页命中记 `anchor_ambiguous` 不硬凑。
+**第三步：锚点直连。**（**已实现**（`anchor_direct_connect`））精确命中给 0.95；模糊命中（后缀、参数通配）给 0.85；界面词锚点按 6.15 分档给 0.90。找不到对应节点时记 `anchor_unresolved` 并降级为普通文本，不硬凑。接口锚点复用 6.11 反向索引，置信度沿路径取最小值再乘锚点系数；路由锚点经 `:param` 归一化通配动态段；字段锚点只在唯一页面命中时直连，多页命中记 `anchor_ambiguous` 不硬凑。界面词锚点直连到链路元素的可见文案（viewText / 列名）：唯一命中落到**元素级**（`Match.chainId` + `targets` 指向「哪个按钮 / 哪一列」，差距表 #7），同页多元素命中只落页面级（记 `anchor_element_ambiguous`），跨页命中记 `anchor_ambiguous`。
 
 **第四步：语义残差。**（**已实现**（`orchestrator.locate_node`））只有**没有锚点覆盖**的功能点才走 `judge / locate`。同一个需求里锚点命中的页面可以作为「邻域约束」缩小其他功能点的候选集（同一模块的功能点通常落在相邻路由），但约束只影响排序，不改变模型只能从候选里选的事实。（邻域约束未做。）
 
@@ -1595,7 +1595,7 @@ dry-run 默认开启：模型产出的计划先给用户审阅，再决定是否
 | 4 | ~~route.title~~ / 菜单名未提取 | **已修（route.title）**：`routes.ts` 从路由表提取 `title` / `label` / `name` 字面量与 react-router `handle.title`（JSX 形态收 `title` 属性），写入 `route.attrs.title`；召回新增 `routeTitle` 信号（0.9）并进引文语料，「订单管理页」可命中带标题的路由。菜单配置提取（`mapping.json` 的 `menuFiles` 白名单）仍待做 | 4.1.6 |
 | 5 | ~~layout / page 未区分~~ | **已修**：`routes.ts` 按「element 内出现 react-router `<Outlet>`（内联 JSX 或组件声明子树）→ layout；有子路由 → layout；叶子路由 → page；index 优先」分类，写入 `route.attrs.pageComponentId` 与 `layoutComponentIds`；Next 的 `layout.tsx` 按目录前缀归属到子树页面路由；同一路径多个页面候选记 `route_page_ambiguous` 不静默取第一个。后端 `recall.page_nodes` 布局集合吃显式标注（覆盖「只挂一条路径」的场景），`anchors._route_pages` 直连候选以标注为准，布局组件不再冒充页面 | — | 4.1.6 / 6.12 |
 | 6 | ~~没有 `navigates` 边~~ | **已修**：`navigate.ts` 产出 `navigates` 边 | — | 4.1.5 / 6.14 |
-| 7 | 元素级匹配缺失 | `Match` 只有 `pageNodeId` | 只能回答「哪个页面」，不能回答「哪个按钮 / 哪一列」 | 6.14 / 6.15 |
+| 7 | ~~元素级匹配缺失~~ | **已修**：界面词锚点（引号内非路由 / 组件 / 字段文本，宁缺毋滥）直连到链路元素的可见文案（`viewText` / `attrs.columns` 字面量列名，列名已进链路元素段语料）——唯一命中落 `Match.chainId` + `targets` 指向具体元素（置信度 0.90，6.15 分档），同页多元素只落页面级并记 `anchor_element_ambiguous`，跨页命中记 `anchor_ambiguous`；AI 路径的元素级（`locate.py` 的链路引文归属）此前已落地 | — | 6.14 / 6.15 |
 | 8 | 交互链路未进契约与子图 | 子图一跳，`component → fn → api` 的 api 恒缺席 | 用户看不到「点击 → 函数 → 接口」的完整链路 | 6.8 / 6.14 |
 | 9 | ~~`verifiedEvidence` 从未填充~~ | **已修**：`judge._verified_evidence` 产出节点 id、文件、行列、命中字段与证据置信度 | — | 6.15 |
 | 10 | ~~`Source` 只有 `ai`，置信度统一封顶 0.6~~ | **已修（锚点部分）**：`requirement.schema.json` 的 `Match.confidence` 上限放宽到 1.0（AI 推断的 0.6 封顶仍由 judge 运行时硬保证），`source` 语义明确为「锚点直连=static / AI 判定=ai」；契约已重新生成。元素级 / 链路级证据的 source 细分仍待 6.14/6.15 | — | 6.15 |

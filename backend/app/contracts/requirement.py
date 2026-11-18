@@ -315,7 +315,7 @@ class Match(BaseModel):
     confidence: Annotated[
         float,
         Field(
-            description='结论置信度。AI 推断（source=ai）硬上限 0.6，模型自报的更高值不得透传；锚点直连（source=static，6.13）不受 0.6 约束：精确命中 0.95、模糊命中 0.85',
+            description='结论置信度。AI 推断（source=ai）硬上限 0.6，模型自报的更高值不得透传；锚点直连（source=static，6.13）不受 0.6 约束，按 6.15 分档：接口 / 路由 / 组件 / 文件 / 字段精确命中 0.95、URL 后缀 0.85、精确界面词（元素级，6.14）0.90',
             ge=0.0,
             le=1.0,
         ),

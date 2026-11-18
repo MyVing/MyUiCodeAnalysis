@@ -9,7 +9,7 @@ from __future__ import annotations
 
 from datetime import UTC, datetime
 
-from app.contracts import EdgeKind, NodeKind
+from app.contracts import EdgeKind, IREdge, IRGraph, IRNode, NodeKind
 from app.core.config import Settings
 from app.requirement.anchors import AnchorKind, anchor_direct_connect, extract_anchors
 from app.requirement.features import decompose
@@ -107,6 +107,24 @@ def test_field_anchors() -> None:
         (AnchorKind.field, "user_id")
     ]
     # 单个小写词太泛（id / name），不认；全大写不是字段
+    assert extract_anchors("按 `id` 排序") == []
+
+
+def test_ui_text_anchors_from_leftover_quotes() -> None:
+    """差距表 #7：引号里的界面词是用户手动标出的原文，收作 uiText 锚点。"""
+    assert [(a.kind, a.raw) for a in extract_anchors('点击「导出」按钮')] == [
+        (AnchorKind.uiText, "导出")
+    ]
+    # 其他锚点形态优先：路由 / 组件 / 字段不被当成界面词
+    kinds = [a.kind for a in extract_anchors("`/users` `UserList` `showFilter` 「搜索」")]
+    assert kinds == [
+        AnchorKind.route,
+        AnchorKind.component,
+        AnchorKind.field,
+        AnchorKind.uiText,
+    ]
+    # 单字符太泛（「增」「删」）与两字母小写词（`id`）不认
+    assert extract_anchors("点「增」新增一行") == []
     assert extract_anchors("按 `id` 排序") == []
 
 
@@ -274,6 +292,161 @@ def test_field_anchor_shared_by_pages_is_ambiguous() -> None:
     assert result.matches == []
     assert any(w.code == "anchor_ambiguous" for w in result.warnings)
 
+
+# ------------------------------------------------------------- 元素级直连（#7）
+
+
+def _button(
+    element_id: str,
+    *,
+    view_text: str | None = "导出",
+    attrs: dict | None = None,
+) -> IRNode:
+    base = {"events": ["onClick"]}
+    if view_text is not None:
+        base["viewText"] = view_text
+    base.update(attrs or {})
+    return node(
+        element_id,
+        NodeKind.element,
+        f"<button> {view_text or ''}".strip(),
+        file="src/pages/UserList.tsx",
+        attrs=base,
+    )
+
+
+def _element_graph(
+    elements: list[IRNode],
+    *,
+    props: list[tuple[str, str | None]] | None = None,
+    extra_nodes: list[IRNode] | None = None,
+    extra_edges: list[IREdge] | None = None,
+) -> IRGraph:
+    """UserList 页面 + 若干元素（contains 挂载）。"""
+    user_list = page("src/pages/UserList.tsx#UserList", "UserList", props=props)
+    route = node(
+        "src/router.tsx#/users",
+        NodeKind.route,
+        "/users",
+        file="src/router.tsx",
+        attrs={"path": "/users"},
+    )
+    return graph(
+        [user_list, route, *elements, *(extra_nodes or [])],
+        [
+            edge(route.id, user_list.id, EdgeKind.renders),
+            *(edge(user_list.id, element.id, EdgeKind.contains) for element in elements),
+            *(extra_edges or []),
+        ],
+    )
+
+
+def test_ui_text_anchor_hits_element_chain() -> None:
+    """「导出」唯一命中按钮元素：match 落到元素级（chainId + targets）。"""
+    button = _button("src/pages/UserList.tsx#UserList/e-btn")
+    handle = node(
+        "src/pages/UserList.tsx#handleExport",
+        NodeKind.fn,
+        "handleExport",
+        file="src/pages/UserList.tsx",
+    )
+    g = _element_graph(
+        [button],
+        extra_nodes=[handle],
+        extra_edges=[edge(button.id, handle.id, EdgeKind.calls)],
+    )
+    result = anchor_direct_connect(g, decompose('点击「导出」按钮导出列表'))
+    assert result.covered == {"f1"}
+    (match,) = result.matches
+    assert match.pageNodeId == "src/pages/UserList.tsx#UserList"
+    assert match.routeId == "src/router.tsx#/users"
+    # 元素级落点：链路 id + 被引文命中的元素段，前端据此高亮「哪个按钮」
+    assert match.chainId == f"{button.id}::{button.id}|{handle.id}"
+    assert match.targets == [button.id]
+    assert match.confidence == 0.90
+    assert str(match.source) == "static"
+    assert match.verifiedEvidence is not None
+    assert match.verifiedEvidence[0].nodeId == button.id
+
+
+def test_ui_text_anchor_hits_column_title() -> None:
+    """「哪一列」：列名（attrs.columns 的字面量 title）也是元素的可见文案。"""
+    table = _button(
+        "src/pages/UserList.tsx#UserList/e-table",
+        view_text=None,
+        attrs={
+            "viewRole": "container",
+            "events": ["onRowClick"],
+            "columns": [{"title": "状态", "dataIndex": "status"}],
+        },
+    )
+    g = _element_graph([table])
+    result = anchor_direct_connect(g, decompose('按「状态」筛选列表'))
+    assert result.covered == {"f1"}
+    (match,) = result.matches
+    assert match.chainId is not None
+    assert match.targets == [table.id]
+    assert match.confidence == 0.90
+
+
+def test_ui_text_anchor_shared_by_pages_is_ambiguous() -> None:
+    """同一文案出现在两个页面：不唯一归属，降级为普通检索词。"""
+    first = _button("src/pages/A.tsx#A/e-btn")
+    second = _button("src/pages/B.tsx#B/e-btn")
+    page_a = page("src/pages/A.tsx#A", "A")
+    page_b = page("src/pages/B.tsx#B", "B")
+    route_a = node("src/router.tsx#/a", NodeKind.route, "/a", file="r.tsx", attrs={"path": "/a"})
+    route_b = node("src/router.tsx#/b", NodeKind.route, "/b", file="r.tsx", attrs={"path": "/b"})
+    g = graph(
+        [page_a, page_b, route_a, route_b, first, second],
+        [
+            edge(route_a.id, page_a.id, EdgeKind.renders),
+            edge(route_b.id, page_b.id, EdgeKind.renders),
+            edge(page_a.id, first.id, EdgeKind.contains),
+            edge(page_b.id, second.id, EdgeKind.contains),
+        ],
+    )
+    result = anchor_direct_connect(g, decompose('点击「导出」按钮'))
+    assert result.matches == []
+    assert result.covered == frozenset()
+    assert any(w.code == "anchor_ambiguous" for w in result.warnings)
+
+
+def test_ui_text_anchor_multi_elements_same_page_stays_page_level() -> None:
+    """同页多元素命中：页面确定、元素不唯一——落页面级，不猜具体交互。"""
+    toolbar = _button("src/pages/UserList.tsx#UserList/e-tb")
+    row = _button("src/pages/UserList.tsx#UserList/e-row")
+    g = _element_graph([toolbar, row])
+    result = anchor_direct_connect(g, decompose('点击「导出」按钮'))
+    assert result.covered == {"f1"}
+    (match,) = result.matches
+    assert match.pageNodeId == "src/pages/UserList.tsx#UserList"
+    assert match.chainId is None
+    assert match.targets is None
+    assert match.confidence == 0.90
+    assert any(w.code == "anchor_element_ambiguous" for w in result.warnings)
+
+
+def test_ui_text_anchor_unresolved_degrades_with_warning() -> None:
+    g = _element_graph([])
+    result = anchor_direct_connect(g, decompose('点击「导出」按钮'))
+    assert result.matches == []
+    assert result.covered == frozenset()
+    (warning,) = result.warnings
+    assert warning.code == "anchor_unresolved"
+    assert warning.featureId == "f1"
+
+
+def test_page_level_and_element_level_matches_both_kept() -> None:
+    """字段锚点（页面级）与界面词锚点（元素级）同页并存：去重不互相吞掉。"""
+    button = _button("src/pages/UserList.tsx#UserList/e-btn")
+    g = _element_graph([button], props=[("showFilter", None)])
+    result = anchor_direct_connect(g, decompose('展示 `showFilter` 开关「导出」'))
+    assert len(result.matches) == 2
+    assert {(match.chainId, tuple(match.targets or [])) for match in result.matches} == {
+        (None, ()),
+        (f"{button.id}::{button.id}", (button.id,)),
+    }
 
 def test_features_without_anchors_stay_uncovered() -> None:
     result = anchor_direct_connect(

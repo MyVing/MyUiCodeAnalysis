@@ -9,10 +9,14 @@
    - 接口锚点要求显式 method（`GET /api/users`），裸 URL 不认；
    - 路由锚点只认引号 / 反引号包裹的 `/xxx`，且排除文件扩展名结尾；
    - 组件锚点只认 `<X />` 形态与引号内的 PascalCase；
-   - 字段锚点只认引号内的 camelCase / snake_case，单个小写词（`id`）不认。
+   - 字段锚点只认引号内的 camelCase / snake_case，单个小写词（`id`）不认；
+   - 界面词锚点认其余引号内容（至少两字），逐字命中链路元素的文案 / 列名才落。
 2. **锚点直连**：精确命中图上的节点即产出 `Match`（source=static），
-   置信度按 6.13 分档：精确 0.95、模糊（URL 后缀）0.85。找不到对应节点时记
-   `anchor_unresolved` 降级为普通文本，不硬凑。
+   置信度按 6.13 / 6.15 分档：精确 0.95、URL 后缀 0.85、精确界面词 0.90。
+   界面词唯一命中某链路元素时落到**元素级**（`Match.chainId` + `targets` 指向
+   「哪个按钮 / 哪一列」，差距表 #7）；同页多元素命中只落页面级，跨页命中
+   记 `anchor_ambiguous`。找不到对应节点时记 `anchor_unresolved` 降级为普通
+   文本，不硬凑。
 
 直连结果进产物后，**被锚点覆盖的功能点不再进模型**（第四步语义残差）：模型
 只能补充锚点未覆盖的功能点。这样大量带接口 / 页面路径的需求根本不需要模型。
@@ -40,12 +44,17 @@ from app.contracts import (
 )
 from app.contracts.requirement import Location, Match, RequirementWarning, Severity
 from app.ir.api_usage import ApiUsageIndex, normalize_url
+from app.requirement.chains import derive_chains
 from app.requirement.features import DecomposedFeature
 from app.requirement.recall import collect_page_evidences, page_nodes
 from app.requirement.subgraph import build_subgraph
 
 # 精确锚点（6.13 第三步）：method + path 都对上，或路由 / 组件 / 字段唯一命中
 _ANCHOR_EXACT = 0.95
+
+# 精确界面词（6.15 分档）：引文逐字命中某元素的 viewText / 列名。比字段锚点低半档
+# ——界面词的语料面大（同文案常出现在多个页面），唯一命中才落元素级。
+_ANCHOR_UITEXT = 0.90
 
 # 锚点可信度依赖「图上的节点确实对得上」，静态证据恒为 1.0 的档位语义在这里
 # 不适用：直连是跨节点结论，统一给 0.95 而不是 1.0。
@@ -89,6 +98,7 @@ class AnchorKind(StrEnum):
     component = "component"
     file = "file"
     field = "field"
+    uiText = "uiText"
 
 
 @dataclass(frozen=True)
@@ -166,6 +176,13 @@ def extract_anchors(text: str) -> list[Anchor]:
             continue
         if _CAMEL_RE.match(quoted) or _SNAKE_RE.match(quoted):
             add(AnchorKind.field, quoted, quoted, start, match.end())
+            continue
+        # 剩下的引号内容当作界面词锚点（差距表 #7）：需求说「导出」「状态」时，
+        # 引号是用户手动标出的原文，比裸中文可靠得多。两类太泛的不认：单字符
+        # （「增」「删」能命中几乎所有工具栏），以及两字母纯小写英文词（`id`
+        # 这类被字段锚点规则明确拒绝的标识，换个通道收进来等于绕过校验）。
+        if len(quoted) >= 2 and not (quoted.isascii() and quoted.isalpha() and len(quoted) == 2):
+            add(AnchorKind.uiText, quoted, quoted, start, match.end())
 
     for match in _JSX_RE.finditer(text):
         name = match.group(1)
@@ -196,6 +213,10 @@ def anchor_direct_connect(
     pages_by_route = _route_pages(graph, nodes_by_id)
     components_by_name, components_by_file = _component_index(graph)
     field_pages = _field_index(graph, pages, layout_ids)
+    # 元素级落点（差距表 #7）：界面词锚点按链路元素的可见文案直连。
+    # 链路限定在真页面内——布局兜底归属的元素不在 page_nodes 的页面集合里，
+    # 直接引用会让 pageNodeId 落在候选页面集合之外。
+    ui_texts = _element_text_index(graph, nodes_by_id, page_ids)
 
     matches: list[Match] = []
     warnings: list[RequirementWarning] = []
@@ -278,10 +299,116 @@ def anchor_direct_connect(
                     emit(feature.id, anchor, page_id, route_by_page.get(page_id))
                 # 一个页面都没命中时不告警：字段是 best-effort 识别，
                 # 未命中只能说明它不是 props / 文案层面的标识，保持沉默
+            elif anchor.kind is AnchorKind.uiText:
+                element_hits = ui_texts.get(anchor.raw, [])
+                if not element_hits:
+                    warnings.append(_unresolved(feature.id, anchor))
+                    continue
+                pages_hit = {page_id for _, _, page_id in element_hits}
+                if len(pages_hit) > 1:
+                    # 宁缺毋滥：同一句界面文案在多个页面出现（「暂无数据」这类
+                    # 共通文案是常态），引文无法证明归属，降级为普通检索词
+                    warnings.append(
+                        RequirementWarning(
+                            code="anchor_ambiguous",
+                            severity=Severity.info,
+                            message=(
+                                f"界面文案「{anchor.raw}」出现在 {len(pages_hit)} 个页面的"
+                                f"元素上，无法唯一归属，已降级为普通检索词"
+                            ),
+                            featureId=feature.id,
+                        )
+                    )
+                    continue
+                if len(element_hits) == 1:
+                    # 唯一命中：落到元素级（差距表 #7）——chainId + targets 指向
+                    # 「哪个按钮 / 哪一列」，前端据此高亮链路的具体段
+                    chain_id, element_id, page_id = element_hits[0]
+                    matches.append(
+                        _match(
+                            graph,
+                            nodes_by_id,
+                            feature.id,
+                            anchor,
+                            page_id=page_id,
+                            route_id=route_by_page.get(page_id),
+                            confidence=_ANCHOR_UITEXT,
+                            chain_id=chain_id,
+                            targets=[element_id],
+                            path_node_ids=(element_id,),
+                        )
+                    )
+                else:
+                    # 同页多元素命中（如工具栏与行内都有「编辑」）：页面是确定的，
+                    # 元素不唯一——落页面级 match，不猜具体元素
+                    page_id = next(iter(pages_hit))
+                    matches.append(
+                        _match(
+                            graph,
+                            nodes_by_id,
+                            feature.id,
+                            anchor,
+                            page_id=page_id,
+                            route_id=route_by_page.get(page_id),
+                            confidence=_ANCHOR_UITEXT,
+                        )
+                    )
+                    warnings.append(
+                        RequirementWarning(
+                            code="anchor_element_ambiguous",
+                            severity=Severity.info,
+                            message=(
+                                f"界面文案「{anchor.raw}」在该页面命中 "
+                                f"{len(element_hits)} 个元素，只定位到页面，不猜具体交互"
+                            ),
+                            featureId=feature.id,
+                        )
+                    )
 
     deduped = _dedupe_matches(matches)
     covered = frozenset(match.featureId for match in deduped)
     return AnchorOutcome(matches=deduped, warnings=warnings, covered=covered)
+
+
+def _element_text_index(
+    graph: IRGraph,
+    nodes_by_id: dict[str, IRNode],
+    page_ids: set[str],
+) -> dict[str, list[tuple[str, str, str]]]:
+    """界面文案 → [(chainId, elementId, pageId)]。
+
+    语料是链路起点元素的可见文案：viewText + attrs.columns 的字面量列名（列名由
+    chains.py 的元素段语料同一规则收集，两处口径一致）。文案相等的判定用逐字
+    匹配——锚点是用户用引号标出的原文，归一化放宽反而会制造高置信度误命中。
+    每个元素恰好产出一条链路（derive_chains 逐元素建链），因此 (chain, element)
+    不会重复。
+    """
+    chains = derive_chains(graph)
+    index: dict[str, list[tuple[str, str, str]]] = defaultdict(list)
+    for chain in chains.by_id.values():
+        if chain.page_id not in page_ids:
+            continue
+        element = nodes_by_id.get(chain.element.node_id)
+        if element is None:
+            continue
+        for text in _element_texts(element):
+            index[text].append((chain.id, element.id, chain.page_id))
+    return dict(index)
+
+
+def _element_texts(element: IRNode) -> list[str]:
+    texts: list[str] = []
+    view_text = element.attrs.get("viewText")
+    if isinstance(view_text, str) and view_text.strip():
+        texts.append(view_text)
+    columns = element.attrs.get("columns")
+    if isinstance(columns, list):
+        for column in columns:
+            if isinstance(column, dict):
+                title = column.get("title")
+                if isinstance(title, str) and title.strip():
+                    texts.append(title)
+    return texts
 
 
 def _route_index(graph: IRGraph, nodes_by_id: dict[str, IRNode]) -> dict[str, str]:
@@ -397,6 +524,8 @@ def _match(
     route_id: str | None,
     confidence: float,
     path_node_ids: Sequence[str] = (),
+    chain_id: str | None = None,
+    targets: list[str] | None = None,
 ) -> Match:
     reason = _REASONS[anchor.kind].format(raw=anchor.raw)
     evidence_ids = path_node_ids or (
@@ -410,6 +539,8 @@ def _match(
     return Match(
         featureId=feature_id,
         pageNodeId=page_id,
+        chainId=chain_id,
+        targets=targets,
         routeId=route_id,
         confidence=confidence,
         quote=anchor.raw,
@@ -428,6 +559,7 @@ _REASONS: dict[AnchorKind, str] = {
     AnchorKind.component: "锚点直连：需求提到组件 {raw}，图中它就是该页面",
     AnchorKind.file: "锚点直连：需求提到文件 {raw}，图中它定义了该页面",
     AnchorKind.field: "锚点直连：需求提到字段 {raw}，唯一出现在该页面的 props / 文案里",
+    AnchorKind.uiText: "锚点直连：需求提到界面文案 {raw}，图中该页面存在带此文案的交互元素",
 }
 
 
@@ -468,10 +600,14 @@ def _via_of(node: IRNode) -> str:
 
 
 def _dedupe_matches(matches: list[Match]) -> list[Match]:
-    """同一 (功能点, 页面, 路由) 只留一条：置信度最高者优先，平手取先出现者。"""
-    best: dict[tuple[str, str, str | None], Match] = {}
+    """同一 (功能点, 页面, 路由, 链路) 只留一条：置信度最高者优先，平手取先出现者。
+
+    chainId 进 key：同一页面的页面级直连（字段锚点）与元素级直连（界面词锚点）
+    是两条不同证据，不能互相吞掉。
+    """
+    best: dict[tuple[str, str, str | None, str | None], Match] = {}
     for match in matches:
-        key = (match.featureId, match.pageNodeId, match.routeId)
+        key = (match.featureId, match.pageNodeId, match.routeId, match.chainId)
         current = best.get(key)
         if current is None or match.confidence > current.confidence:
             best[key] = match

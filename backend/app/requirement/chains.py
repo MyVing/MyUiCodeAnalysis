@@ -373,6 +373,10 @@ def _build_chain(
         step_texts[element.id].append(text)
     if href_value:
         step_texts[element.id].append(href_value)
+    # 列名（view.ts 写进 attrs.columns 的字面量 title）也属于「元素看得见的文案」：
+    # 需求说「状态列」时引用的是列名而不是元素自身的 viewText，语料缺了它，
+    # 元素级锚点与引文校验都命中不了表格（差距表 #7 的「哪一列」）。
+    step_texts[element.id].extend(_column_titles(element))
 
     _walk(
         element,
@@ -522,6 +526,20 @@ def _view_text(node: IRNode) -> str | None:
 def _view_role(node: IRNode) -> str | None:
     value = node.attrs.get("viewRole")
     return value if isinstance(value, str) else None
+
+
+def _column_titles(element: IRNode) -> list[str]:
+    """元素 attrs.columns 里的字面量列名。只认字面量；动态列 view.ts 不产内容。"""
+    columns = element.attrs.get("columns")
+    if not isinstance(columns, list):
+        return []
+    titles: list[str] = []
+    for column in columns:
+        if isinstance(column, dict):
+            title = column.get("title")
+            if isinstance(title, str) and title.strip():
+                titles.append(title)
+    return titles
 
 
 def _step_of(node: IRNode, role: str) -> ChainStep:
