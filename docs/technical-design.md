@@ -445,7 +445,7 @@ element（有 viewText / columns / tag）
 
 **第三步：沿请求链补全接口。** `handleSearch → fetchUsers → GET /api/users` 这条链由 `calls` + `requests` 边天然串起来；封装器穿透后置信度按 1.0 / 0.9 / 0.8 三档衰减。
 
-**第四步：按需求锚点裁剪。** 一个页面可能有几十个交互。定位到页面后只保留与需求锚点相关的链路：
+**第四步：按需求锚点裁剪。** 一个页面可能有几十个交互。定位到页面后只保留与需求锚点相关的链路：（**已实现**（差距表 #7/#8）：界面词锚点直连链路元素，仅被 match 引用的链路进产物 `interactionChains`；「事件名 / 动作词命中」与 Top-N 未对齐标注未做）
 
 - 元素 `viewText` / `columns[].title` / `tag` 命中需求里的界面词；
 - 事件名或处理函数名命中需求里的动作词（「点击导出」→ `onClick` + `export`）；
@@ -1318,7 +1318,7 @@ ActionChain {
 
 `terminatedAt` 是把「链路在哪里断了」变成一等字段：父组件注入的回调、动态属性取到的处理函数，都如实标注而不是产出一条看起来完整实则断掉的链。断链照常展示，只是置信度下调、UI 标注中断原因——藏起来会让用户以为「这个按钮没有行为」。
 
-**子图保持一跳，接口链路不靠放大子图解决**。曾经设想过「类型感知的两跳」让 `component → fn → api` 的 api 进入子图，但这条路的代价是子图失去「证据范围」的含义（两跳会把共享基础组件与工具函数带进来）。正确的做法是把两件事分开：
+**子图保持一跳，接口链路不靠放大子图解决**（**已实现**（差距表 #8）：`chains.py` 确定性推导 + `requirement.schema.json` 的 `interactionChains` / `Match.chainId` / `targets`，前端 `RequirementPanel` 逐段展示并标注断点；AI 路径与锚点路径都会填充）。曾经设想过「类型感知的两跳」让 `component → fn → api` 的 api 进入子图，但这条路的代价是子图失去「证据范围」的含义（两跳会把共享基础组件与工具函数带进来）。正确的做法是把两件事分开：
 
 - **子图（`Match.subgraph`）回答「这个结论是在多大范围内得出的」**——它就该小、就该只到一跳、就该显式承认 api 计数恒为 0；
 - **链路（`ActionChain`）回答「点击之后发生了什么」**——它沿 `calls` / `requests` / `navigates` 走，天然含接口与跳转，且逐段带 `file:line`。
@@ -1596,9 +1596,9 @@ dry-run 默认开启：模型产出的计划先给用户审阅，再决定是否
 | 5 | ~~layout / page 未区分~~ | **已修**：`routes.ts` 按「element 内出现 react-router `<Outlet>`（内联 JSX 或组件声明子树）→ layout；有子路由 → layout；叶子路由 → page；index 优先」分类，写入 `route.attrs.pageComponentId` 与 `layoutComponentIds`；Next 的 `layout.tsx` 按目录前缀归属到子树页面路由；同一路径多个页面候选记 `route_page_ambiguous` 不静默取第一个。后端 `recall.page_nodes` 布局集合吃显式标注（覆盖「只挂一条路径」的场景），`anchors._route_pages` 直连候选以标注为准，布局组件不再冒充页面 | — | 4.1.6 / 6.12 |
 | 6 | ~~没有 `navigates` 边~~ | **已修**：`navigate.ts` 产出 `navigates` 边 | — | 4.1.5 / 6.14 |
 | 7 | ~~元素级匹配缺失~~ | **已修**：界面词锚点（引号内非路由 / 组件 / 字段文本，宁缺毋滥）直连到链路元素的可见文案（`viewText` / `attrs.columns` 字面量列名，列名已进链路元素段语料）——唯一命中落 `Match.chainId` + `targets` 指向具体元素（置信度 0.90，6.15 分档），同页多元素只落页面级并记 `anchor_element_ambiguous`，跨页命中记 `anchor_ambiguous`；AI 路径的元素级（`locate.py` 的链路引文归属）此前已落地 | — | 6.14 / 6.15 |
-| 8 | 交互链路未进契约与子图 | 子图一跳，`component → fn → api` 的 api 恒缺席 | 用户看不到「点击 → 函数 → 接口」的完整链路 | 6.8 / 6.14 |
+| 8 | ~~交互链路未进契约与子图~~ | **已修**：子图按设计保持一跳（证据范围），「点击 → 函数 → 接口」由 `ActionChain` 承担——`chains.py` 确定性推导，`requirement.schema.json` 的 `interactionChains` + `Match.chainId` / `targets` 进契约，前端 `RequirementPanel` 逐段展示并标注断点；编排层收集全部被 match 引用的链路，AI 路径（`locate.py`）与锚点路径（dry-run 元素级直连）都会填充 | — | 6.8 / 6.14 |
 | 9 | ~~`verifiedEvidence` 从未填充~~ | **已修**：`judge._verified_evidence` 产出节点 id、文件、行列、命中字段与证据置信度 | — | 6.15 |
-| 10 | ~~`Source` 只有 `ai`，置信度统一封顶 0.6~~ | **已修（锚点部分）**：`requirement.schema.json` 的 `Match.confidence` 上限放宽到 1.0（AI 推断的 0.6 封顶仍由 judge 运行时硬保证），`source` 语义明确为「锚点直连=static / AI 判定=ai」；契约已重新生成。元素级 / 链路级证据的 source 细分仍待 6.14/6.15 | — | 6.15 |
+| 10 | ~~`Source` 只有 `ai`，置信度统一封顶 0.6~~ | **已修（锚点部分）**：`requirement.schema.json` 的 `Match.confidence` 上限放宽到 1.0（AI 推断的 0.6 封顶仍由 judge 运行时硬保证），`source` 语义明确为「锚点直连=static / AI 判定=ai」；契约已重新生成。元素级 / 链路级证据的 source 细分已随 #7 / #8 落地（元素级直连 source=static，AI 链路判定 source=ai） | — | 6.15 |
 | 11 | ~~`view.ts` / `jsx-inventory.ts` 未接线~~ | **已修**：`index.ts` 构建 inventory，`view.ts` / `navigate.ts` 产出并入 `buildGraph`，前端 `ViewPanel` 展示 `viewRole` / `viewText` / `columns` | — | 4.1.2 / 4.1.4 |
 | 12 | i18n 只存 key 不存译文 | `uiText` 收 i18n 取词键 | 中文需求无法命中英文键名或译文 | 6.13（文档结构化时补 locale 解析） |
 | 13 | 无评估集与指标 | 只有单测 fixture | 定位质量无法回归、无法比较方案优劣 | 6.16 |

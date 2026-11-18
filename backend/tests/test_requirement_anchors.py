@@ -509,3 +509,30 @@ async def test_dry_run_emits_anchor_matches_without_model() -> None:
     # 未被锚点覆盖的功能点（f2）在 dry-run 下没有模型结论，只落 candidates
     feature_ids = {match.featureId for match in mapping.matches}
     assert "f2" not in feature_ids
+
+
+async def test_dry_run_emits_interaction_chains_for_element_anchor() -> None:
+    """差距表 #8：锚点元素级直连命中的链路进 interactionChains——dry-run 不调
+    模型，但「点击 → 函数」的完整路径是图上事实，照常产出。"""
+    button = _button("src/pages/UserList.tsx#UserList/e-btn")
+    handle = node(
+        "src/pages/UserList.tsx#handleExport",
+        NodeKind.fn,
+        "handleExport",
+        file="src/pages/UserList.tsx",
+    )
+    g = _element_graph(
+        [button],
+        extra_nodes=[handle],
+        extra_edges=[edge(button.id, handle.id, EdgeKind.calls)],
+    )
+    orchestrator = RequirementOrchestrator(Settings(_env_file=None), llm=None)
+    mapping = await orchestrator.run(_PROJECT, _task('点击「导出」按钮'), g)
+    (match,) = mapping.matches
+    assert match.chainId == f"{button.id}::{button.id}|{handle.id}"
+    assert mapping.interactionChains is not None
+    (chain,) = mapping.interactionChains
+    assert chain.id == match.chainId
+    assert chain.element.nodeId == button.id
+    # 逐段可回源：起点元素 + 处理函数
+    assert [step.nodeId for step in chain.steps] == [button.id, handle.id]

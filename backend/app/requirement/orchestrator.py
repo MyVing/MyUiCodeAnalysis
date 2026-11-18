@@ -10,7 +10,9 @@
 锚点直连（6.13）是零模型的确定性步骤，dry-run 照常产出：锚点覆盖的功能点直接
 落 `matches`（source=static），不再进模型——第四步语义残差只针对未覆盖的功能点。
 dry-run 的「不调模型」语义不变，但结论不再只看 candidates：确定性锚点本来就是
-零模型的，把它排除反而让 dry-run 低估可用结论。
+零模型的，把它排除反而让 dry-run 低估可用结论。锚点元素级直连（差距表 #7）命中
+的链路同样进 `interactionChains`（差距表 #8）——「点击 → 函数 → 接口」不依赖
+模型可用性。
 
 locate 失败（模型不可用 / 输出无效）时 `LocateOutcome.degraded` 为真，未覆盖功能点
 退化成「词法候选 + 显式告警」，任务仍然成功——一次模型抖动不该把用户的分析结果打没。
@@ -217,10 +219,6 @@ class RequirementOrchestrator:
                 matches.extend(locate_outcome.matches)
                 dropped = locate_outcome.dropped
                 unmatched = locate_outcome.unmatched
-                if locate_outcome.chain_ids:
-                    interaction_chains = chain_contracts(
-                        derive_chains(graph), locate_outcome.chain_ids
-                    )
                 # 「AI 也选了哪些页面」只作为标注写回候选，不改动词法得分
                 semantic_signals(candidates, matches)
             elif judge_outcome is not None:
@@ -229,6 +227,13 @@ class RequirementOrchestrator:
                 dropped = judge_outcome.dropped
                 unmatched = judge_outcome.unmatched
                 semantic_signals(candidates, matches)
+
+            # interactionChains 收全部被 match 引用的链路，不区分来源（差距表 #8）：
+            # 锚点元素级直连（dry-run 下唯一的事实来源）与 AI 链路判定一样，
+            # 都要在产物里给出「点击 → 函数 → 接口」的完整路径
+            chain_ids = list(dict.fromkeys(match.chainId for match in matches if match.chainId))
+            if chain_ids:
+                interaction_chains = chain_contracts(derive_chains(graph), chain_ids)
 
             requirement_map = _assemble_map(
                 context,
