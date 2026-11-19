@@ -85,6 +85,7 @@ tests/fixtures/            验收样本，M1 的分析器以它们为准
 - **hook 归属只看组件函数体的顶层语句，穿过函数就停**。React 的规则就是 hook 只能在顶层调用，所以 `useEffect(() => { useFoo() })` 里的 `useFoo` 不属于本组件——那是违规写法，不该被当成结构事实。条件表达式里的调用（`cond ? useX() : []`）在顶层语句内，仍算本组件的。
 - **reads / writes 靠符号引用，不靠位置推断**。`setLoading(true)` 写在 effect 回调里，仍然是本组件在写自己的状态，所以引用查找要贯穿全部嵌套层级，与 hook 归属的"不跨函数"是两条独立规则，不要合并。
 - **hook 节点 id 不用行列号**。在组件上方插一行注释就会让所有 hook 的 id 漂移。优先用绑定变量名（`handleSelect`），没有绑定时用「hook 名 + 组件内序号」。只有初始化表达式**就是**这个调用时才取绑定名：`const rows = cond ? useData() : []` 里 `rows` 是整个三元表达式的结果，拿它命名会误导。
+- **具名 hook 的回调体是独立归属范围**（`callbackOwners`）。`const handleExport = useCallback(() => fetch(...), [])` 体内的请求归 `handleExport` 节点，不归组件——归组件会把「点击才请求」说成「加载时请求」。只登记 **绑定了名字** 的 hook：`useEffect(() => {...})` 的回调体在挂载时执行，没有独立动作语义，仍归组件。归属判定按**祖先就近**进行（`ownership.ts::findNearestOwner`），不能「先查完组件范围再查回调体」——那样回调体永远先命中组件。
 
 `deps` 字段的 `null` 与 `[]` 必须区分：前者是"每次渲染都执行"，后者是"仅挂载/卸载"。前端 `HookPanel` 分别显示，合成一个会让用户误判副作用频率。
 
@@ -100,6 +101,8 @@ tests/fixtures/            验收样本，M1 的分析器以它们为准
 置信度分三档，反映的是「结论有多确定」而不是「调用点写没写」：URL 是直接字面量 1.0；经封装器参数转一手 0.9；经局部变量转一手 0.8。证据位置也随之一并指向**真正决定 URL 的那一行**——点开证据看到的就该是结论的来源。
 
 `fn` 节点只留给「组件调用、自己又不在封装器名单里」的函数（如 `fetchUsers`）。封装器是请求管道的实现细节，把它也画成业务节点会让星图变噪音，链路信息已经由 `requests` 边承载。
+
+- **请求归属分三层，按祖先就近判定**（`api.ts::resolveOwner`）：组件内的具名 hook 回调体 → 该 hook 节点；组件体内的其他位置 → 组件；都不命中才是模块级函数（补 `fn` 节点）。`findOwner` 只认组件，不能直接拿它判断归属。hook 回调体已是图上节点，不能再补 fn，否则同一个函数出现两次。
 
 ## 事件的表达方式
 
@@ -178,7 +181,6 @@ tests/fixtures/            验收样本，M1 的分析器以它们为准
 - 运行时增强（可选）：交互主动遍历、Console/网络与节点的关联深化
 - 语义层增强（可选，见 `docs/p3-semantic-layer-design.md`）：影响面解释、回归建议
 - 链路层（见 `docs/chain-semantic-design.md`）：`derive_chains` + `ActionChain` 契约、前端链路视图、召回语义路
-
 **P3 AI 语义层已完成**：设计文档（`b4aec47`）→ 后端判定编排（`a793ffa`）→ 前端面板（`957191b`）。
 
 - **LLM 接入刻意薄**：`LLMClient` 协议 + httpx 直连 OpenAI 兼容端点（`app/requirement/llm.py`），不引 openai SDK——判定路径只发单轮补全，协议抽象留给测试注入 Fake。`APP_LLM_ENABLED` / `APP_LLM_API_KEY` / `APP_LLM_BASE_URL` / `APP_LLM_MODEL` 进 Settings；未配置时非 dry-run 在建任务前同步拒绝（409 `llm_unavailable`），不让用户等一个必然失败的任务。
@@ -215,3 +217,11 @@ tests/fixtures/            验收样本，M1 的分析器以它们为准
 - **接线顺序**（`index.ts`）：`jsx-inventory` → `events` → `view(extraElementIds)` → `routes` → `navigate`。事件层先于视图层（视图层要知道哪些元素已被收）；导航层后于路由层（目标是 route 节点）与视图层（`<Link>` 的起点是元素）。
 - **前端 `ViewPanel`**：元素节点详情新增「界面」块（标签 + 角色徽标 + 可见文案 / 动态文案标注 / 表格列）。`NodeInspector` 的私有属性排除表按「面板是否真的接手」条件判定——`tag` / `target` 是事件层也写的字段，元素没有 `viewRole` 时它们是唯一信息，无条件排除就是丢数据。
 - 验证：ast-worker 211 passed（12 文件）、frontend 69 passed（15 文件）、backend 124 passed + 14 skipped；`npm run typecheck` 全绿；契约生成 `--check` 一致；真实 Worker 跑 `tests/fixtures/enterprise-react-app` 得到 32 节点 / 36 边（含 13 条 `contains`）。
+
+**修复 #23：hook 处理函数的请求归属（P3.6 收尾）**：`const doExport = useCallback(() => fetch(...), [])` 体内的请求此前记在组件名下，图上呈现为「页面加载时请求」。
+
+- **归属范围从一层变成两层**（`ownership.ts::findNearestOwner`）：原来的 `findOwner` 只认组件定义位置，现在接受一个范围数组，**按祖先就近**逐层匹配。不在第二轮才查外层范围——`useCallback` 的回调体就写在组件函数体里，先查外层会让所有回调体都归到组件。`findOwner` 保留为单范围包装，其余三个分析器（`jsx-inventory` / `navigate` / `ui-text`）行为不变。
+- **回调体索引由 hooks 分析器产出**（`hooks.ts::callbackOwners`）：键是回调函数节点的定义位置，值是 hook 节点 id。只收录**绑定了名字**的 hook——`useEffect(() => {...})` 的请求仍归组件，它在挂载时执行，不是某个具名动作触发的；给它挂到一个匿名 hook 节点上反而让人误以为可以单独触发。判据是「hook 的第一个实参是函数」，不认具体 hook 名字（`useCallback` / `useMemo` / 自定义 `useXxx` 一视同仁）。
+- **不补 fn 节点**（`api.ts::resolveOwner`）：hook 回调体已经是图上节点（由 hooks 分析器产出），再补一个同名 fn 会让同一个函数在图上出现两次。而模块级函数（`fetchUsers`）照旧补节点——那类函数原本不在图上。
+- **链路因此接上**：事件层把 `onClick={handleExport}` 连到 hook 节点，API 层把 `requests` 边从同一个 hook 节点连到接口，`元素 --calls--> hook --requests--> 接口` 成为一条完整路径。此前这条链在 hook 节点处断开，读者会误以为接口是加载时请求的。
+- 验证：ast-worker 251 passed（13 文件，新增 7 条归属测试）；`npm run typecheck` 全绿；契约 `--check` 一致；真实 Worker 跑样本仓仍是 32 节点 / 39 边，`handleSelect` 的 calls 边端点不变。

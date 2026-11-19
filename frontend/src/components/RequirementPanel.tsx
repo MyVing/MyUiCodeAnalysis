@@ -9,7 +9,7 @@ import {
   Sparkles,
   TriangleAlert,
 } from "lucide-react";
-import { useState } from "react";
+import { useEffect, useState } from "react";
 
 import { api } from "@/api/client";
 import { useRequirementTask } from "@/api/queries";
@@ -80,12 +80,27 @@ interface RequirementPanelProps {
   analysisId?: string;
   /** 点击需求匹配时联动选中页面，并可传入后端计算的一跳子图 */
   onSelectNode: (nodeId: string, focusNodeIds?: string[]) => void;
+  /** 从 AI 对话页带回的需求草稿：到达即填入输入框 */
+  initialRequirement?: string;
 }
 
 /** 需求定位面板：需求 → 功能点召回 → AI 判定（可 dry-run），产物落 RequirementMap。 */
-export function RequirementPanel({ projectId, analysisId, onSelectNode }: RequirementPanelProps) {
+export function RequirementPanel({
+  projectId,
+  analysisId,
+  onSelectNode,
+  initialRequirement,
+}: RequirementPanelProps) {
   const [expanded, setExpanded] = useState(false);
   const [requirement, setRequirement] = useState("");
+
+  // AI 对话草稿到达时自动展开面板并填入（草稿非空才触发，手动清空不受影响）
+  useEffect(() => {
+    if (!initialRequirement) return;
+    setRequirement(initialRequirement);
+    setExpanded(true);
+  }, [initialRequirement]);
+
   // 默认 dry-run：先看召回质量，再决定要不要烧一次模型
   const [dryRun, setDryRun] = useState(true);
   const [activeTaskId, setActiveTaskId] = useState<string | null>(null);

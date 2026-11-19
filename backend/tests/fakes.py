@@ -87,7 +87,10 @@ class FakeGitClient:
 
 
 class FakeLLMClient:
-    """脚本化模型：按序返回响应，记录每次调用的 prompt 供断言。"""
+    """脚本化模型：按序返回响应，记录每次调用的 prompt 供断言。
+
+    chat 与 chat_messages 共用同一份响应脚本与调用记录（channel 区分来源）。
+    """
 
     def __init__(
         self,
@@ -98,9 +101,23 @@ class FakeLLMClient:
         self.responses = list(responses or [])
         self.error = error
         self.calls: list[tuple[str, str]] = []
+        self.message_calls: list[tuple[str, list[dict[str, str]], float]] = []
 
     async def chat(self, system: str, user: str) -> str:
         self.calls.append((system, user))
+        return await self._next_response()
+
+    async def chat_messages(
+        self,
+        system: str,
+        messages: list[dict[str, str]],
+        *,
+        temperature: float = 0,
+    ) -> str:
+        self.message_calls.append((system, messages, temperature))
+        return await self._next_response()
+
+    async def _next_response(self) -> str:
         if self.error is not None:
             raise self.error
         if not self.responses:

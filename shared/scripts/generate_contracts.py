@@ -58,6 +58,12 @@ TARGETS: dict[str, tuple[Path, Path]] = {
         REPO_ROOT / "backend" / "app" / "contracts" / "explore.py",
         REPO_ROOT / "shared" / "contracts" / "src" / "explore.ts",
     ),
+    # 规格文档装配器：确定性要素/事件/接口映射 + 模型推断的步骤/规则/字段映射。
+    # evidence / dropped / warnings 复用 requirement.schema.json 的定义（跨文件内联）。
+    "specdoc": (
+        REPO_ROOT / "backend" / "app" / "contracts" / "specdoc.py",
+        REPO_ROOT / "shared" / "contracts" / "src" / "specdoc.ts",
+    ),
 }
 
 # datamodel-code-generator 0.96.0 的参数，已用现有 contracts.py 逐字节验证还原。

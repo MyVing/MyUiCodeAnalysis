@@ -9,13 +9,23 @@
 from fastapi import APIRouter, HTTPException, status
 
 from app.api.deps import (
+    AnalysisRepositoryDep,
     ProjectServiceDep,
+    RequirementChatServiceDep,
     RequirementLocateServiceDep,
 )
 from app.api.v1.projects import require_project
 from app.contracts import RequirementMap
+from app.requirement.chat import RequirementChatPreconditionError
+from app.requirement.llm import LLMCallError
 from app.requirement.service import RequirementPreconditionError
-from app.schemas import RequirementLocateStart, RequirementTask, RequirementTaskList
+from app.schemas import (
+    RequirementChatResult,
+    RequirementChatStart,
+    RequirementLocateStart,
+    RequirementTask,
+    RequirementTaskList,
+)
 
 router = APIRouter(tags=["requirements"])
 
@@ -52,6 +62,51 @@ async def start_requirement_locate(
             ),
             detail=error.message,
         ) from None
+
+
+@router.post(
+    "/projects/{project_id}/requirement-chat",
+    response_model=RequirementChatResult,
+    responses={
+        404: {"description": "项目不存在"},
+        502: {"description": "模型调用失败"},
+        503: {"description": "模型未配置"},
+    },
+)
+async def requirement_chat(
+    project_id: str,
+    payload: RequirementChatStart,
+    service: ProjectServiceDep,
+    chat_service: RequirementChatServiceDep,
+    analyses: AnalysisRepositoryDep,
+) -> RequirementChatResult:
+    """同步需求对话：一次请求一次模型调用，会话历史由前端全量回传。
+
+    项目已有解析产物时，先做意图判定：用户在「问某个功能的前端交互视图」
+    则基于锚点反向召回定位页面并就地生成规格文档（不落库）；否则走澄清。
+    图缺失不拦请求——退化为纯澄清对话。
+    """
+    project = await require_project(project_id, service)
+    graph = await analyses.get_latest_graph(project_id)
+    messages = [{"role": item.role, "content": item.content} for item in payload.messages]
+    try:
+        reply, draft, doc_markdown, doc_page = await chat_service.chat(
+            messages, project=project, graph=graph
+        )
+    except RequirementChatPreconditionError as error:
+        raise HTTPException(
+            status_code=status.HTTP_503_SERVICE_UNAVAILABLE, detail=error.message
+        ) from None
+    except LLMCallError as error:
+        raise HTTPException(
+            status_code=status.HTTP_502_BAD_GATEWAY, detail=error.message
+        ) from None
+    return RequirementChatResult(
+        reply=reply,
+        draft_requirement=draft,
+        doc_markdown=doc_markdown,
+        doc_page=doc_page,
+    )
 
 
 @router.get("/projects/{project_id}/requirements", response_model=RequirementTaskList)

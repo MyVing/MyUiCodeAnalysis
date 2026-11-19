@@ -347,8 +347,9 @@ def test_recall_keeps_locatable_evidence_for_each_quote(user_graph: IRGraph) -> 
     assert text_evidence.source is _STATIC
     assert text_evidence.confidence == 1.0
 
-    # 每条引文都能在 quote_corpus 里找到，两套数据不允许各说各话
-    assert {item.text for item in detail.evidence} == set(detail.quote_corpus)
+    # 每条证据都能在 quote_corpus 里找到（反向归属后种子文本也会进语料，
+    # 所以证据集是语料的子集），两套数据不允许各说各话
+    assert {item.text for item in detail.evidence} <= set(detail.quote_corpus)
 
 
 def test_recall_attributes_api_evidence_to_the_api_node(user_graph: IRGraph) -> None:
@@ -373,23 +374,46 @@ def test_recall_reaches_api_url_through_one_hop(user_graph: IRGraph) -> None:
     assert any(signal.kind is SignalKind.apiUrl for signal in user_list.candidate.signals)
 
 
-def test_recall_does_not_inherit_children_texts(user_graph: IRGraph) -> None:
-    """TableCard 的文案只归 TableCard，不许被页面继承——否则候选之间失去区分度。"""
-    result = recall(user_graph, decompose("查看")[0].terms)
-    assert result.candidates == []
+def test_child_text_attributes_to_owner_page(user_graph: IRGraph) -> None:
+    """子组件文案反向归属到所属页面：能召回页面，但 TableCard 自己不是页面。
 
-
-def test_recall_does_not_inherit_children_texts_for_single_route_page(
-    user_graph: IRGraph,
-) -> None:
-    """单路由页面不享受布局特权：TableCard 是 UserList 的子组件，文案仍不继承。
-
-    布局例外只对「被多条路由复用」的组件开启。UserList 只挂在 /users 下，
-    它渲染 TableCard 是普通页面结构，不是全站外壳。
+    6.11 语义取代旧的「一刀切不继承」：词法命中在 TableCard 上，沿 renders
+    反向归属到 UserList——页面与子组件的区分度由置信度（路径最弱一环 ×
+    种子系数 0.7）表达，而不是靠丢弃。
     """
     result = recall(user_graph, decompose("查看")[0].terms)
+    user_list = next(
+        item
+        for item in result.candidates
+        if item.candidate.nodeId.endswith("#UserList")
+    )
+    assert user_list.candidate.score > 0
+    # TableCard 不是页面：命中归属到它所属的页面，而不是产生新候选
     assert all(
         "TableCard" not in item.candidate.nodeId for item in result.candidates
+    )
+
+
+def test_child_text_keeps_full_attribution_path(user_graph: IRGraph) -> None:
+    """子组件文案命中的归属路径完整可回查：TableCard → UserList → route。
+
+    反向 BFS 的价值就在这里：候选不只带分数，还带「这条命中是怎么走到
+    这个页面的」——每一环都能回图核对，判定从「选页面」变成「确认链路」。
+    """
+    result = recall(user_graph, decompose("查看")[0].terms)
+    user_list = next(
+        item
+        for item in result.candidates
+        if item.candidate.nodeId.endswith("#UserList")
+    )
+    assert user_list.candidate.anchorNodeIds == [
+        "src/components/TableCard.tsx#TableCard",
+        "src/pages/UserList.tsx#UserList",
+        "src/router.tsx#/users",
+    ]
+    assert any(
+        signal.kind is SignalKind.uiText and signal.value == "查看"
+        for signal in user_list.candidate.signals
     )
 
 

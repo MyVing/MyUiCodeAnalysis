@@ -13,6 +13,7 @@ from app.api.v1 import (
     requirements,
     runtime,
     source,
+    specdocs,
     tasks,
 )
 
@@ -28,3 +29,4 @@ api_router.include_router(requirements.router)
 api_router.include_router(runtime.router)
 api_router.include_router(explore.router)
 api_router.include_router(source.router)
+api_router.include_router(specdocs.router)

@@ -195,6 +195,85 @@ class RequirementTaskList(ApiModel):
     items: list[RequirementTask] = Field(default_factory=list)
 
 
+class ChatMessage(ApiModel):
+    """对话历史中的一条消息。会话状态在前端持有，后端每次收全量历史。"""
+
+    role: Literal["user", "assistant"]
+    content: str = Field(min_length=1, max_length=10000)
+
+    @field_validator("content")
+    @classmethod
+    def strip_content(cls, value: str) -> str:
+        stripped = value.strip()
+        if not stripped:
+            raise ValueError("消息内容不能为空")
+        return stripped
+
+
+class RequirementChatStart(ApiModel):
+    """一次需求对话的输入：全量历史 + 可选的首条草稿上下文。
+
+    上限 40 条：防止单请求被塞入超长会话烧掉模型预算——真聊到 40 条
+    说明该提炼草稿了，前端应该在那时点「填入输入框」。
+    """
+
+    messages: list[ChatMessage] = Field(min_length=1, max_length=40)
+
+
+class RequirementChatResult(ApiModel):
+    """一次需求对话的输出。draftRequirement 非空表示模型认为信息已足够成文；
+    docMarkdown 非空表示命中了项目页面并就地生成了规格文档（业务操作步骤 +
+    前端交互视图），docPage 是命中的页面名。"""
+
+    reply: str
+    draft_requirement: str | None = None
+    doc_markdown: str | None = None
+    doc_page: str | None = None
+
+
+class SpecDocStart(ApiModel):
+    """一次规格文档装配的输入：指定来源需求定位产物。
+
+    定位产物（RequirementMap）必须已存在且其 analysisId 与项目最新图一致，
+    否则服务会以前置校验拒绝（specdoc_map_stale）。`dryRun=True` 只跑确定性
+    装配（要素 / 事件 / 接口映射），模型推断章节（步骤 / 规则 / 字段映射）留空。
+    """
+
+    requirement_id: str = Field(min_length=1, max_length=128)
+    dry_run: bool = False
+
+    @field_validator("requirement_id")
+    @classmethod
+    def strip_requirement_id(cls, value: str) -> str:
+        stripped = value.strip()
+        if not stripped:
+            raise ValueError("requirementId 不能为空")
+        return stripped
+
+
+class SpecDocTask(ApiModel):
+    """规格文档装配任务的状态。字段形状与 RequirementTask 对齐，前端复用同一套轮询逻辑。"""
+
+    id: str
+    project_id: str
+    requirement_id: str
+    status: TaskStatus
+    dry_run: bool
+    created_at: datetime
+    started_at: datetime | None = None
+    finished_at: datetime | None = None
+    error_code: str | None = None
+    error_message: str | None = None
+    element_count: int | None = None
+    event_count: int | None = None
+    rule_count: int | None = None
+    warning_count: int | None = None
+
+
+class SpecDocTaskList(ApiModel):
+    items: list[SpecDocTask] = Field(default_factory=list)
+
+
 class RuntimeStart(ApiModel):
     """一次运行时采集的输入。url 与 command 至少给一个：
 

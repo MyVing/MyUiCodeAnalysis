@@ -24,18 +24,21 @@ from app.explore.runner import ExploreWorkerRunner
 from app.explore.service import ExploreService
 from app.git_client import GitClient, SubprocessGitClient
 from app.plugin_manager.registry import PluginRegistry, create_plugin_registry
+from app.requirement.chat import RequirementChatService
 from app.requirement.llm import LLMClient, build_llm_client
 from app.requirement.service import RequirementLocateService
 from app.runtime.requirement_collect import RequirementCollectService
 from app.runtime.runner import RuntimeWorkerRunner, SubprocessRuntimeRunner
 from app.runtime.service import RuntimeService
 from app.services.project_service import ProjectService
+from app.specdoc.service import SpecDocService
 from app.storage.checkpoint import MySqlCheckpointSaver
 from app.storage.explore import ExploreRepository
 from app.storage.factory import Storage
 from app.storage.repositories import AnalysisRepository, ProjectRepository
 from app.storage.requirement import RequirementRepository
 from app.storage.runtime import RuntimeRepository
+from app.storage.specdoc import SpecDocRepository
 
 SettingsDep = Annotated[Settings, Depends(get_settings)]
 
@@ -69,6 +72,10 @@ def get_runtime_repository(request: Request) -> RuntimeRepository:
 
 def get_explore_repository(request: Request) -> ExploreRepository:
     return get_storage(request).explores
+
+
+def get_specdoc_repository(request: Request) -> SpecDocRepository:
+    return get_storage(request).specdocs
 
 
 def get_git_client(settings: SettingsDep) -> GitClient:
@@ -129,8 +136,11 @@ def get_requirement_locate_service(
     llm: Annotated[LLMClient | None, Depends(get_llm_client)],
     checkpointer: Annotated[BaseCheckpointSaver, Depends(get_requirement_checkpointer)],
     settings: SettingsDep,
+    runtime: Annotated[RuntimeRepository, Depends(get_runtime_repository)],
 ) -> RequirementLocateService:
-    return RequirementLocateService(repository, analyses, settings, llm, checkpointer)
+    return RequirementLocateService(
+        repository, analyses, settings, llm, checkpointer, runtime
+    )
 
 
 def get_runtime_worker_runner() -> RuntimeWorkerRunner:
@@ -167,6 +177,16 @@ def get_explore_service(
     return ExploreService(repository, runner, settings, llm)
 
 
+def get_specdoc_service(
+    repository: Annotated[SpecDocRepository, Depends(get_specdoc_repository)],
+    requirements: Annotated[RequirementRepository, Depends(get_requirement_repository)],
+    analyses: Annotated[AnalysisRepository, Depends(get_analysis_repository)],
+    llm: Annotated[LLMClient | None, Depends(get_llm_client)],
+    settings: SettingsDep,
+) -> SpecDocService:
+    return SpecDocService(repository, requirements, analyses, settings, llm)
+
+
 ProjectServiceDep = Annotated[ProjectService, Depends(get_project_service)]
 AnalysisRepositoryDep = Annotated[AnalysisRepository, Depends(get_analysis_repository)]
 AnalysisServiceDep = Annotated[AnalysisService, Depends(get_analysis_service)]
@@ -176,6 +196,19 @@ RequirementLocateServiceDep = Annotated[
 ]
 RuntimeServiceDep = Annotated[RuntimeService, Depends(get_runtime_service)]
 ExploreServiceDep = Annotated[ExploreService, Depends(get_explore_service)]
+SpecDocServiceDep = Annotated[SpecDocService, Depends(get_specdoc_service)]
+
+
+def get_requirement_chat_service(
+    llm: Annotated[LLMClient | None, Depends(get_llm_client)],
+    settings: SettingsDep,
+) -> RequirementChatService:
+    return RequirementChatService(llm, settings)
+
+
+RequirementChatServiceDep = Annotated[
+    RequirementChatService, Depends(get_requirement_chat_service)
+]
 
 
 def get_requirement_collect_service(

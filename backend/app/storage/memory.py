@@ -9,15 +9,23 @@ import json
 from collections import deque
 from typing import Any
 
-from app.contracts import IRGraph, RequirementMap, RuntimeTrace
+from app.contracts import IRGraph, RequirementMap, RuntimeTrace, SpecDocMap
 from app.requirement.page_profile import ProfilePayload
-from app.schemas import AnalysisTask, ExploreTask, Project, RequirementTask, RuntimeTask
+from app.schemas import (
+    AnalysisTask,
+    ExploreTask,
+    Project,
+    RequirementTask,
+    RuntimeTask,
+    SpecDocTask,
+)
 from app.storage.repositories import DuplicateRemoteUrlError
 
 MAX_GRAPHS_PER_PROJECT = 5
 MAX_MAPS_PER_PROJECT = 20
 MAX_TRACES_PER_PROJECT = 20
 MAX_ARTIFACTS_PER_PROJECT = 20
+MAX_SPECS_PER_PROJECT = 20
 
 
 class InMemoryProjectRepository:
@@ -252,6 +260,88 @@ class InMemoryRequirementRepository:
 
 def create_requirement_repository() -> InMemoryRequirementRepository:
     return InMemoryRequirementRepository()
+
+
+class InMemorySpecDocRepository:
+    """规格文档装配的内存仓储：形态与 requirement 仓储一致，产物按任务 id 存。"""
+
+    def __init__(self) -> None:
+        self._tasks: dict[str, SpecDocTask] = {}
+        self._docs: dict[str, SpecDocMap] = {}
+        # 任务 id → specDocId：产物按任务取用，避免前端拼 id
+        self._doc_by_task: dict[str, str] = {}
+        self._doc_order: dict[str, deque[str]] = {}
+        self._lock = asyncio.Lock()
+
+    async def add_task(self, task: SpecDocTask) -> SpecDocTask:
+        async with self._lock:
+            self._tasks[task.id] = task
+        return task
+
+    async def get_task(self, task_id: str) -> SpecDocTask | None:
+        async with self._lock:
+            return self._tasks.get(task_id)
+
+    async def update_task(self, task: SpecDocTask) -> SpecDocTask:
+        async with self._lock:
+            self._tasks[task.id] = task
+            return task
+
+    async def list_by_project(self, project_id: str) -> list[SpecDocTask]:
+        async with self._lock:
+            items = [item for item in self._tasks.values() if item.project_id == project_id]
+        return sorted(items, key=lambda item: item.created_at, reverse=True)
+
+    async def save_doc(self, spec_doc: SpecDocMap) -> None:
+        async with self._lock:
+            project_id = spec_doc.projectId
+            order = self._doc_order.setdefault(project_id, deque())
+            if spec_doc.specDocId in order:
+                order.remove(spec_doc.specDocId)
+            self._docs[spec_doc.specDocId] = spec_doc
+            order.append(spec_doc.specDocId)
+            while len(order) > MAX_SPECS_PER_PROJECT:
+                oldest = order.popleft()
+                self._docs.pop(oldest, None)
+                for task_id, mapped in list(self._doc_by_task.items()):
+                    if mapped == oldest:
+                        del self._doc_by_task[task_id]
+
+    async def link_task(self, task_id: str, spec_doc_id: str) -> None:
+        async with self._lock:
+            self._doc_by_task[task_id] = spec_doc_id
+
+    async def get_doc(self, spec_doc_id: str) -> SpecDocMap | None:
+        async with self._lock:
+            return self._docs.get(spec_doc_id)
+
+    async def get_doc_by_task(self, task_id: str) -> SpecDocMap | None:
+        async with self._lock:
+            spec_doc_id = self._doc_by_task.get(task_id)
+            if spec_doc_id is None:
+                return None
+            return self._docs.get(spec_doc_id)
+
+    async def purge_project(self, project_id: str) -> None:
+        async with self._lock:
+            task_ids = [
+                task_id
+                for task_id, item in self._tasks.items()
+                if item.project_id == project_id
+            ]
+            for task_id in task_ids:
+                del self._tasks[task_id]
+                self._doc_by_task.pop(task_id, None)
+            self._docs = {
+                spec_doc_id: item
+                for spec_doc_id, item in self._docs.items()
+                if item.projectId != project_id
+            }
+            self._doc_order.pop(project_id, None)
+
+
+def create_specdoc_repository() -> InMemorySpecDocRepository:
+    return InMemorySpecDocRepository()
 
 
 class InMemoryRuntimeRepository:

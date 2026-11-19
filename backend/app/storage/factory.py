@@ -13,6 +13,7 @@ from app.storage.memory import (
     create_project_repository,
     create_requirement_repository,
     create_runtime_repository,
+    create_specdoc_repository,
 )
 from app.storage.mysql import (
     MySqlAnalysisRepository,
@@ -20,6 +21,7 @@ from app.storage.mysql import (
     MySqlProjectRepository,
     MySqlRequirementRepository,
     MySqlRuntimeRepository,
+    MySqlSpecDocRepository,
     create_engine_from_url,
     init_schema,
     run_boot_recovery,
@@ -27,6 +29,7 @@ from app.storage.mysql import (
 from app.storage.repositories import AnalysisRepository, ProjectRepository
 from app.storage.requirement import RequirementRepository
 from app.storage.runtime import RuntimeRepository
+from app.storage.specdoc import SpecDocRepository
 
 logger = logging.getLogger(__name__)
 
@@ -38,6 +41,7 @@ class Storage:
     requirements: RequirementRepository
     runtimes: RuntimeRepository
     explores: "ExploreRepository"
+    specdocs: SpecDocRepository
     engine: AsyncEngine | None = None  # memory 分支为 None
 
 
@@ -50,6 +54,7 @@ def create_storage(settings: Settings) -> Storage:
             requirements=create_requirement_repository(),
             runtimes=create_runtime_repository(),
             explores=create_explore_repository(),
+            specdocs=create_specdoc_repository(),
         )
     engine = create_engine_from_url(settings)
     return Storage(
@@ -58,6 +63,7 @@ def create_storage(settings: Settings) -> Storage:
         requirements=MySqlRequirementRepository(engine),
         runtimes=MySqlRuntimeRepository(engine),
         explores=MySqlExploreRepository(engine),
+        specdocs=MySqlSpecDocRepository(engine),
         engine=engine,
     )
 

@@ -35,7 +35,6 @@ from dataclasses import dataclass
 from enum import StrEnum
 
 from app.contracts import (
-    EdgeKind,
     IRGraph,
     IRNode,
     NodeKind,
@@ -46,7 +45,7 @@ from app.contracts.requirement import Location, Match, RequirementWarning, Sever
 from app.ir.api_usage import ApiUsageIndex, normalize_url
 from app.requirement.chains import derive_chains
 from app.requirement.features import DecomposedFeature
-from app.requirement.recall import collect_page_evidences, page_nodes
+from app.requirement.recall import collect_page_evidences, page_nodes, route_target_pages
 from app.requirement.subgraph import build_subgraph
 
 # 精确锚点（6.13 第三步）：method + path 都对上，或路由 / 组件 / 字段唯一命中
@@ -210,7 +209,7 @@ def anchor_direct_connect(
     nodes_by_id = {node.id: node for node in graph.nodes}
 
     routes_by_path = _route_index(graph, nodes_by_id)
-    pages_by_route = _route_pages(graph, nodes_by_id)
+    pages_by_route = route_target_pages(graph, nodes_by_id)
     components_by_name, components_by_file = _component_index(graph)
     field_pages = _field_index(graph, pages, layout_ids)
     # 元素级落点（差距表 #7）：界面词锚点按链路元素的可见文案直连。
@@ -421,57 +420,6 @@ def _route_index(graph: IRGraph, nodes_by_id: dict[str, IRNode]) -> dict[str, st
         if isinstance(path, str) and (normalized := normalize_url(path)):
             routes.setdefault(normalized, node.id)
     return routes
-
-
-def _route_pages(graph: IRGraph, nodes_by_id: dict[str, IRNode]) -> dict[str, list[str]]:
-    """route → 渲染的页面组件（布局复用时一个路由可挂多个页面）。
-
-    ast-worker 已经按 `<Outlet>` / 嵌套路由层级 / index 规则区分过 layout 与
-    page（`attrs.pageComponentId` / `attrs.layoutComponentIds`），这里的顺序
-    以显式标注为准——同一路径下 layout 先声明时，按边遍历顺序取会把布局组件
-    当成页面。attrs 缺省（旧图）时退回全部渲染目标，行为不变。
-    """
-    by_route: dict[str, list[str]] = defaultdict(list)
-    for edge in graph.edges:
-        if edge.kind is not EdgeKind.renders:
-            continue
-        source = nodes_by_id.get(edge.from_)
-        target = nodes_by_id.get(edge.to)
-        if (
-            source is not None
-            and source.kind is NodeKind.route
-            and target is not None
-            and target.kind in (NodeKind.component, NodeKind.server_component)
-        ):
-            by_route[source.id].append(target.id)
-
-    for node in graph.nodes:
-        if node.kind is not NodeKind.route:
-            continue
-        declared_layout = node.attrs.get("layoutComponentIds")
-        layout_ids = (
-            {item for item in declared_layout if isinstance(item, str)}
-            if isinstance(declared_layout, list)
-            else set()
-        )
-        declared_page = node.attrs.get("pageComponentId")
-        if not layout_ids and not isinstance(declared_page, str):
-            continue  # 旧图没有区分信息，保持原有顺序
-        targets = by_route.get(node.id, [])
-        if isinstance(declared_page, str):
-            pages = [declared_page] + [
-                item
-                for item in targets
-                if item != declared_page and item not in layout_ids
-            ]
-        else:
-            pages = [item for item in targets if item not in layout_ids]
-        if pages:
-            by_route[node.id] = pages
-        elif targets:
-            # 全被标成 layout 的极端情况：保留原目标，不给空列表
-            by_route[node.id] = targets
-    return dict(by_route)
 
 
 def _component_index(graph: IRGraph) -> tuple[dict[str, str], dict[str, str]]:

@@ -7,6 +7,7 @@ import {
   Database,
   Loader2,
   Maximize2,
+  MessagesSquare,
   Radar,
   RefreshCw,
   RotateCw,
@@ -15,7 +16,7 @@ import {
   type LucideIcon,
 } from "lucide-react";
 import { useEffect, useMemo, useState, type ReactNode } from "react";
-import { Link, useParams } from "react-router-dom";
+import { Link, useLocation, useNavigate, useParams } from "react-router-dom";
 
 import { api } from "@/api/client";
 import { useAnalysisTask, useProject, useProjectGraph, useRuntimeTask } from "@/api/queries";
@@ -48,9 +49,23 @@ const INPUT_CLASS = "app-input text-xs";
 export default function WorkbenchPage() {
   const params = useParams();
   const projectId = params.projectId ?? "";
+  const location = useLocation();
+  const navigate = useNavigate();
   const projectQuery = useProject(projectId);
   const graphQuery = useProjectGraph(projectId);
   const queryClient = useQueryClient();
+
+  // 从 AI 对话页带回的需求草稿：一次性注入需求输入框，消费后立即清掉路由 state
+  const draftFromChat = (
+    location.state as { draftRequirement?: string } | null
+  )?.draftRequirement;
+  const [chatDraft, setChatDraft] = useState<string | null>(draftFromChat ?? null);
+  useEffect(() => {
+    if (!draftFromChat) return;
+    setChatDraft(draftFromChat);
+    navigate(location.pathname, { replace: true, state: null });
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [draftFromChat]);
 
   const graph = graphQuery.data;
   const [selectedNodeId, setSelectedNodeId] = useState<string | null>(null);
@@ -320,6 +335,14 @@ export default function WorkbenchPage() {
               更新代码
             </button>
           )}
+          <Link
+            to={`/projects/${projectId}/chat`}
+            className="app-btn-ghost"
+            data-testid="open-requirement-chat"
+          >
+            <MessagesSquare size={13} />
+            AI 需求助手
+          </Link>
           <button
             type="button"
             onClick={() => setShowRuntime((current) => !current)}
@@ -673,6 +696,7 @@ export default function WorkbenchPage() {
           projectId={projectId}
           analysisId={graph.analysisId}
           onSelectNode={focusNode}
+          initialRequirement={chatDraft ?? undefined}
         />
       )}
 

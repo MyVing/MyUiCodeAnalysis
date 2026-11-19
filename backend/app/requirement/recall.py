@@ -14,11 +14,13 @@ from app.contracts import (
     Candidate,
     EdgeKind,
     Evidence,
+    IREdge,
     IRGraph,
     IRNode,
     Location,
     NodeKind,
     RequirementWarning,
+    RuntimeTrace,
     Signal,
     SignalKind,
     Source,
@@ -27,6 +29,7 @@ from app.contracts import (
 # RequirementWarning 的 severity 用 requirement 契约自己的枚举：IR 契约里也有同名
 # 的 Severity，但那是另一个类型，混用会让等值比较莫名其妙地失败。
 from app.contracts.requirement import Severity
+from app.ir.api_usage import ApiUsageHit, ApiUsageIndex, apply_runtime_backing
 from app.requirement.lexicon import RequirementTerms, SearchTerm
 from app.requirement.text import ascii_words, contains_cjk, normalize
 
@@ -114,8 +117,17 @@ def recall(
     terms: RequirementTerms,
     *,
     top_k: int = DEFAULT_TOP_K,
+    trace: RuntimeTrace | None = None,
 ) -> RecallResult:
-    """从图里召回页面候选，按得分降序，截断到 top_k。"""
+    """从图里召回页面候选，按得分降序，截断到 top_k。
+
+    两段式（6.11 通用化）：先在全图上找「种子命中」（路由 / 组件名 / 文案 /
+    接口 / hook / 函数名），每个命中点沿图边反向归属到页面——词法只负责
+    「发现」，归属完全由图结构决定；没有任何种子命中时回退到页面级词法
+    评分（`collect_page_evidences` + `_score_page`），并显式告警。`trace`
+    是运行时采集产物（可为 None）：接口种子的命中页若同时出现在 trace 的
+    请求与页面 URL 里，置信度抬到运行时档（0.95）。
+    """
     if not terms.terms:
         return RecallResult(
             candidates=[],
@@ -149,6 +161,52 @@ def recall(
         )
         return RecallResult(candidates=[], warnings=warnings, route_by_page={})
 
+    seed_hits = _attribute_seeds(
+        graph, terms, frozenset(page.id for page in pages), trace
+    )
+    if not seed_hits:
+        warnings.append(
+            RequirementWarning(
+                code="fallback_lexical",
+                severity=Severity.info,
+                message=(
+                    "没有图内种子命中（路由 / 组件名 / 文案 / 接口 / 函数名），"
+                    "回退到页面级词法评分。"
+                ),
+            )
+        )
+        return _lexical_recall(
+            graph, terms, pages, route_by_page, layout_ids, top_k, warnings
+        )
+
+    scored = _candidates_from_seed_hits(graph, pages, route_by_page, layout_ids, seed_hits)
+    scored.sort(key=lambda item: (-item.candidate.score, item.candidate.nodeId))
+
+    if len(scored) > top_k:
+        warnings.append(
+            RequirementWarning(
+                code="candidates_truncated",
+                severity=Severity.info,
+                message=f"共召回 {len(scored)} 个候选，只保留得分前 {top_k} 个。",
+            )
+        )
+    return RecallResult(
+        candidates=scored[:top_k],
+        warnings=warnings,
+        route_by_page=route_by_page,
+    )
+
+
+def _lexical_recall(
+    graph: IRGraph,
+    terms: RequirementTerms,
+    pages: list[IRNode],
+    route_by_page: dict[str, str],
+    layout_ids: set[str],
+    top_k: int,
+    warnings: list[RequirementWarning],
+) -> RecallResult:
+    """降级路径：页面级词法评分（无任何种子命中时兜底，保证不比旧实现差）。"""
     evidences = collect_page_evidences(graph, pages, layout_ids)
     scored = [
         detail
@@ -171,6 +229,398 @@ def recall(
         warnings=warnings,
         route_by_page=route_by_page,
     )
+
+
+# 种子系数（6.11）：命中种类决定可信度。接口是需求文档里最无歧义的信息，
+# 但词法命中只能确认「URL 含这个词」（不是 method+path 全对上的锚点直连），
+# 按 ApiUsageIndex 的后缀档 0.85 计；路由路径是页面身份的声明式来源，计 1.0。
+API_SEED_COEFFICIENT = 0.85
+SEED_COEFFICIENTS: dict[SignalKind, float] = {
+    SignalKind.routePath: 1.0,
+    SignalKind.routeTitle: 0.9,
+    SignalKind.uiText: 0.7,
+    SignalKind.componentName: 0.6,
+    SignalKind.handlerName: 0.5,
+    SignalKind.apiUrl: API_SEED_COEFFICIENT,
+}
+
+
+@dataclass(frozen=True)
+class _SeedHit:
+    """一条「种子命中 → 反向归属到页面」的结论：路径上每一环都可回图核对。"""
+
+    page_node_id: str
+    route_node_id: str | None
+    kind: SignalKind
+    text: str
+    # 命中该种子的检索词权重之和（与 _score_page 同口径）
+    term_weight: float
+    # min(路径上各边置信度) × 种子系数；运行时双证抬到 0.95
+    confidence: float
+    # 完整归属路径：种子 → … → 页面（→ 路由）
+    node_ids: tuple[str, ...]
+    edge_ids: tuple[str, ...]
+    runtime_backed: bool = False
+
+
+def collect_seeds(graph: IRGraph) -> list[tuple[str, SignalKind, str]]:
+    """全图收集可被检索词命中的种子文本，按 (node, kind, text) 去重。
+
+    词法在这一步只负责「发现」——命中哪里算哪里，不负责归属；命中点随后沿
+    图边反向归属到页面。种子覆盖五类声明式信息：路由路径 / 标题、组件名、
+    界面文案（组件 uiText 与元素 viewText）、接口 URL、hook / 函数名。
+    """
+    seeds: list[tuple[str, SignalKind, str]] = []
+    seen: set[tuple[str, SignalKind, str]] = set()
+
+    def add(node_id: str, kind: SignalKind, text: str) -> None:
+        if not text.strip():
+            return
+        key = (node_id, kind, text)
+        if key not in seen:
+            seen.add(key)
+            seeds.append(key)
+
+    for node in graph.nodes:
+        if node.kind is NodeKind.route:
+            add(node.id, SignalKind.routePath, node.name)
+            title = node.attrs.get("title")
+            if isinstance(title, str):
+                add(node.id, SignalKind.routeTitle, title)
+        elif node.kind in (NodeKind.component, NodeKind.server_component):
+            if node.attrs.get("external") is True:
+                continue
+            add(node.id, SignalKind.componentName, node.name)
+            ui_text = node.attrs.get("uiText")
+            if isinstance(ui_text, dict):
+                for entry in ui_text.get("texts") or []:
+                    if isinstance(entry, dict) and isinstance(entry.get("text"), str):
+                        add(node.id, SignalKind.uiText, entry["text"])
+        elif node.kind is NodeKind.element:
+            view_text = node.attrs.get("viewText")
+            if isinstance(view_text, str):
+                add(node.id, SignalKind.uiText, view_text)
+        elif node.kind is NodeKind.api:
+            url = node.attrs.get("url") or node.attrs.get("path")
+            if isinstance(url, str):
+                add(node.id, SignalKind.apiUrl, url)
+        elif node.kind in (NodeKind.hook, NodeKind.fn):
+            add(node.id, SignalKind.handlerName, node.name)
+    return seeds
+
+
+def _attribute_seeds(
+    graph: IRGraph,
+    terms: RequirementTerms,
+    page_ids: frozenset[str],
+    trace: RuntimeTrace | None,
+) -> list[_SeedHit]:
+    """种子命中 → 反向归属到页面（→路由）。
+
+    api 种子与锚点直连共用 ApiUsageIndex 的归一化、遍历与运行时双证；其余
+    种子走同一实例的通用反向遍历（同一套边预算与置信度规则）。路由种子的
+    页面就是该路由的渲染目标（正向一跳），不走反向遍历——route 节点的反向
+    入边到不了它自己的页面。
+    """
+    index = ApiUsageIndex(graph)
+    nodes_by_id = {node.id: node for node in graph.nodes}
+    pages_by_route = route_target_pages(graph, nodes_by_id)
+    shared = _shared_component_ids(graph, nodes_by_id)
+    hits: list[_SeedHit] = []
+
+    for (node_id, kind, text), term_weight in seeds_with_terms(collect_seeds(graph), terms):
+        coefficient = SEED_COEFFICIENTS[kind]
+        if kind is SignalKind.apiUrl:
+            api_node = nodes_by_id[node_id]
+            url = api_node.attrs.get("url") or api_node.attrs.get("path")
+            for walk in index.walk_from(
+                node_id, coefficient, page_ids=page_ids, suffix_match=True
+            ):
+                hits.append(
+                    _api_seed_hit(
+                        walk, kind, text, term_weight, api_node, url, trace, index
+                    )
+                )
+        elif kind in (SignalKind.routePath, SignalKind.routeTitle):
+            for page_id in pages_by_route.get(node_id, []):
+                edge = _route_page_edge(graph, node_id, page_id)
+                confidence = round(coefficient * max(
+                    (item.confidence for item in edge.evidence), default=0.0
+                ) if edge is not None else coefficient, 4)
+                hits.append(
+                    _SeedHit(
+                        page_node_id=page_id,
+                        route_node_id=node_id,
+                        kind=kind,
+                        text=text,
+                        term_weight=term_weight,
+                        confidence=confidence,
+                        node_ids=(page_id, node_id),
+                        edge_ids=(edge.id,) if edge is not None else (),
+                    )
+                )
+        else:
+            for walk in index.walk_from(node_id, coefficient, page_ids=page_ids):
+                # 布局复用衰减：路径经过被多条路由共享的外壳组件时折半
+                confidence = walk.confidence
+                if any(node_id_item in shared for node_id_item in walk.path):
+                    confidence = round(confidence * LAYOUT_REUSE_DECAY, 4)
+                hits.append(
+                    _SeedHit(
+                        page_node_id=walk.page_node_id,
+                        route_node_id=walk.route_node_id,
+                        kind=kind,
+                        text=text,
+                        term_weight=term_weight,
+                        confidence=confidence,
+                        node_ids=walk.path,
+                        edge_ids=walk.edge_path,
+                    )
+                )
+    return _dedupe_hits(hits)
+
+
+def _dedupe_hits(hits: list[_SeedHit]) -> list[_SeedHit]:
+    """同一种子在同一个页面上的多条等价归属只保留置信度最高的一条。
+
+    共享布局（route_home → FullLayout ← route_posts）会让 Header 的文案经
+    两条路由各归属一次到同一个页面——那是同一次命中，不是两次证据；重复
+    折扣只该作用于真正不同的种子出现（比如两个不同子组件都有这段文案）。
+    """
+    best: dict[tuple[str, SignalKind, str, str], _SeedHit] = {}
+    order: list[tuple[str, SignalKind, str, str]] = []
+    for hit in hits:
+        key = (
+            hit.page_node_id,
+            hit.kind,
+            normalize(hit.text),
+            hit.node_ids[0] if hit.node_ids else "",
+        )
+        current = best.get(key)
+        if current is None:
+            best[key] = hit
+            order.append(key)
+        elif hit.confidence > current.confidence:
+            best[key] = hit
+    return [best[key] for key in order]
+
+
+def seeds_with_terms(
+    seeds: list[tuple[str, SignalKind, str]], terms: RequirementTerms
+) -> list[tuple[tuple[str, SignalKind, str], float]]:
+    """过滤出被检索词命中的种子，并带上权重之和（保持发现顺序）。"""
+    matched: list[tuple[tuple[str, SignalKind, str], float]] = []
+    for seed in seeds:
+        term_hits = _match_terms(seed[2], terms.terms)
+        if term_hits:
+            matched.append((seed, sum(term.weight for term in term_hits)))
+    return matched
+
+
+def _api_seed_hit(
+    walk: ApiUsageHit,
+    kind: SignalKind,
+    text: str,
+    term_weight: float,
+    api_node: IRNode,
+    url: object,
+    trace: RuntimeTrace | None,
+    index: ApiUsageIndex,
+) -> _SeedHit:
+    """api 种子命中，附带运行时双证强化（trace 请求 + 页面 URL 同时命中）。"""
+    confidence = walk.confidence
+    runtime_backed = False
+    if trace is not None and isinstance(url, str):
+        method = api_node.attrs.get("method")
+        route_paths = {walk.page_node_id: index.route_path_of(walk.route_node_id)}
+        backed = apply_runtime_backing(
+            (walk,),
+            route_paths,
+            method=method if isinstance(method, str) else None,
+            url=url,
+            trace=trace,
+        )
+        runtime_backed = backed[0].runtime_backed
+        confidence = backed[0].confidence
+    return _SeedHit(
+        page_node_id=walk.page_node_id,
+        route_node_id=walk.route_node_id,
+        kind=kind,
+        text=text,
+        term_weight=term_weight,
+        confidence=confidence,
+        node_ids=walk.path,
+        edge_ids=walk.edge_path,
+        runtime_backed=runtime_backed,
+    )
+
+
+# 布局复用衰减：归属路径经过被 ≥2 条路由渲染的组件（全站外壳）时，
+# 该命中折半计权——能召回，但不能压过页面自有文案。
+LAYOUT_REUSE_DECAY = 0.5
+
+
+def _shared_component_ids(
+    graph: IRGraph, nodes_by_id: dict[str, IRNode]
+) -> frozenset[str]:
+    """被 ≥2 条路由渲染的组件（layout 语义）：它们身上的命中对每页等价。"""
+    counts: dict[str, int] = defaultdict(int)
+    for edge in graph.edges:
+        if edge.kind is not EdgeKind.renders:
+            continue
+        source = nodes_by_id.get(edge.from_)
+        if source is not None and source.kind is NodeKind.route:
+            counts[edge.to] += 1
+    return frozenset(node_id for node_id, count in counts.items() if count >= 2)
+
+
+def _route_page_edge(graph: IRGraph, route_id: str, page_id: str) -> IREdge | None:
+    return next(
+        (
+            edge
+            for edge in graph.edges
+            if edge.kind is EdgeKind.renders and edge.from_ == route_id and edge.to == page_id
+        ),
+        None,
+    )
+
+
+def _candidates_from_seed_hits(
+    graph: IRGraph,
+    pages: list[IRNode],
+    route_by_page: dict[str, str],
+    layout_ids: set[str],
+    seed_hits: list[_SeedHit],
+) -> list[CandidateDetail]:
+    """按页面聚合种子命中，产出候选。
+
+    页面得分 = 该页全部信号得分之和（契约语义：signals 之和即总分）；
+    同一种子文本在同一页面重复命中按 _REPEAT_DECAY 逐次折扣。quote_corpus
+    追加种子文本：判定阶段的引文校验必须能查到这些「归属依据」。
+    """
+    evidences = collect_page_evidences(graph, pages, layout_ids)
+    by_page: dict[str, list[_SeedHit]] = defaultdict(list)
+    for hit in seed_hits:
+        by_page[hit.page_node_id].append(hit)
+
+    details: list[CandidateDetail] = []
+    for page in pages:
+        page_hits = by_page.get(page.id)
+        if not page_hits:
+            continue
+        base = _page_detail(page, evidences.get(page.id, []))
+        signals: list[Signal] = []
+        repeats: dict[tuple[SignalKind, str], int] = defaultdict(int)
+        best = page_hits[0]
+        for hit in page_hits:
+            if hit.confidence > best.confidence:
+                best = hit
+            key = (hit.kind, normalize(hit.text))
+            repeat = repeats[key]
+            repeats[key] += 1
+            score = hit.confidence * hit.term_weight * _REPEAT_DECAY**repeat
+            signals.append(Signal(kind=hit.kind, value=hit.text, score=round(score, 4)))
+        kept = _top_signals_per_kind(signals)
+        candidate = Candidate(
+            nodeId=page.id,
+            routeId=best.route_node_id or route_by_page.get(page.id),
+            name=page.name,
+            file=page.file,
+            score=round(sum(signal.score for signal in signals), 4),
+            signals=kept,
+            anchorNodeIds=list(best.node_ids) if len(best.node_ids) > 1 else None,
+            anchorEdgeIds=list(best.edge_ids) if best.edge_ids else None,
+        )
+        seed_texts = {hit.text for hit in page_hits} - set(base.quote_corpus)
+        detail = CandidateDetail(
+            candidate=candidate,
+            ui_texts=base.ui_texts,
+            prop_names=base.prop_names,
+            prop_descriptions=base.prop_descriptions,
+            api_urls=base.api_urls,
+            quote_corpus=_unique_preserving_order([*base.quote_corpus, *seed_texts]),
+            evidence=base.evidence,
+        )
+        details.append(detail)
+    return details
+
+
+def _page_detail(page: IRNode, evidences: list[RecallEvidence]) -> CandidateDetail:
+    """从页面证据构造候选的语料部分（不含得分——得分来自种子命中聚合）。"""
+    return CandidateDetail(
+        candidate=Candidate(
+            nodeId=page.id,
+            name=page.name,
+            file=page.file,
+            score=0.0,
+            signals=[],
+        ),
+        ui_texts=_unique_preserving_order(
+            item.text for item in evidences if item.kind is SignalKind.uiText
+        )[:MAX_ITEMS_PER_CANDIDATE],
+        prop_names=_unique_preserving_order(
+            item.text for item in evidences if item.kind is SignalKind.propName
+        )[:MAX_ITEMS_PER_CANDIDATE],
+        prop_descriptions=_unique_preserving_order(
+            item.text for item in evidences if item.kind is SignalKind.propDescription
+        )[:MAX_ITEMS_PER_CANDIDATE],
+        api_urls=sorted({item.text for item in evidences if item.kind is SignalKind.apiUrl}),
+        quote_corpus=_unique_preserving_order(item.text for item in evidences),
+        evidence=list(evidences),
+    )
+
+
+def route_target_pages(
+    graph: IRGraph, nodes_by_id: dict[str, IRNode]
+) -> dict[str, list[str]]:
+    """route → 渲染的页面组件（布局复用时一个路由可挂多个页面）。
+
+    ast-worker 已经按 `<Outlet>` / 嵌套路由层级 / index 规则区分过 layout 与
+    page（`attrs.pageComponentId` / `attrs.layoutComponentIds`），这里的顺序
+    以显式标注为准——同一路径下 layout 先声明时，按边遍历顺序取会把布局组件
+    当成页面。attrs 缺省（旧图）时退回全部渲染目标，行为不变。
+    """
+    by_route: dict[str, list[str]] = defaultdict(list)
+    for edge in graph.edges:
+        if edge.kind is not EdgeKind.renders:
+            continue
+        source = nodes_by_id.get(edge.from_)
+        target = nodes_by_id.get(edge.to)
+        if (
+            source is not None
+            and source.kind is NodeKind.route
+            and target is not None
+            and target.kind in (NodeKind.component, NodeKind.server_component)
+        ):
+            by_route[source.id].append(target.id)
+
+    for node in graph.nodes:
+        if node.kind is not NodeKind.route:
+            continue
+        declared_layout = node.attrs.get("layoutComponentIds")
+        layout_ids = (
+            {item for item in declared_layout if isinstance(item, str)}
+            if isinstance(declared_layout, list)
+            else set()
+        )
+        declared_page = node.attrs.get("pageComponentId")
+        if not layout_ids and not isinstance(declared_page, str):
+            continue  # 旧图没有区分信息，保持原有顺序
+        targets = by_route.get(node.id, [])
+        if isinstance(declared_page, str):
+            pages = [declared_page] + [
+                item
+                for item in targets
+                if item != declared_page and item not in layout_ids
+            ]
+        else:
+            pages = [item for item in targets if item not in layout_ids]
+        if pages:
+            by_route[node.id] = pages
+        elif targets:
+            # 全被标成 layout 的极端情况：保留原目标，不给空列表
+            by_route[node.id] = targets
+    return dict(by_route)
 
 
 def page_nodes(graph: IRGraph) -> tuple[list[IRNode], dict[str, str], set[str]]:

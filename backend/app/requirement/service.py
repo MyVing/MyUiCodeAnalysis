@@ -21,6 +21,7 @@ from app.requirement.orchestrator import RequirementOrchestrator
 from app.schemas import Project, RequirementLocateStart, RequirementTask
 from app.storage.repositories import AnalysisRepository
 from app.storage.requirement import RequirementRepository
+from app.storage.runtime import RuntimeRepository
 
 logger = logging.getLogger(__name__)
 
@@ -42,12 +43,14 @@ class RequirementLocateService:
         settings: Settings,
         llm: LLMClient | None = None,
         checkpointer: BaseCheckpointSaver | None = None,
+        runtime: RuntimeRepository | None = None,
     ) -> None:
         self._repository = repository
         self._analyses = analyses
         self._settings = settings
         self._llm = llm
         self._checkpointer = checkpointer
+        self._runtime = runtime
         # asyncio.Task 弱引用会被事件循环 GC，必须持有强引用直到完成
         self._background: set[asyncio.Task[None]] = set()
 
@@ -169,5 +172,13 @@ class RequirementLocateService:
                 profile = await self._analyses.get_page_profiles(project.id, graph.analysisId)
             except Exception:  # noqa: BLE001 - 读画像失败不该让定位失败
                 logger.exception("读取页面画像失败：project=%s", project.id)
+        # 运行时采集产物（可选）：trace 的请求 URL + 页面 URL 同时命中时，
+        # 接口种子的归属置信度抬到 0.95。读不到就静默跳过。
+        trace = None
+        if self._runtime is not None:
+            try:
+                trace = await self._runtime.get_latest_trace(project.id)
+            except Exception:  # noqa: BLE001 - 读 trace 失败不该让定位失败
+                logger.exception("读取运行时采集产物失败：project=%s", project.id)
         orchestrator = RequirementOrchestrator(self._settings, self._llm, self._checkpointer)
-        return await orchestrator.run(project, task, graph, profile)
+        return await orchestrator.run(project, task, graph, profile, trace)

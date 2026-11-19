@@ -308,14 +308,26 @@ class ApiUsageIndex:
                 hits.extend(nodes)
         return hits
 
-    def _walk_from_api(self, api_node: IRNode, suffix_match: bool) -> list[ApiUsageHit]:
-        """从 api 节点反向走整张图，收集所有可达页面的命中。"""
-        anchor = _ANCHOR_SUFFIX if suffix_match else _ANCHOR_EXACT
+    def walk_from(
+        self,
+        node_id: str,
+        anchor: float,
+        *,
+        page_ids: frozenset[str] | None = None,
+        suffix_match: bool = False,
+    ) -> list[ApiUsageHit]:
+        """从任意节点反向走整张图，收集所有可达页面（→路由）的命中。
+
+        api 反查与召回种子归属共用同一套遍历：边预算各计各的、置信度沿路径取
+        最小值 × 锚点系数、到页面为止。`page_ids` 是无路由降级图的页面集合：
+        这些页面没有 route 终跳，命中时直接以页面为落点（route_node_id 为
+        None），不再向上展开——与有路由页面同一条「到页面为止」规则。
+        """
         hits: list[ApiUsageHit] = []
         start = _WalkState(
-            node_id=api_node.id,
+            node_id=node_id,
             budgets=(),
-            path=(api_node.id,),
+            path=(node_id,),
             edge_path=(),
             min_confidence=1.0,
         )
@@ -341,9 +353,29 @@ class ApiUsageIndex:
                         evidence=self._path_evidence(state.edge_path),
                     )
                 )
+            if (
+                page_ids
+                and state.node_id in page_ids
+                and state.node_id not in self._routes_by_page
+            ):
+                # 无路由页面：没有 route 终跳，直接以页面为落点
+                hits.append(
+                    ApiUsageHit(
+                        page_node_id=state.node_id,
+                        route_node_id=None,
+                        path=state.path,
+                        edge_path=state.edge_path,
+                        confidence=round(state.min_confidence * anchor, 4),
+                        url_suffix_match=suffix_match,
+                        runtime_backed=False,
+                        evidence=self._path_evidence(state.edge_path),
+                    )
+                )
             # 页面本身不再向上展开：layout 复用、父级传递都会把「谁在用」冲淡成
             # 「谁可能沾边」。反查的答案到 route 为止。
             if state.node_id in self._routes_by_page:
+                continue
+            if page_ids and state.node_id in page_ids:
                 continue
             for edge in self._in_edges.get(state.node_id, []):
                 budget = _HOP_BUDGETS.get(edge.kind)
@@ -356,6 +388,11 @@ class ApiUsageIndex:
                     continue  # 环路：图上不该有，防御性跳过
                 stack.append(state.with_edge(edge))
         return hits
+
+    def _walk_from_api(self, api_node: IRNode, suffix_match: bool) -> list[ApiUsageHit]:
+        """从 api 节点反向走整张图，收集所有可达页面的命中。"""
+        anchor = _ANCHOR_SUFFIX if suffix_match else _ANCHOR_EXACT
+        return self.walk_from(api_node.id, anchor, suffix_match=suffix_match)
 
     def _edge_by_id(self, edge_id: str) -> IREdge | None:
         return self._edges_by_id.get(edge_id)

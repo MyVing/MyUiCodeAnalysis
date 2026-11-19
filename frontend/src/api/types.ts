@@ -196,6 +196,26 @@ export interface RequirementTaskList {
 
 export type RequirementMapArtifact = RequirementMap;
 
+/** 需求对话：会话历史由前端持有，每次全量回传 */
+export interface ChatMessage {
+  role: "user" | "assistant";
+  content: string;
+  /** 命中项目页面时就地生成的规格文档（业务操作步骤 + 前端交互视图） */
+  docMarkdown?: string;
+  docPage?: string;
+}
+
+export interface RequirementChatStart {
+  messages: ChatMessage[];
+}
+
+export interface RequirementChatResult {
+  reply: string;
+  draftRequirement?: string | null;
+  docMarkdown?: string | null;
+  docPage?: string | null;
+}
+
 /** AI 自动探索输入：url 与 command 二选一；dryRun=true 只产出计划不执行 */
 export interface ExploreStart {
   goal: string;

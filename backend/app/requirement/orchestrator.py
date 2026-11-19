@@ -36,7 +36,7 @@ from langgraph.checkpoint.memory import MemorySaver
 from langgraph.graph import END, START, StateGraph
 from langgraph.graph.state import CompiledStateGraph
 
-from app.contracts import Feature, IRGraph, RequirementMap, RequirementWarning
+from app.contracts import Feature, IRGraph, RequirementMap, RequirementWarning, RuntimeTrace
 from app.contracts.requirement import Dropped, Match, Severity, Unmatched
 from app.core.config import Settings
 from app.requirement.anchors import AnchorOutcome, anchor_direct_connect
@@ -99,13 +99,15 @@ class RequirementOrchestrator:
         task: RequirementTask,
         graph: IRGraph,
         profile: ProfilePayload | None = None,
+        trace: RuntimeTrace | None = None,
     ) -> RequirementMap:
         """跑一次定位。`profile` 是离线页面画像（阶段 C 产物，可为 None）。
 
         画像按图版本缓存，由调用方（`RequirementLocateService`）读出来传进来：
-        编排层不该自己碰仓储，它只负责「怎么算」。
+        编排层不该自己碰仓储，它只负责「怎么算」。`trace` 同理——运行时采集
+        产物（可为 None），召回阶段用它做运行时双证强化。
         """
-        compiled = self._build_graph(project, task, graph, profile)
+        compiled = self._build_graph(project, task, graph, profile, trace)
         config: RunnableConfig = {"configurable": {"thread_id": task.id}}
         final = await compiled.ainvoke({"requirement": task.requirement}, config)
         return final["map"]
@@ -116,6 +118,7 @@ class RequirementOrchestrator:
         task: RequirementTask,
         graph: IRGraph,
         profile: ProfilePayload | None = None,
+        trace: RuntimeTrace | None = None,
     ) -> CompiledStateGraph:
         settings = self._settings
         llm = self._llm if not task.dry_run else None
@@ -139,7 +142,10 @@ class RequirementOrchestrator:
 
         async def recall_node(state: LocateState) -> dict:
             top_k = settings.llm_max_candidates
-            results = [recall(graph, feature.terms, top_k=top_k) for feature in state["features"]]
+            results = [
+                recall(graph, feature.terms, top_k=top_k, trace=trace)
+                for feature in state["features"]
+            ]
             warnings = [warning for result in results for warning in result.warnings]
             # 合并后统一截断：多个功能点各自取 top_k 会重复计数，
             # 让「候选上限」名不副实。

@@ -16,6 +16,8 @@ import type {
   Project,
   ProjectCreate,
   ProjectGitCreate,
+  RequirementChatResult,
+  RequirementChatStart,
   RequirementCollectStart,
   RequirementCollectResult,
   RequirementLocateStart,
@@ -161,6 +163,13 @@ export const api = {
 
   startRequirementLocate: (projectId: string, payload: RequirementLocateStart) =>
     request<RequirementTask>(`/projects/${projectId}/requirements`, {
+      method: "POST",
+      body: JSON.stringify(payload),
+    }),
+
+  /** 需求对话：同步一次模型调用；503=模型未配置，502=模型调用失败 */
+  chatRequirement: (projectId: string, payload: RequirementChatStart) =>
+    request<RequirementChatResult>(`/projects/${projectId}/requirement-chat`, {
       method: "POST",
       body: JSON.stringify(payload),
     }),

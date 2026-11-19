@@ -10,6 +10,7 @@ provider 抽象为 LLMClient 协议，测试用 Fake 注入，编排层不感知
 
 from __future__ import annotations
 
+import asyncio
 import logging
 from typing import Protocol
 
@@ -45,12 +46,22 @@ class LLMClient(Protocol):
     async def chat(self, system: str, user: str) -> str:
         """单轮补全。实现方负责超时与错误归一：失败抛 LLMCallError。"""
 
+    async def chat_messages(
+        self,
+        system: str,
+        messages: list[dict[str, str]],
+        *,
+        temperature: float = 0,
+    ) -> str:
+        """多轮补全：messages 为全量历史（role ∈ user/assistant）。失败抛 LLMCallError。"""
+
 
 class OpenAICompatibleLLM:
     """POST {base_url}/chat/completions 的最小实现。
 
-    每次调用新建 AsyncClient：一次需求定位最多几次调用，连接复用的收益
-    不值得引入客户端生命周期管理（关闭钩子、事件循环绑定）。
+    AsyncClient 跨调用复用（懒创建、按事件循环绑定）：TLS/TCP 握手可能高达
+    数十秒（中转网络慢时实测 44s+），每次调用新建客户端意味着文档生成连打
+    4 次就要付 4 次握手，60s 超时必爆；复用后只有第一次付这个成本。
     """
 
     def __init__(self, settings: Settings) -> None:
@@ -62,15 +73,29 @@ class OpenAICompatibleLLM:
         self._timeout = settings.llm_timeout_seconds
         self._max_tokens = settings.llm_max_tokens
         self._response_format = settings.llm_response_format
+        self._client: httpx.AsyncClient | None = None
+        self._loop: asyncio.AbstractEventLoop | None = None
 
-    def _build_payload(self, system: str, user: str) -> dict[str, object]:
+    def _http(self) -> httpx.AsyncClient:
+        """复用客户端；事件循环变了（测试多次 asyncio.run）则重建。"""
+        loop = asyncio.get_running_loop()
+        if self._client is None or self._loop is not loop:
+            # 旧循环已退出，无法（也无需）优雅关闭旧客户端，交给 GC
+            self._client = httpx.AsyncClient(timeout=self._timeout)
+            self._loop = loop
+        return self._client
+
+    def _build_payload(
+        self,
+        system: str,
+        messages: list[dict[str, str]],
+        *,
+        temperature: float = 0,
+    ) -> dict[str, object]:
         payload: dict[str, object] = {
             "model": self._model,
-            "messages": [
-                {"role": "system", "content": system},
-                {"role": "user", "content": user},
-            ],
-            "temperature": 0,
+            "messages": [{"role": "system", "content": system}, *messages],
+            "temperature": temperature,
             "max_tokens": self._max_tokens,
         }
         if self._response_format:
@@ -78,14 +103,22 @@ class OpenAICompatibleLLM:
         return payload
 
     async def chat(self, system: str, user: str) -> str:
-        payload = self._build_payload(system, user)
+        return await self.chat_messages(system, [{"role": "user", "content": user}])
+
+    async def chat_messages(
+        self,
+        system: str,
+        messages: list[dict[str, str]],
+        *,
+        temperature: float = 0,
+    ) -> str:
+        payload = self._build_payload(system, messages, temperature=temperature)
         try:
-            async with httpx.AsyncClient(timeout=self._timeout) as client:
-                response = await client.post(
-                    f"{self._base_url}/chat/completions",
-                    headers={"Authorization": f"Bearer {self._api_key}"},
-                    json=payload,
-                )
+            response = await self._http().post(
+                f"{self._base_url}/chat/completions",
+                headers={"Authorization": f"Bearer {self._api_key}"},
+                json=payload,
+            )
         except httpx.TimeoutException as error:
             # 超时可能只是这一次慢：重试有意义
             raise LLMCallError(f"模型请求超时：{error}") from error

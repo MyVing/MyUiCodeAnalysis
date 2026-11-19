@@ -107,6 +107,7 @@ class SignalKind(StrEnum):
     apiUrl = 'apiUrl'
     propName = 'propName'
     propDescription = 'propDescription'
+    handlerName = 'handlerName'
     semanticRank = 'semanticRank'
 
 
@@ -144,6 +145,16 @@ class Candidate(BaseModel):
     ] = None
     score: Annotated[float, Field(ge=0.0)]
     signals: list[Signal]
+    anchorNodeIds: Annotated[
+        list[str] | None,
+        Field(
+            description='最优命中的完整归属路径（种子 → … → 页面 → 路由），反向 BFS 产出；纯词法候选缺省'
+        ),
+    ] = None
+    anchorEdgeIds: Annotated[
+        list[str] | None,
+        Field(description='归属路径上每条边的 id，与 anchorNodeIds 一一对应'),
+    ] = None
 
 
 class SubgraphCounts(BaseModel):

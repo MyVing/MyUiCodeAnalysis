@@ -199,6 +199,11 @@ def _build_user_prompt(
             "propDescriptions": detail.prop_descriptions,
             "apiUrls": detail.api_urls,
         }
+        # 锚点归属路径（反向 BFS 产物）：让模型知道「这条命中的每一环」，
+        # 判定从「选页面」变成「确认链路」。没有锚点的纯词法候选不带。
+        if candidate.anchorNodeIds:
+            payload["anchorNodeIds"] = candidate.anchorNodeIds
+            payload["anchorEdgeIds"] = candidate.anchorEdgeIds or []
         # 页面画像：只帮助理解页面用途，不是引文来源（见 profile.py 的约束 1）
         summary = (summaries or {}).get(candidate.nodeId)
         if summary:

@@ -21,7 +21,7 @@ from sqlalchemy import Row, text
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncEngine, create_async_engine
 
-from app.contracts import IRGraph, RequirementMap, RuntimeTrace
+from app.contracts import IRGraph, RequirementMap, RuntimeTrace, SpecDocMap
 from app.core.config import Settings
 from app.requirement.page_profile import ProfilePayload
 from app.schemas import (
@@ -30,6 +30,7 @@ from app.schemas import (
     Project,
     RequirementTask,
     RuntimeTask,
+    SpecDocTask,
 )
 from app.storage.checkpoint import CHECKPOINT_DDL_STATEMENTS
 from app.storage.repositories import DuplicateRemoteUrlError
@@ -213,6 +214,42 @@ DDL_STATEMENTS: tuple[str, ...] = (
       CONSTRAINT fk_explore_artifacts_task FOREIGN KEY (task_id)
         REFERENCES explore_tasks(id) ON DELETE CASCADE,
       KEY idx_explore_artifacts_project (project_id, created_at)
+    ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4
+    """,
+    # 规格文档装配：任务状态 + 产物（JSON）。同一 RequirementMap 可多次生成
+    # 规格，产物按 specDocId（= 任务 id）存取。
+    """
+    CREATE TABLE IF NOT EXISTS specdoc_tasks (
+      id VARCHAR(32) PRIMARY KEY,
+      project_id VARCHAR(32) NOT NULL,
+      requirement_id VARCHAR(32) NOT NULL,
+      status ENUM('queued','running','succeeded','failed') NOT NULL,
+      dry_run BOOLEAN NOT NULL,
+      created_at DATETIME(6) NOT NULL,
+      started_at DATETIME(6) NULL,
+      finished_at DATETIME(6) NULL,
+      error_code VARCHAR(64) NULL,
+      error_message TEXT NULL,
+      element_count INT NULL,
+      event_count INT NULL,
+      rule_count INT NULL,
+      warning_count INT NULL,
+      CONSTRAINT fk_specdocs_project FOREIGN KEY (project_id)
+        REFERENCES projects(id) ON DELETE CASCADE,
+      KEY idx_specdoc_tasks_project (project_id, created_at)
+    ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4
+    """,
+    """
+    CREATE TABLE IF NOT EXISTS spec_docs (
+      spec_doc_id VARCHAR(32) PRIMARY KEY,
+      project_id VARCHAR(32) NOT NULL,
+      requirement_id VARCHAR(32) NOT NULL,
+      analysis_id VARCHAR(32) NULL,
+      payload JSON NOT NULL,
+      created_at DATETIME(6) NOT NULL,
+      CONSTRAINT fk_spec_docs_task FOREIGN KEY (spec_doc_id)
+        REFERENCES specdoc_tasks(id) ON DELETE CASCADE,
+      KEY idx_spec_docs_project (project_id, created_at)
     ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4
     """,
 )
@@ -808,6 +845,134 @@ class MySqlRequirementRepository:
         async with self._engine.connect() as conn:
             row = (await conn.execute(query, {"id": task_id})).first()
         return RequirementMap.model_validate_json(row.payload) if row else None
+
+    async def purge_project(self, project_id: str) -> None:
+        # MySQL 路径靠 projects 外键级联删除，无需额外语句
+        return None
+
+
+class MySqlSpecDocRepository:
+    def __init__(self, engine: AsyncEngine) -> None:
+        self._engine = engine
+
+    def _task(self, row: Row[Any]) -> SpecDocTask:
+        return SpecDocTask(
+            id=row.id,
+            project_id=row.project_id,
+            requirement_id=row.requirement_id,
+            status=row.status,
+            dry_run=bool(row.dry_run),
+            created_at=_from_db(row.created_at),
+            started_at=_from_db(row.started_at),
+            finished_at=_from_db(row.finished_at),
+            error_code=row.error_code,
+            error_message=row.error_message,
+            element_count=row.element_count,
+            event_count=row.event_count,
+            rule_count=row.rule_count,
+            warning_count=row.warning_count,
+        )
+
+    async def add_task(self, task: SpecDocTask) -> SpecDocTask:
+        query = text(
+            """
+            INSERT INTO specdoc_tasks
+              (id, project_id, requirement_id, status, dry_run, created_at)
+            VALUES (:id, :pid, :rid, 'queued', :dry_run, :created_at)
+            """
+        )
+        async with self._engine.begin() as conn:
+            await conn.execute(
+                query,
+                {
+                    "id": task.id,
+                    "pid": task.project_id,
+                    "rid": task.requirement_id,
+                    "dry_run": task.dry_run,
+                    "created_at": _to_db(task.created_at),
+                },
+            )
+        return task
+
+    async def get_task(self, task_id: str) -> SpecDocTask | None:
+        query = text("SELECT * FROM specdoc_tasks WHERE id = :id")
+        async with self._engine.connect() as conn:
+            row = (await conn.execute(query, {"id": task_id})).first()
+        return self._task(row) if row else None
+
+    async def update_task(self, task: SpecDocTask) -> SpecDocTask:
+        query = text(
+            """
+            UPDATE specdoc_tasks
+            SET status = :status, started_at = :started_at, finished_at = :finished_at,
+                error_code = :error_code, error_message = :error_message,
+                element_count = :element_count, event_count = :event_count,
+                rule_count = :rule_count, warning_count = :warning_count
+            WHERE id = :id
+            """
+        )
+        async with self._engine.begin() as conn:
+            await conn.execute(
+                query,
+                {
+                    "id": task.id,
+                    "status": task.status,
+                    "started_at": _to_db(task.started_at) if task.started_at else None,
+                    "finished_at": _to_db(task.finished_at) if task.finished_at else None,
+                    "error_code": task.error_code,
+                    "error_message": task.error_message,
+                    "element_count": task.element_count,
+                    "event_count": task.event_count,
+                    "rule_count": task.rule_count,
+                    "warning_count": task.warning_count,
+                },
+            )
+        return task
+
+    async def list_by_project(self, project_id: str) -> list[SpecDocTask]:
+        query = text(
+            "SELECT * FROM specdoc_tasks WHERE project_id = :pid ORDER BY created_at DESC"
+        )
+        async with self._engine.connect() as conn:
+            rows = (await conn.execute(query, {"pid": project_id})).all()
+        return [self._task(row) for row in rows]
+
+    async def save_doc(self, spec_doc: SpecDocMap) -> None:
+        query = text(
+            """
+            INSERT INTO spec_docs
+              (spec_doc_id, project_id, requirement_id, analysis_id, payload, created_at)
+            VALUES (:sid, :pid, :rid, :aid, :payload, :created_at)
+            ON DUPLICATE KEY UPDATE payload = VALUES(payload),
+              analysis_id = VALUES(analysis_id)
+            """
+        )
+        async with self._engine.begin() as conn:
+            await conn.execute(
+                query,
+                {
+                    "sid": spec_doc.specDocId,
+                    "pid": spec_doc.projectId,
+                    "rid": spec_doc.requirementId,
+                    "aid": spec_doc.analysisId,
+                    "payload": spec_doc.model_dump_json(exclude_none=True),
+                    "created_at": _to_db(datetime.now(UTC)),
+                },
+            )
+
+    async def link_task(self, task_id: str, spec_doc_id: str) -> None:
+        # specDocId 即任务 id，绑定是幂等确认
+        return None
+
+    async def get_doc(self, spec_doc_id: str) -> SpecDocMap | None:
+        query = text("SELECT payload FROM spec_docs WHERE spec_doc_id = :sid")
+        async with self._engine.connect() as conn:
+            row = (await conn.execute(query, {"sid": spec_doc_id})).first()
+        return SpecDocMap.model_validate_json(row.payload) if row else None
+
+    async def get_doc_by_task(self, task_id: str) -> SpecDocMap | None:
+        # specDocId = 任务 id：单跳直达
+        return await self.get_doc(task_id)
 
     async def purge_project(self, project_id: str) -> None:
         # MySQL 路径靠 projects 外键级联删除，无需额外语句
