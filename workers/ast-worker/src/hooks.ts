@@ -32,7 +32,7 @@ import { Node as MorphNode } from "ts-morph";
 import type { Evidence, IREdge, IRNode, Warning } from "@uicodeanalysis/contracts";
 
 import type { DiscoveredComponent } from "./components.js";
-import { toProjectRelative } from "./paths.js";
+import { isProjectSource, toProjectRelative } from "./paths.js";
 import { positionKey } from "./positions.js";
 
 /** 组件里的 hook 调用是语法事实。 */
@@ -364,6 +364,9 @@ export function analyzeHooks(input: HooksAnalysisInput): HooksAnalysisResult {
       // 绑定了变量的（`const handleSelect = useCallback(...)`）以变量名作后缀，
       // 这样「handleSelect 用了哪个 hook」在图上直接可读。
       const boundName = readBoundVariableName(call);
+      // 解构 hook 返回值的绑定名：`const { onSubmit } = useLogin()` 里事件引用的
+      // 是 onSubmit 而不是 hook 名，事件分析需要这份名单才能落点
+      const destructuredNames = readDestructuredBindingNames(declaration);
       const nodeId = `${component.id}/${hookSuffix(boundName, hookName, hookCounters, component.id)}`;
 
       const pos = sourceFile.getLineAndColumnAtPos(call.getStart());
@@ -380,6 +383,7 @@ export function analyzeHooks(input: HooksAnalysisInput): HooksAnalysisResult {
           deps: extractDeps(call),
           // 绑定变量名与 hook 名不同时两个都要能看到
           ...(boundName ? { binding: boundName } : {}),
+          ...(destructuredNames.length > 0 ? { destructured: destructuredNames } : {}),
         },
         evidence: [
           {
@@ -399,6 +403,11 @@ export function analyzeHooks(input: HooksAnalysisInput): HooksAnalysisResult {
         if (callback) {
           callbackOwners.set(positionKey(relativeFile, callback.getStart()), nodeId);
         }
+      }
+
+      // 自定义 hook：定义体在别的文件里，其内部绑定回调的归属登记到本调用点节点
+      if (!classification.builtin) {
+        registerCustomHookCallbackBodies(call, nodeId, rootPath, callbackOwners);
       }
 
       addEdge(edges, {
@@ -448,6 +457,78 @@ function readBoundVariableName(call: CallExpression): string | null {
   if (parent.getInitializer()?.getStart() !== call.getStart()) return null;
   const nameNode = parent.getNameNode();
   return MorphNode.isIdentifier(nameNode) ? nameNode.getText() : null;
+}
+
+/**
+ * 解构 hook 返回值的绑定名（`const { onSubmit } = useLogin()` → ["onSubmit", ...]）。
+ *
+ * 自定义 hook 的返回值经解构进入组件作用域，事件绑定的具名引用
+ * （`onSubmit={onSubmit}`）命中的是绑定名而不是 hook 名；不登记这些名字，
+ * 事件的落点就断了。只收顶层绑定；嵌套解构（`const [{ a }] = useX()`）
+ * 不在一期范围内。
+ */
+function readDestructuredBindingNames(declaration: Node | null): string[] {
+  if (!declaration || !MorphNode.isVariableDeclaration(declaration)) return [];
+  const nameNode = declaration.getNameNode();
+  if (!MorphNode.isObjectBindingPattern(nameNode)) return [];
+
+  const names: string[] = [];
+  for (const element of nameNode.getElements()) {
+    if (element.getDotDotDotToken()) continue;
+    const elementName = element.getNameNode();
+    if (MorphNode.isIdentifier(elementName)) names.push(elementName.getText());
+  }
+  return names;
+}
+
+/**
+ * 自定义 hook 定义体内「绑定到变量名的回调体」的归属登记。
+ *
+ * DI 架构里请求链路穿过自定义 hook：`const { onSubmit } = useLogin()` 在组件里，
+ * 而 `sessionService.login(...)` 在 useLogin.ts 的 handleSubmit 回调体里。回调体
+ * 位置若不归属到 hook 调用点节点，api 分析会把其中的调用归到「模块级函数」
+ * 名下——它与事件落点（hook 节点）之间没有边，链条在图上断开。
+ *
+ * 登记语义与 useCallback 回调体完全一致：hook 调用点节点代表「这个 hook 实例
+ * 在这个组件里」，其内部绑定回调的执行时机由消费者（事件）决定。
+ * 只扫一层：hook 定义体的顶层语句，不递归、不追 hook 调 hook 的链。
+ */
+function registerCustomHookCallbackBodies(
+  call: CallExpression,
+  hookNodeId: string,
+  rootPath: string,
+  callbackOwners: Map<string, string>,
+): void {
+  const callee = call.getExpression();
+  if (!MorphNode.isIdentifier(callee)) return;
+
+  // 调用点标识符的符号是 import 别名（声明为 ImportSpecifier），必须穿透
+  // 才能拿到 hook 定义处的 FunctionDeclaration——与 api.ts 的同名处理一致
+  let symbol = callee.getSymbol();
+  if (symbol?.isAlias()) {
+    try {
+      symbol = symbol.getAliasedSymbol();
+    } catch {
+      return;
+    }
+  }
+
+  for (const decl of symbol?.getDeclarations() ?? []) {
+    if (!MorphNode.isFunctionDeclaration(decl)) continue;
+    const defFile = decl.getSourceFile();
+    if (!isProjectSource(rootPath, defFile.getFilePath())) continue;
+    const relativeFile = toProjectRelative(rootPath, defFile.getFilePath());
+    if (relativeFile === null) continue;
+
+    for (const inner of collectTopLevelCalls(decl)) {
+      // 只登记绑定到名字的回调（`const onSubmit = handleSubmit(fn)`）：
+      // 没有名字就没有节点身份可归属，与顶层 hook 的登记规则一致
+      if (!readBoundVariableName(inner)) continue;
+      const callback = callbackFunctionOf(inner);
+      if (!callback) continue;
+      callbackOwners.set(positionKey(relativeFile, callback.getStart()), hookNodeId);
+    }
+  }
 }
 
 interface BuildStateNodeInput {

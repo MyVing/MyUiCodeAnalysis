@@ -87,8 +87,14 @@ _MAPPING_SYSTEM = """\
 要求：
 1. 只归纳语料里有依据的映射（请求体字段名、接口 url、参数名）。
 2. api 用「METHOD url」或 url。
-3. quote 必须从对应页面的语料里逐字复制，禁止改写或拼凑。
-4. 语料没有依据的映射不要输出。
+3. quote 必须是语料里**一段连续原文**，逐字复制，禁止改写或拼凑。
+   错误示例：把 `- Your Name
+- useRegister
+- /api/users` 这样的关键词罗列当 quote——它不是语料原文，校验必然失败。
+   正确示例：语料里有一行是 `<input {...register("username")} placeholder="Your Name" />`，
+   quote 就原样复制这一行。
+4. 每条映射各自带自己的 quote，不要多条共用一段引文。
+5. 语料没有依据的映射不要输出。
 """
 
 
@@ -464,7 +470,7 @@ async def _infer_mappings(
         if front is None or backend is None or api is None:
             dropped.append(Dropped(reason=Reason.invalid_shape, quote=quote))
             continue
-        evidence, page_id = _locate_mapping_quote(api, quote, contexts)
+        evidence, page_id = _locate_mapping_quote_tolerant(api, quote, contexts)
         if evidence is None:
             dropped.append(Dropped(reason=Reason.quote_not_found, quote=quote))
             continue
@@ -479,6 +485,36 @@ async def _infer_mappings(
             )
         )
     return mappings, dropped, []
+
+
+def _mapping_quote_candidates(quote: str | None) -> list[str]:
+    """引文候选：整条优先；列表式引文拆行兜底。
+
+    模型不稳定时会把 quote 写成关键词罗列（`- Your Name\\n- useRegister`），
+    多行整体逐字匹配必然失败。先按原样校验，失败后拆行去掉列表标记逐行再试。
+    拆出的每一行仍走同一套逐字校验——防幻觉纪律不变，命中不了照样拒绝。
+    """
+    if not isinstance(quote, str) or not quote:
+        return []
+    if "\n" not in quote:
+        return [quote]
+    candidates = [quote]
+    for line in quote.splitlines():
+        stripped = line.strip().lstrip("-*·•").strip()
+        if stripped and stripped not in candidates:
+            candidates.append(stripped)
+    return candidates
+
+
+def _locate_mapping_quote_tolerant(
+    api: str, quote: str | None, contexts: list[_PageContext]
+) -> tuple[VerifiedEvidence | None, str | None]:
+    """逐个候选引文尝试定位，第一个校验通过的生效。"""
+    for candidate in _mapping_quote_candidates(quote):
+        evidence, page_id = _locate_mapping_quote(api, candidate, contexts)
+        if evidence is not None:
+            return evidence, page_id
+    return None, None
 
 
 def _locate_mapping_quote(

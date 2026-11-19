@@ -213,6 +213,17 @@ function buildNameTable(
       const binding = node.attrs.binding;
       const name = typeof binding === "string" && binding.length > 0 ? binding : node.name;
       targets.set(name, { id: node.id, kind: node.kind });
+      // 解构 hook 返回值的绑定名（`const { onSubmit } = useLogin()`）同样落到
+      // 该 hook 节点。静态近似：不区分 hook 返回对象的具体键——绑定到的是
+      // hook 而不是它内部的具体函数，多个事件可能落到同一 hook 节点上。
+      const destructured = node.attrs.destructured;
+      if (Array.isArray(destructured)) {
+        for (const item of destructured) {
+          if (typeof item === "string" && item.length > 0) {
+            targets.set(item, { id: node.id, kind: node.kind });
+          }
+        }
+      }
       continue;
     }
 

@@ -92,6 +92,38 @@ async def test_valid_outputs_are_capped_and_bound_to_pages() -> None:
     assert outcome.dropped == []
 
 
+async def test_list_style_mapping_quote_falls_back_to_lines() -> None:
+    """模型把 quote 写成关键词罗列时拆行兜底：能逐字命中的行救回该条映射。
+
+    回归背景：register 页实测中模型输出多行列表式 quote，整体逐字匹配必然
+    失败，字段映射整批被拒。拆出的每一行仍走同一套逐字校验，纪律不变。
+    """
+    listy = {
+        "fieldMappings": [
+            {
+                "frontField": "payeeAccount",
+                "backendParam": "payee_account",
+                "api": "POST /api/transfer",
+                "quote": "- payeeAccount\n- payee_account\n- POST /api/transfer",
+                "confidence": 0.7,
+            }
+        ]
+    }
+    requirement_map = spec_requirement_map(spec_graph())
+    outcome = await infer_sections(
+        requirement_map.requirement,
+        requirement_map,
+        _materials(),
+        _llm_with(mappings=listy),
+        max_calls=1,
+    )
+    assert len(outcome.field_mappings) == 1
+    mapping = outcome.field_mappings[0]
+    assert mapping.pageId == PAGE_ID
+    assert mapping.quote == "POST /api/transfer"
+    assert outcome.dropped == []
+
+
 async def test_invalid_quote_goes_to_dropped() -> None:
     """引文不在语料里：进 dropped（quote_not_found），不产出条目。"""
     bad = {"steps": [{**_VALID_STEPS["steps"][0], "quote": "语料里没有这句话"}]}

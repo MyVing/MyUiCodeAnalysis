@@ -127,8 +127,17 @@ export async function collectTrace(
       networkEvents.push(event);
     });
     page.on("console", (message) => {
-      // playwright 的 'warning' 对齐契约里的 'warn'
-      const level = message.type() === "warning" ? "warn" : message.type();
+      // 对齐契约枚举（log/info/warn/error/debug）：playwright 的 'warning'
+      // 落到 'warn'；Chromium 的 'verbose'（CDP consoleAPICalled 的级别，
+      // 比 debug 更细）按语义落到 'debug'。未知级别兜底 'log'，避免整个
+      // trace 因一条控制台消息过不了校验被拒收
+      // playwright 的类型声明不含 'verbose'，但运行时确实会出现（CDP
+      // consoleAPICalled 的级别直通），所以按 string 处理而不是按字面量联合类型
+      const raw = message.type() as string;
+      const mapped = raw === "warning" ? "warn" : raw === "verbose" ? "debug" : raw;
+      const level = ["log", "info", "warn", "error", "debug"].includes(mapped)
+        ? mapped
+        : "log";
       const event: Record<string, unknown> = { level, message: message.text() };
       const location = message.location();
       if (location.url) {

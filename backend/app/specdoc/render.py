@@ -230,10 +230,26 @@ def _group(items, key_of) -> dict[str, list]:
 
 
 def _group_by_element_page(doc: SpecDocMap, element_by_id) -> dict[str, list]:
-    """接口映射按触发要素的页面归组。"""
+    """接口映射按触发要素的页面归组。
+
+    mapping.elementId 是图上要素节点的原始 id（`...#Login/jsx:form/onSubmit`），
+    要素清单的 id 却是 ui.{pageNo}.{序号}——直接查必然落空，接口映射会全部
+    归到无名页。经事件桥接：mapping.eventId → event.elementId → 拥有该事件的
+    要素（eventIds 反查）→ 其 pageId。
+    """
+    page_by_raw_element_id: dict[str, str] = {}
+    event_by_id = {event.id: event for event in doc.events}
+    for element in doc.elements:
+        for event_id in element.eventIds or []:
+            event = event_by_id.get(event_id)
+            if event is not None:
+                page_by_raw_element_id[event.elementId] = element.pageId
+
     result: dict[str, list] = defaultdict(list)
     for mapping in doc.apiMappings:
         element = element_by_id.get(mapping.elementId)
-        page_id = element.pageId if element is not None else ""
-        result[page_id].append(mapping)
+        if element is not None:
+            result[element.pageId].append(mapping)
+        else:
+            result[page_by_raw_element_id.get(mapping.elementId, "")].append(mapping)
     return result

@@ -29,13 +29,13 @@
  * 误认成客户端，它的符号在项目内。
  */
 
-import type { CallExpression, Node, Project, SourceFile } from "ts-morph";
+import type { CallExpression, Node, Project, PropertyAccessExpression, SourceFile } from "ts-morph";
 import { Node as MorphNode, SyntaxKind } from "ts-morph";
 
 import type { Evidence, IREdge, IRNode, Warning } from "@uicodeanalysis/contracts";
 
 import { findNearestOwner } from "./ownership.js";
-import { isProjectSource, toProjectRelative } from "./paths.js";
+import { isProjectSource, toPosix, toProjectRelative } from "./paths.js";
 import { positionKey } from "./positions.js";
 
 /**
@@ -488,10 +488,63 @@ function isHttpClientCall(call: CallExpression, rootPath: string): boolean {
 
   // `axios.get` 的根标识符是 axios；`fetch` 本身就是客户端
   if (MorphNode.isPropertyAccessExpression(expr)) {
-    const rootName = expr.getExpression().getText().split(".")[0] ?? "";
-    return HTTP_CLIENTS.has(rootName);
+    const receiver = expr.getExpression();
+    const rootName = receiver.getText().split(".")[0] ?? "";
+    if (HTTP_CLIENTS.has(rootName)) return true;
+    // 根名不在名单里时查类型：DI 注入的客户端（`this.http` / `axios.create()`
+    // 的实例）名字与初始化器都不含客户端痕迹，但类型系统知道它是谁
+    return resolveReceiverClient(receiver, rootPath);
   }
   return HTTP_CLIENTS.has(name);
+}
+
+/**
+ * 类型级判定 receiver 是否为已知 HTTP 客户端的实例。
+ *
+ * 覆盖两类 DI 间接：`this.http = inject(() => ky)` 与
+ * `const api = axios.create()`。统一走类型而不是逐个追初始化器——receiver 的
+ * 类型符号指向的声明在项目外的依赖包里、包名在受控名单内，即认定是客户端。
+ *
+ * 类型解析失败（`any` / 丢失 @types）时返回 false，退化为现状，无回归。
+ */
+function resolveReceiverClient(receiver: Node, rootPath: string): boolean {
+  const type = receiver.getType();
+  const symbol = type.getAliasSymbol() ?? type.getSymbol();
+  const decls: Node[] = symbol?.getDeclarations() ?? [];
+  if (decls.length === 0) return false;
+
+  const externalDecls = decls.filter(
+    (decl) => !isProjectSource(rootPath, decl.getSourceFile().getFilePath()),
+  );
+  // 部分声明在项目内（如项目里自己扩展了客户端接口）→ 不能认定整个类型来自客户端
+  if (externalDecls.length === 0 || externalDecls.length !== decls.length) return false;
+
+  for (const decl of externalDecls) {
+    const pkg = packageNameOfDeclarationPath(decl.getSourceFile().getFilePath());
+    // @types/axios 只是 axios 的类型载体，客户端身份是去掉前缀后的包名
+    const bare = pkg?.startsWith("@types/") ? pkg.slice("@types/".length) : pkg;
+    if (bare !== null && HTTP_CLIENTS.has(bare)) return true;
+  }
+  return false;
+}
+
+/**
+ * 从声明文件路径提取裸包名：取最后一个 node_modules 之后的段。
+ *
+ * pnpm 的嵌套结构（`.pnpm/ky@1.x/node_modules/ky/...`）靠「最后一个」命中真实
+ * 包目录；`@scope/pkg` 取两段，其余取一段。
+ */
+function packageNameOfDeclarationPath(absolutePath: string): string | null {
+  const posix = toPosix(absolutePath);
+  const marker = "/node_modules/";
+  const last = posix.lastIndexOf(marker);
+  if (last === -1) return null;
+
+  const segments = posix.slice(last + marker.length).split("/");
+  if (segments[0]?.startsWith("@")) {
+    return segments.length >= 2 ? `${segments[0]}/${segments[1]}` : null;
+  }
+  return segments[0] ?? null;
 }
 
 /**
@@ -558,6 +611,9 @@ function findEnclosingFunction(node: Node): Node | null {
  */
 function getFunctionName(fn: Node): string | null {
   if (MorphNode.isFunctionDeclaration(fn)) return fn.getName() ?? null;
+  // service 类的方法（`class SessionService { async login(...) {...} }`）：
+  // DI 架构里请求链路穿过类方法，方法名就是它在图里的身份
+  if (MorphNode.isMethodDeclaration(fn)) return fn.getName();
   const parent = fn.getParent();
   if (parent && MorphNode.isVariableDeclaration(parent)) return parent.getName();
   if (parent && MorphNode.isPropertyAssignment(parent)) return parent.getName();
@@ -1085,12 +1141,20 @@ export function analyzeApi(input: ApiAnalysisInput): ApiAnalysisResult {
       }
     }
 
+    // 接口实现索引懒构建：只有真的出现「对接口方法的调用」才扫一遍全项目的
+    // implements 子句，纯函数式项目（没有类）零开销。
+    let interfaceImpls: InterfaceImplIndex | null = null;
+    const getInterfaceImpls = (): InterfaceImplIndex => {
+      if (interfaceImpls === null) interfaceImpls = buildInterfaceImplIndex(sourceFiles, rootPath);
+      return interfaceImpls;
+    };
+
     for (const file of project.getSourceFiles()) {
       const relativeFile = toProjectRelative(rootPath, file.getFilePath());
       if (relativeFile === null) continue;
 
       for (const call of file.getDescendantsOfKind(SyntaxKind.CallExpression)) {
-        const fnId = resolveCalledFunctionId(call, callTargets, rootPath);
+        const fnId = resolveCalledFunctionId(call, callTargets, rootPath, getInterfaceImpls);
         if (!fnId) continue;
 
         const callerId =
@@ -1231,14 +1295,21 @@ function readRequestAtCall(
  * 比对声明位置而不是名字：同名函数在不同文件里是不同实体，`fetchUsers`
  * 在 A 文件和 B 文件里可以完全是两回事。也必须穿透 import 别名——调用点的
  * 符号指向的是调用方文件里的 ImportSpecifier。
+ *
+ * 方法调用（`obj.fn()`）同样解析：属性符号的声明与 receiver 怎么来的
+ * （DI 注入、import、字面量）无关，声明在项目内的类/接口方法上。
  */
 function resolveCalledFunctionId(
   call: CallExpression,
   callTargets: ReadonlyMap<string, string>,
   rootPath: string,
+  getInterfaceImpls: () => InterfaceImplIndex,
 ): string | null {
   const expr = call.getExpression();
-  // 方法调用（`obj.fn()`）不在本期范围：静态判定不了 obj 指向哪个模块的函数
+
+  if (MorphNode.isPropertyAccessExpression(expr)) {
+    return resolveMethodCallTarget(expr, callTargets, rootPath, getInterfaceImpls);
+  }
   if (!MorphNode.isIdentifier(expr)) return null;
 
   let symbol = expr.getSymbol();
@@ -1257,6 +1328,117 @@ function resolveCalledFunctionId(
     if (hit) return hit;
   }
   return null;
+}
+
+/** 接口名#方法名 → 实现该方法的类方法节点（多个实现类都登记）。 */
+type InterfaceImplIndex = Map<string, Node[]>;
+
+/**
+ * 方法调用（`obj.fn()`）的目标解析。
+ *
+ * 取 `.fn` 属性上的符号：DI 注入（`inject<SessionServiceInterface>(...)`）时
+ * receiver 的类型是接口，符号声明在接口方法上（无方法体）；直接持有实现类
+ * 时声明在类方法上。前者查「接口实现索引」，全部实现类都尝试按位置命中
+ * （多实现全连，保守但每条边都有位置证据支撑）；命中不了返回 null，
+ * 保持「不虚构边」的现状语义。
+ */
+function resolveMethodCallTarget(
+  expr: PropertyAccessExpression,
+  callTargets: ReadonlyMap<string, string>,
+  rootPath: string,
+  getInterfaceImpls: () => InterfaceImplIndex,
+): string | null {
+  for (const decl of expr.getSymbol()?.getDeclarations() ?? []) {
+    const relativeFile = toProjectRelative(rootPath, decl.getSourceFile().getFilePath());
+    if (relativeFile === null) continue;
+
+    const hit = callTargets.get(positionKey(relativeFile, decl.getStart()));
+    if (hit) return hit;
+
+    // 接口方法声明：方法体在实现类里，按「接口名#方法名」找实现。
+    // 接口成员在 ts-morph 里是 MethodSignature（类里才是 MethodDeclaration），
+    // 两种都要认——漏掉 MethodSignature 会让 DI 场景的接口分支永远进不去
+    const parent = decl.getParent();
+    if (
+      (MorphNode.isMethodSignature(decl) || MorphNode.isMethodDeclaration(decl)) &&
+      parent !== undefined &&
+      MorphNode.isInterfaceDeclaration(parent)
+    ) {
+      const key = `${parent.getName()}#${decl.getName()}`;
+      for (const impl of getInterfaceImpls().get(key) ?? []) {
+        const implFile = toProjectRelative(rootPath, impl.getSourceFile().getFilePath());
+        if (implFile === null) continue;
+        const implHit = callTargets.get(positionKey(implFile, impl.getStart()));
+        if (implHit) return implHit;
+      }
+    }
+  }
+  return null;
+}
+
+/**
+ * 解析 implements 子句指向的接口真实名字。
+ *
+ * 子句文本只是调用方本地的名字：`import { UserService as IUserService }` 后
+ * 写 `implements IUserService`，文本是别名、接口真名是 UserService。索引键
+ * 必须用真名——调用侧（resolveMethodCallTarget）按「方法签名所在接口声明的
+ * 名字」查找，别名与真名对不上时 join 永远失配（register 链路断边即此成因）。
+ *
+ * 符号解析失败（`implements Base<x>` 之类的复杂表达式）时退回子句文本，
+ * 保持旧语义。
+ */
+function interfaceNamesOfImplementsClause(clauseExpr: Node): string[] {
+  const raw = clauseExpr.getText().trim();
+  if (!MorphNode.isIdentifier(clauseExpr)) return [raw];
+
+  let symbol = clauseExpr.getSymbol();
+  if (symbol?.isAlias()) {
+    try {
+      symbol = symbol.getAliasedSymbol();
+    } catch {
+      return [raw];
+    }
+  }
+  const names: string[] = [];
+  for (const decl of symbol?.getDeclarations() ?? []) {
+    if (MorphNode.isInterfaceDeclaration(decl)) names.push(decl.getName());
+  }
+  return names.length > 0 ? names : [raw];
+}
+
+/** 预扫全项目 `implements X` 的类，建「接口名#方法名 → 类方法」索引。 */
+function buildInterfaceImplIndex(
+  sourceFiles: readonly { file: SourceFile }[],
+  rootPath: string,
+): InterfaceImplIndex {
+  const index: InterfaceImplIndex = new Map();
+  for (const { file } of sourceFiles) {
+    if (!isProjectSource(rootPath, file.getFilePath())) continue;
+
+    for (const cls of file.getDescendantsOfKind(SyntaxKind.ClassDeclaration)) {
+      const clauses = cls.getImplements();
+      if (clauses.length === 0) continue;
+
+      for (const clause of clauses) {
+        for (const interfaceName of interfaceNamesOfImplementsClause(
+          clause.getExpression(),
+        )) {
+          for (const method of cls.getMethods()) {
+            const key = `${interfaceName}#${method.getName()}`;
+            const existing = index.get(key);
+            if (existing) {
+              if (!existing.some((m) => m.getStart() === method.getStart())) {
+                existing.push(method);
+              }
+            } else {
+              index.set(key, [method]);
+            }
+          }
+        }
+      }
+    }
+  }
+  return index;
 }
 
 /** 直接从 HTTP 客户端调用构造请求点。 */

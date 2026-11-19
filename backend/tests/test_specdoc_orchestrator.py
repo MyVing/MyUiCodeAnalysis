@@ -8,6 +8,7 @@ from datetime import UTC, datetime
 from app.core.config import Settings
 from app.schemas import Project, SpecDocTask
 from app.specdoc.orchestrator import SCHEMA_VERSION, SpecDocOrchestrator
+from app.specdoc.render import render_markdown
 from tests.fakes import FakeLLMClient
 from tests.specdoc_fixture import spec_graph, spec_requirement_map
 
@@ -116,6 +117,25 @@ async def test_full_pipeline_numbers_rules_and_echoes_meta() -> None:
     # prompt 里没有页面画像——硬约束：语料只能是代码原文
     system, user = llm.calls[0]
     assert "功能点" in user and "页面语料" in user
+
+
+async def test_api_mappings_render_under_their_page() -> None:
+    """接口映射按触发要素的页面归组。
+
+    mapping.elementId 是图上要素节点的原始 id，要素清单 id 是 ui.{pageNo}.{n}——
+    直接查必然落空（接口映射会全部归到无名页，2.1.4.5 恒空）。经事件桥接后
+    应落在 Transfer 页，动作名取要素可见文案。
+    """
+    graph_ = spec_graph()
+    orchestrator = SpecDocOrchestrator(Settings(_env_file=None), llm=None)
+    doc = await orchestrator.run(
+        _PROJECT, _task(dry_run=True), spec_requirement_map(graph_), graph_
+    )
+    body = render_markdown(doc)
+
+    assert "_本页面无后端接口调用。_" not in body
+    assert "| 转账 | POST /api/transfer | **POST** | 0.95 |" in body
+    assert "| 付款账户 | GET /api/account/queryBalance | **GET** | 0.95 |" in body
 
 
 async def test_dropped_entries_surface_in_doc() -> None:
