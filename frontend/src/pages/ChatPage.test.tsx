@@ -6,9 +6,13 @@ import { useLocation, MemoryRouter, Route, Routes } from "react-router-dom";
 
 import { ApiError } from "@/api/client";
 import ChatPage from "@/pages/ChatPage";
-import type { RequirementChatResult } from "@/api/types";
+import type { ChatSession, ChatSessionSummaryList, RequirementChatResult } from "@/api/types";
 
 const chatRequirement = vi.fn();
+const listChatSessions = vi.fn();
+const getChatSession = vi.fn();
+const saveChatSession = vi.fn();
+const deleteChatSession = vi.fn();
 
 // vi.mock 会被提升到文件顶部：类定义必须放进 factory 内，
 // 测试里通过 import { ApiError } 拿到的就是 factory 里的实现
@@ -22,6 +26,10 @@ vi.mock("@/api/client", () => ({
   },
   api: {
     chatRequirement: (...args: unknown[]) => chatRequirement(...args),
+    listChatSessions: () => listChatSessions(),
+    getChatSession: (...args: unknown[]) => getChatSession(...args),
+    saveChatSession: (...args: unknown[]) => saveChatSession(...args),
+    deleteChatSession: (...args: unknown[]) => deleteChatSession(...args),
   },
 }));
 
@@ -57,10 +65,25 @@ async function sendMessage(text: string) {
   await userEvent.click(screen.getByTestId("chat-send"));
 }
 
+function sessionSummary(id: string, title: string, messageCount = 2) {
+  return {
+    id,
+    projectId: "prj_1",
+    title,
+    messageCount,
+    createdAt: "2026-11-19T08:00:00Z",
+    updatedAt: "2026-11-19T08:00:00Z",
+  };
+}
+
 describe("ChatPage", () => {
   beforeEach(() => {
     vi.clearAllMocks();
     chatRequirement.mockReset();
+    listChatSessions.mockReset().mockResolvedValue({ items: [] } satisfies ChatSessionSummaryList);
+    getChatSession.mockReset();
+    saveChatSession.mockReset();
+    deleteChatSession.mockReset().mockResolvedValue(undefined);
   });
 
   it("发送消息后展示用户与 AI 消息，历史全量回传", async () => {
@@ -81,11 +104,157 @@ describe("ChatPage", () => {
     expect(screen.queryByTestId("chat-pending")).not.toBeInTheDocument();
   });
 
+  it("回复成功后整段会话落库，历史列表刷新", async () => {
+    chatRequirement.mockResolvedValueOnce({
+      reply: "筛选什么字段？",
+      draftRequirement: null,
+    } satisfies RequirementChatResult);
+    saveChatSession.mockResolvedValueOnce({
+      id: "chat_1",
+      projectId: "prj_1",
+      title: "我想加个筛选",
+      messages: [],
+      draft: null,
+      createdAt: "2026-11-19T08:00:00Z",
+      updatedAt: "2026-11-19T08:00:00Z",
+    } satisfies ChatSession);
+    renderChat();
+
+    await sendMessage("我想加个筛选");
+
+    await waitFor(() => {
+      expect(saveChatSession).toHaveBeenCalledWith("prj_1", {
+        messages: [
+          { role: "user", content: "我想加个筛选" },
+          { role: "assistant", content: "筛选什么字段？", docMarkdown: undefined, docPage: undefined },
+        ],
+        draft: null,
+      });
+    });
+    // 新建时 id 省略：服务端返回后前端记住会话 id
+    const payload = (saveChatSession.mock.calls[0] as unknown[])[1] as { id?: string };
+    expect(payload.id).toBeUndefined();
+    await waitFor(() => {
+      expect(listChatSessions).toHaveBeenCalledTimes(2);
+    });
+  });
+
+  it("历史侧栏渲染会话列表，点击后回放消息与草稿", async () => {
+    listChatSessions.mockResolvedValueOnce({
+      items: [sessionSummary("chat_1", "登录页加记住我"), sessionSummary("chat_2", "转账交互视图")],
+    } satisfies ChatSessionSummaryList);
+    getChatSession.mockResolvedValueOnce({
+      id: "chat_2",
+      projectId: "prj_1",
+      title: "转账交互视图",
+      messages: [
+        { role: "user", content: "转账的前端交互视图" },
+        { role: "assistant", content: "已定位到页面《转账》" },
+      ],
+      draft: "在转账页增加收款人校验",
+      createdAt: "2026-11-19T08:00:00Z",
+      updatedAt: "2026-11-19T08:00:00Z",
+    } satisfies ChatSession);
+    renderChat();
+
+    const items = await screen.findAllByTestId("chat-history-item");
+    expect(items).toHaveLength(2);
+    const target = items[1];
+    expect(target).toBeDefined();
+
+    await userEvent.click(target!);
+    await waitFor(() => {
+      expect(getChatSession).toHaveBeenCalledWith("chat_2");
+    });
+    await waitFor(() => {
+      expect(screen.getAllByTestId("chat-message")).toHaveLength(2);
+    });
+    expect(screen.getByTestId("chat-draft-banner")).toHaveTextContent(
+      "在转账页增加收款人校验",
+    );
+  });
+
+  it("删除历史会话后从列表移除；删除当前会话则回到欢迎页", async () => {
+    listChatSessions.mockResolvedValueOnce({
+      items: [sessionSummary("chat_1", "登录页加记住我")],
+    } satisfies ChatSessionSummaryList);
+    getChatSession.mockResolvedValueOnce({
+      id: "chat_1",
+      projectId: "prj_1",
+      title: "登录页加记住我",
+      messages: [
+        { role: "user", content: "登录页加记住我" },
+        { role: "assistant", content: "好的" },
+      ],
+      draft: null,
+      createdAt: "2026-11-19T08:00:00Z",
+      updatedAt: "2026-11-19T08:00:00Z",
+    } satisfies ChatSession);
+    // 删除后 invalidate 触发重新拉取：列表变空
+    listChatSessions.mockResolvedValueOnce({ items: [] } satisfies ChatSessionSummaryList);
+    renderChat();
+
+    await userEvent.click(await screen.findByTestId("chat-history-item"));
+    await waitFor(() => {
+      expect(screen.getAllByTestId("chat-message")).toHaveLength(2);
+    });
+
+    await userEvent.click(screen.getByTestId("chat-history-delete"));
+    await waitFor(() => {
+      expect(deleteChatSession).toHaveBeenCalledWith("chat_1");
+    });
+    await waitFor(() => {
+      expect(screen.queryByTestId("chat-history-item")).not.toBeInTheDocument();
+    });
+    // 当前会话被删除：回到空对话状态
+    await waitFor(() => {
+      expect(screen.queryByTestId("chat-message")).not.toBeInTheDocument();
+    });
+  });
+
+  it("新建对话清空当前消息区", async () => {
+    listChatSessions.mockResolvedValueOnce({
+      items: [sessionSummary("chat_1", "登录页加记住我")],
+    } satisfies ChatSessionSummaryList);
+    getChatSession.mockResolvedValueOnce({
+      id: "chat_1",
+      projectId: "prj_1",
+      title: "登录页加记住我",
+      messages: [
+        { role: "user", content: "登录页加记住我" },
+        { role: "assistant", content: "好的" },
+      ],
+      draft: null,
+      createdAt: "2026-11-19T08:00:00Z",
+      updatedAt: "2026-11-19T08:00:00Z",
+    } satisfies ChatSession);
+    renderChat();
+
+    await userEvent.click(await screen.findByTestId("chat-history-item"));
+    await waitFor(() => {
+      expect(screen.getAllByTestId("chat-message")).toHaveLength(2);
+    });
+
+    await userEvent.click(screen.getByTestId("chat-history-new"));
+    await waitFor(() => {
+      expect(screen.queryByTestId("chat-message")).not.toBeInTheDocument();
+    });
+  });
+
   it("出现草稿 banner，点击后草稿经路由 state 带回工作台", async () => {
     chatRequirement.mockResolvedValueOnce({
       reply: "草稿已生成",
       draftRequirement: "在用户列表页增加按状态筛选",
     } satisfies RequirementChatResult);
+    saveChatSession.mockResolvedValueOnce({
+      id: "chat_1",
+      projectId: "prj_1",
+      title: "草稿",
+      messages: [],
+      draft: null,
+      createdAt: "2026-11-19T08:00:00Z",
+      updatedAt: "2026-11-19T08:00:00Z",
+    } satisfies ChatSession);
     renderChat();
 
     await sendMessage("用户列表页加状态筛选");
@@ -133,6 +302,15 @@ describe("ChatPage", () => {
       docMarkdown: markdown,
       docPage: "转账",
     } satisfies RequirementChatResult);
+    saveChatSession.mockResolvedValueOnce({
+      id: "chat_1",
+      projectId: "prj_1",
+      title: "转账",
+      messages: [],
+      draft: null,
+      createdAt: "2026-11-19T08:00:00Z",
+      updatedAt: "2026-11-19T08:00:00Z",
+    } satisfies ChatSession);
     renderChat();
 
     await sendMessage("转账的前端交互视图");
@@ -141,6 +319,14 @@ describe("ChatPage", () => {
     expect(screen.getByTestId("chat-doc-block")).toHaveTextContent(
       "业务操作步骤",
     );
+    // 含文档的回复保存时消息携带 docMarkdown/docPage
+    await waitFor(() => {
+      expect(saveChatSession).toHaveBeenCalledWith("prj_1", expect.objectContaining({
+        messages: expect.arrayContaining([
+          expect.objectContaining({ docMarkdown: markdown, docPage: "转账" }),
+        ]),
+      }));
+    });
 
     await userEvent.click(screen.getByTestId("chat-doc-download"));
     expect(clickSpy).toHaveBeenCalled();

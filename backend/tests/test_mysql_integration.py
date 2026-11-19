@@ -28,6 +28,7 @@ pytestmark = pytest.mark.skipif(
 )
 
 TABLES = (
+    "chat_sessions",
     "langgraph_checkpoint_writes",
     "langgraph_checkpoints",
     "runtime_traces",
@@ -366,3 +367,39 @@ async def test_data_survives_reconnect(engine, db_url: str) -> None:
         assert fetched.name == "测试项目"
     finally:
         await fresh.dispose()
+
+
+async def test_chat_session_upsert_and_eviction(engine) -> None:
+    """会话整包落库 + 每项目 10 条上限淘汰（upsert 事务内完成）。"""
+    from app.storage.mysql import MySqlChatSessionRepository
+
+    await MySqlProjectRepository(engine).add(_project())
+    repo = MySqlChatSessionRepository(engine)
+
+    def _session(index: int) -> object:
+        from app.schemas import ChatMessage, ChatSession
+
+        return ChatSession(
+            id=f"chat_test{index:06d}",
+            project_id="prj_test000001",
+            title=f"需求 {index}",
+            messages=[
+                ChatMessage(role="user", content=f"需求 {index}"),
+                ChatMessage(role="assistant", content="收到", doc_page="转账"),
+            ],
+            draft=None,
+            created_at=datetime.now(UTC),
+            updated_at=datetime.now(UTC),
+        )
+
+    for index in range(11):
+        await repo.upsert(_session(index))
+
+    listed = await repo.list_by_project("prj_test000001")
+    assert len(listed) == 10
+    # 最旧的被淘汰，最新的排最前
+    assert listed[0].id == "chat_test000011"
+    assert await repo.get("chat_test000001") is None
+    assert listed[0].messages[1].doc_page == "转账"
+    assert await repo.delete("chat_test000011") is True
+    assert await repo.delete("chat_test000011") is False

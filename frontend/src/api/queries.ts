@@ -8,7 +8,6 @@ export const useHealth = () =>
     queryFn: api.getHealth,
     retry: false,
   });
-
 export const useProjects = () =>
   useQuery({
     queryKey: ["projects"],
@@ -26,6 +25,14 @@ export const useProjectGraph = (projectId: string) =>
   useQuery({
     queryKey: ["projects", projectId, "graph"],
     queryFn: () => api.getProjectGraph(projectId),
+    enabled: projectId.length > 0,
+  });
+
+/** AI 需求助手会话历史列表：保存/删除后通过失效缓存刷新 */
+export const useChatSessions = (projectId: string) =>
+  useQuery({
+    queryKey: ["chat-sessions", projectId],
+    queryFn: () => api.listChatSessions(projectId),
     enabled: projectId.length > 0,
   });
 

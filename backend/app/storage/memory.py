@@ -13,12 +13,14 @@ from app.contracts import IRGraph, RequirementMap, RuntimeTrace, SpecDocMap
 from app.requirement.page_profile import ProfilePayload
 from app.schemas import (
     AnalysisTask,
+    ChatSession,
     ExploreTask,
     Project,
     RequirementTask,
     RuntimeTask,
     SpecDocTask,
 )
+from app.storage.chat import MAX_CHAT_SESSIONS_PER_PROJECT
 from app.storage.repositories import DuplicateRemoteUrlError
 
 MAX_GRAPHS_PER_PROJECT = 5
@@ -489,3 +491,49 @@ class InMemoryExploreRepository:
 
 def create_explore_repository() -> InMemoryExploreRepository:
     return InMemoryExploreRepository()
+
+
+class InMemoryChatSessionRepository:
+    """AI 需求助手会话的内存仓储：按项目维护 LRU 淘汰顺序，形态与 requirement 一致。"""
+
+    def __init__(self) -> None:
+        self._sessions: dict[str, ChatSession] = {}
+        self._order: dict[str, deque[str]] = {}
+        self._lock = asyncio.Lock()
+
+    async def upsert(self, session: ChatSession) -> ChatSession:
+        async with self._lock:
+            order = self._order.setdefault(session.project_id, deque())
+            if session.id in order:
+                order.remove(session.id)
+            self._sessions[session.id] = session
+            order.append(session.id)
+            while len(order) > MAX_CHAT_SESSIONS_PER_PROJECT:
+                oldest = order.popleft()
+                self._sessions.pop(oldest, None)
+        return session
+
+    async def get(self, session_id: str) -> ChatSession | None:
+        async with self._lock:
+            return self._sessions.get(session_id)
+
+    async def list_by_project(self, project_id: str) -> list[ChatSession]:
+        async with self._lock:
+            items = [
+                item for item in self._sessions.values() if item.project_id == project_id
+            ]
+        return sorted(items, key=lambda item: item.updated_at, reverse=True)
+
+    async def delete(self, session_id: str) -> bool:
+        async with self._lock:
+            session = self._sessions.pop(session_id, None)
+            if session is None:
+                return False
+            order = self._order.get(session.project_id)
+            if order is not None and session_id in order:
+                order.remove(session_id)
+            return True
+
+
+def create_chat_session_repository() -> InMemoryChatSessionRepository:
+    return InMemoryChatSessionRepository()

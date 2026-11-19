@@ -196,10 +196,14 @@ class RequirementTaskList(ApiModel):
 
 
 class ChatMessage(ApiModel):
-    """对话历史中的一条消息。会话状态在前端持有，后端每次收全量历史。"""
+    """对话历史中的一条消息。会话状态在前端持有，后端每次收全量历史；
+    docMarkdown/docPage 是会话落库时 assistant 消息携带的规格文档产物，
+    requirement-chat 接口本身只消费 role/content。"""
 
     role: Literal["user", "assistant"]
     content: str = Field(min_length=1, max_length=10000)
+    doc_markdown: str | None = Field(default=None, max_length=200000)
+    doc_page: str | None = Field(default=None, max_length=200)
 
     @field_validator("content")
     @classmethod
@@ -229,6 +233,56 @@ class RequirementChatResult(ApiModel):
     draft_requirement: str | None = None
     doc_markdown: str | None = None
     doc_page: str | None = None
+
+
+class ChatSessionSummary(ApiModel):
+    """会话摘要：历史侧栏列表用，不含消息正文——docMarkdown 可能很大，
+    列表只需要标题与时间。"""
+
+    id: str
+    project_id: str
+    title: str
+    message_count: int
+    created_at: datetime
+    updated_at: datetime
+
+
+class ChatSessionSummaryList(ApiModel):
+    items: list[ChatSessionSummary] = Field(default_factory=list)
+
+
+class ChatSession(ApiModel):
+    """一个完整会话：全部消息 + 最新草稿。draft 是最近一条 assistant 回复
+    产出的需求草稿，切回会话时前端据此恢复草稿横幅。"""
+
+    id: str
+    project_id: str
+    title: str
+    messages: list[ChatMessage]
+    draft: str | None = None
+    created_at: datetime
+    updated_at: datetime
+
+
+class ChatSessionUpsert(ApiModel):
+    """保存会话的输入：前端在收到 assistant 回复后整段回传。
+
+    id 省略表示新建；title 省略时服务端取首条用户消息截断生成。
+    消息上限与 RequirementChatStart 同为 40 条，保证重放会话可直接继续对话。
+    """
+
+    id: str | None = Field(default=None, max_length=64)
+    title: str | None = Field(default=None, max_length=120)
+    messages: list[ChatMessage] = Field(min_length=1, max_length=40)
+    draft: str | None = Field(default=None, max_length=10000)
+
+    @field_validator("title")
+    @classmethod
+    def strip_title(cls, value: str | None) -> str | None:
+        if value is None:
+            return None
+        stripped = value.strip()
+        return stripped or None
 
 
 class SpecDocStart(ApiModel):

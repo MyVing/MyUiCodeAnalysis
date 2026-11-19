@@ -8,6 +8,9 @@ import type {
   AnalysisStart,
   AnalysisTask,
   AnalysisTaskList,
+  ChatSession,
+  ChatSessionSummaryList,
+  ChatSessionUpsert,
   ExploreStart,
   ExploreTask,
   ExploreTaskList,
@@ -173,6 +176,22 @@ export const api = {
       method: "POST",
       body: JSON.stringify(payload),
     }),
+
+  /** AI 需求助手会话历史：列表为摘要，详情按需取 */
+  listChatSessions: (projectId: string) =>
+    request<ChatSessionSummaryList>(`/projects/${projectId}/chat-sessions`),
+
+  getChatSession: (sessionId: string) =>
+    request<ChatSession>(`/chat-sessions/${sessionId}`),
+
+  saveChatSession: (projectId: string, payload: ChatSessionUpsert) =>
+    request<ChatSession>(`/projects/${projectId}/chat-sessions`, {
+      method: "POST",
+      body: JSON.stringify(payload),
+    }),
+
+  deleteChatSession: (sessionId: string) =>
+    request<void>(`/chat-sessions/${sessionId}`, { method: "DELETE" }),
 
   listRequirementTasks: (projectId: string) =>
     request<RequirementTaskList>(`/projects/${projectId}/requirements`),

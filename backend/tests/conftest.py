@@ -8,6 +8,7 @@ from fastapi.testclient import TestClient
 
 from app.api.deps import (
     get_analysis_repository,
+    get_chat_session_repository,
     get_explore_repository,
     get_explore_worker_runner,
     get_git_client,
@@ -22,6 +23,7 @@ from app.core.config import Settings, get_settings
 from app.main import create_app
 from app.storage.memory import (
     InMemoryAnalysisRepository,
+    InMemoryChatSessionRepository,
     InMemoryExploreRepository,
     InMemoryProjectRepository,
     InMemoryRequirementRepository,
@@ -56,6 +58,11 @@ def explore_repository() -> InMemoryExploreRepository:
 
 
 @pytest.fixture
+def chat_session_repository() -> InMemoryChatSessionRepository:
+    return InMemoryChatSessionRepository()
+
+
+@pytest.fixture
 def fake_runner() -> FakeWorkerRunner:
     return FakeWorkerRunner()
 
@@ -82,6 +89,7 @@ def client(
     requirement_repository: InMemoryRequirementRepository,
     runtime_repository: InMemoryRuntimeRepository,
     explore_repository: InMemoryExploreRepository,
+    chat_session_repository: InMemoryChatSessionRepository,
     fake_runner: FakeWorkerRunner,
     fake_runtime_runner: FakeRuntimeWorkerRunner,
     fake_explore_runner: FakeExploreWorkerRunner,
@@ -101,6 +109,7 @@ def client(
     app.dependency_overrides[get_requirement_repository] = lambda: requirement_repository
     app.dependency_overrides[get_runtime_repository] = lambda: runtime_repository
     app.dependency_overrides[get_explore_repository] = lambda: explore_repository
+    app.dependency_overrides[get_chat_session_repository] = lambda: chat_session_repository
     app.dependency_overrides[get_worker_runner] = lambda: fake_runner
     app.dependency_overrides[get_runtime_worker_runner] = lambda: fake_runtime_runner
     app.dependency_overrides[get_explore_worker_runner] = lambda: fake_explore_runner

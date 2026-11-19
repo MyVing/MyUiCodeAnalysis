@@ -32,6 +32,7 @@ from app.runtime.runner import RuntimeWorkerRunner, SubprocessRuntimeRunner
 from app.runtime.service import RuntimeService
 from app.services.project_service import ProjectService
 from app.specdoc.service import SpecDocService
+from app.storage.chat import ChatSessionRepository
 from app.storage.checkpoint import MySqlCheckpointSaver
 from app.storage.explore import ExploreRepository
 from app.storage.factory import Storage
@@ -76,6 +77,10 @@ def get_explore_repository(request: Request) -> ExploreRepository:
 
 def get_specdoc_repository(request: Request) -> SpecDocRepository:
     return get_storage(request).specdocs
+
+
+def get_chat_session_repository(request: Request) -> ChatSessionRepository:
+    return get_storage(request).chat_sessions
 
 
 def get_git_client(settings: SettingsDep) -> GitClient:
@@ -208,6 +213,9 @@ def get_requirement_chat_service(
 
 RequirementChatServiceDep = Annotated[
     RequirementChatService, Depends(get_requirement_chat_service)
+]
+ChatSessionRepositoryDep = Annotated[
+    ChatSessionRepository, Depends(get_chat_session_repository)
 ]
 
 

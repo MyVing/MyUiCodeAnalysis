@@ -1,15 +1,20 @@
 """需求定位 API。
 
-两类资源刻意分开：
-  /projects/{id}/requirements  项目维度：发起与列出
-  /requirements/{taskId}       任务维度：查询状态与产物
+三类资源刻意分开：
+  /projects/{id}/requirements      项目维度：发起与列出
+  /requirements/{taskId}           任务维度：查询状态与产物
+  /projects/{id}/chat-sessions     AI 需求助手会话：保存与回放
 这样前端「发起 → 轮询 taskId → 取 map」不需要回填项目 id。
 """
+
+from datetime import UTC, datetime
+from uuid import uuid4
 
 from fastapi import APIRouter, HTTPException, status
 
 from app.api.deps import (
     AnalysisRepositoryDep,
+    ChatSessionRepositoryDep,
     ProjectServiceDep,
     RequirementChatServiceDep,
     RequirementLocateServiceDep,
@@ -20,6 +25,11 @@ from app.requirement.chat import RequirementChatPreconditionError
 from app.requirement.llm import LLMCallError
 from app.requirement.service import RequirementPreconditionError
 from app.schemas import (
+    ChatMessage,
+    ChatSession,
+    ChatSessionSummary,
+    ChatSessionSummaryList,
+    ChatSessionUpsert,
     RequirementChatResult,
     RequirementChatStart,
     RequirementLocateStart,
@@ -35,6 +45,16 @@ _PRECONDITION_STATUS: dict[str, int] = {
     "llm_unavailable": status.HTTP_409_CONFLICT,
     "analysis_not_found": status.HTTP_404_NOT_FOUND,
 }
+
+# 会话标题缺省取首条用户消息的前缀截断
+_TITLE_PREFIX_LENGTH = 24
+
+
+def _derive_title(messages: list[ChatMessage]) -> str:
+    for message in messages:
+        if message.role == "user":
+            return message.content[:_TITLE_PREFIX_LENGTH].strip() or "新对话"
+    return "新对话"
 
 
 @router.post(
@@ -166,3 +186,106 @@ async def get_requirement_map(
             detail="定位产物已因保留上限被清理，请重新发起定位。",
         )
     return requirement_map
+
+
+@router.post(
+    "/projects/{project_id}/chat-sessions",
+    status_code=status.HTTP_201_CREATED,
+    response_model=ChatSession,
+    responses={404: {"description": "项目不存在"}},
+)
+async def upsert_chat_session(
+    project_id: str,
+    payload: ChatSessionUpsert,
+    service: ProjectServiceDep,
+    sessions: ChatSessionRepositoryDep,
+) -> ChatSession:
+    """保存（新建或整体替换）一个 AI 需求助手会话。
+
+    前端在收到 assistant 回复后整段回传；id 省略表示新建。仓储写入时维持
+    每项目最多 10 条，超出按 updatedAt 淘汰最旧——被淘汰会话的 id 再次出现
+    时按新建处理（幂等）。requirement-chat 接口本身无状态，本接口只是旁路
+    落库，不参与对话。
+    """
+    await require_project(project_id, service)
+
+    existing: ChatSession | None = None
+    if payload.id is not None:
+        existing = await sessions.get(payload.id)
+        # id 属于其他项目（或已被淘汰后前端仍持有）：按新建处理，不跨项目覆盖
+        if existing is not None and existing.project_id != project_id:
+            existing = None
+
+    now = datetime.now(UTC)
+    session = ChatSession(
+        id=payload.id if existing is not None else f"chat_{uuid4().hex[:12]}",
+        project_id=project_id,
+        title=payload.title or _derive_title(payload.messages),
+        messages=payload.messages,
+        draft=payload.draft,
+        created_at=existing.created_at if existing is not None else now,
+        updated_at=now,
+    )
+    return await sessions.upsert(session)
+
+
+@router.get(
+    "/projects/{project_id}/chat-sessions",
+    response_model=ChatSessionSummaryList,
+    responses={404: {"description": "项目不存在"}},
+)
+async def list_chat_sessions(
+    project_id: str,
+    service: ProjectServiceDep,
+    sessions: ChatSessionRepositoryDep,
+) -> ChatSessionSummaryList:
+    """会话摘要列表（按 updatedAt 倒序）：侧栏渲染只需要标题与时间，
+    消息正文（可能含整份规格文档）由详情接口按需取。"""
+    await require_project(project_id, service)
+    items = await sessions.list_by_project(project_id)
+    return ChatSessionSummaryList(
+        items=[
+            ChatSessionSummary(
+                id=item.id,
+                project_id=item.project_id,
+                title=item.title,
+                message_count=len(item.messages),
+                created_at=item.created_at,
+                updated_at=item.updated_at,
+            )
+            for item in items
+        ]
+    )
+
+
+@router.get(
+    "/chat-sessions/{session_id}",
+    response_model=ChatSession,
+    responses={404: {"description": "会话不存在"}},
+)
+async def get_chat_session(
+    session_id: str, sessions: ChatSessionRepositoryDep
+) -> ChatSession:
+    session = await sessions.get(session_id)
+    if session is None:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail=f"会话 {session_id} 不存在",
+        )
+    return session
+
+
+@router.delete(
+    "/chat-sessions/{session_id}",
+    status_code=status.HTTP_204_NO_CONTENT,
+    responses={404: {"description": "会话不存在"}},
+)
+async def delete_chat_session(
+    session_id: str, sessions: ChatSessionRepositoryDep
+) -> None:
+    deleted = await sessions.delete(session_id)
+    if not deleted:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail=f"会话 {session_id} 不存在",
+        )

@@ -216,6 +216,39 @@ export interface RequirementChatResult {
   docPage?: string | null;
 }
 
+/** 历史侧栏的会话摘要：不含消息正文（可能携带整份规格文档） */
+export interface ChatSessionSummary {
+  id: string;
+  projectId: string;
+  title: string;
+  messageCount: number;
+  createdAt: string;
+  updatedAt: string;
+}
+
+export interface ChatSessionSummaryList {
+  items: ChatSessionSummary[];
+}
+
+/** 完整会话：点击历史项后按需加载，draft 用于恢复草稿横幅 */
+export interface ChatSession {
+  id: string;
+  projectId: string;
+  title: string;
+  messages: ChatMessage[];
+  draft: string | null;
+  createdAt: string;
+  updatedAt: string;
+}
+
+/** 保存会话：id 省略表示新建（后端每项目最多保留 10 条，超出淘汰最旧） */
+export interface ChatSessionUpsert {
+  id?: string;
+  title?: string;
+  messages: ChatMessage[];
+  draft?: string | null;
+}
+
 /** AI 自动探索输入：url 与 command 二选一；dryRun=true 只产出计划不执行 */
 export interface ExploreStart {
   goal: string;

@@ -4,13 +4,14 @@ import { createElement, type ReactNode } from "react";
 import { afterEach, describe, expect, it, vi } from "vitest";
 
 import { api } from "@/api/client";
-import { useAnalysisTask, useRuntimeTask } from "@/api/queries";
-import type { AnalysisTask, RuntimeTask } from "@/api/types";
+import { useAnalysisTask, useChatSessions, useRuntimeTask } from "@/api/queries";
+import type { AnalysisTask, ChatSessionSummaryList, RuntimeTask } from "@/api/types";
 
 vi.mock("@/api/client", () => ({
   api: {
     getTask: vi.fn(),
     getRuntimeTask: vi.fn(),
+    listChatSessions: vi.fn(),
   },
 }));
 
@@ -117,5 +118,39 @@ describe("useRuntimeTask", () => {
     renderHook(() => useRuntimeTask(null), { wrapper: makeWrapper() });
 
     expect(api.getRuntimeTask).not.toHaveBeenCalled();
+  });
+});
+
+describe("useChatSessions", () => {
+  afterEach(() => {
+    vi.clearAllMocks();
+  });
+
+  it("fetches session summaries for the project", async () => {
+    vi.mocked(api.listChatSessions).mockResolvedValue({
+      items: [
+        {
+          id: "chat_1",
+          projectId: "prj_1",
+          title: "登录页加记住我",
+          messageCount: 2,
+          createdAt: "2026-11-19T08:00:00Z",
+          updatedAt: "2026-11-19T08:00:00Z",
+        },
+      ],
+    } satisfies ChatSessionSummaryList);
+
+    const { result } = renderHook(() => useChatSessions("prj_1"), {
+      wrapper: makeWrapper(),
+    });
+
+    await waitFor(() => expect(result.current.data?.items).toHaveLength(1));
+    expect(api.listChatSessions).toHaveBeenCalledWith("prj_1");
+  });
+
+  it("does not fetch when projectId is empty", () => {
+    renderHook(() => useChatSessions(""), { wrapper: makeWrapper() });
+
+    expect(api.listChatSessions).not.toHaveBeenCalled();
   });
 });

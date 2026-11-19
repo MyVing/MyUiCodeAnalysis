@@ -26,12 +26,14 @@ from app.core.config import Settings
 from app.requirement.page_profile import ProfilePayload
 from app.schemas import (
     AnalysisTask,
+    ChatSession,
     ExploreTask,
     Project,
     RequirementTask,
     RuntimeTask,
     SpecDocTask,
 )
+from app.storage.chat import MAX_CHAT_SESSIONS_PER_PROJECT
 from app.storage.checkpoint import CHECKPOINT_DDL_STATEMENTS
 from app.storage.repositories import DuplicateRemoteUrlError
 
@@ -250,6 +252,20 @@ DDL_STATEMENTS: tuple[str, ...] = (
       CONSTRAINT fk_spec_docs_task FOREIGN KEY (spec_doc_id)
         REFERENCES specdoc_tasks(id) ON DELETE CASCADE,
       KEY idx_spec_docs_project (project_id, created_at)
+    ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4
+    """,
+    # AI 需求助手会话：整包 JSON 存放（消息含 docMarkdown 时较大），按项目
+    # 保留最近 MAX_CHAT_SESSIONS_PER_PROJECT 条，淘汰由 upsert 事务内完成。
+    """
+    CREATE TABLE IF NOT EXISTS chat_sessions (
+      id VARCHAR(32) PRIMARY KEY,
+      project_id VARCHAR(32) NOT NULL,
+      payload JSON NOT NULL,
+      created_at DATETIME(6) NOT NULL,
+      updated_at DATETIME(6) NOT NULL,
+      CONSTRAINT fk_chat_sessions_project FOREIGN KEY (project_id)
+        REFERENCES projects(id) ON DELETE CASCADE,
+      KEY idx_chat_sessions_project (project_id, updated_at)
     ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4
     """,
 )
@@ -1269,3 +1285,73 @@ class MySqlExploreRepository:
     async def purge_project(self, project_id: str) -> None:
         # MySQL 路径靠 projects 外键级联删除，无需额外语句
         return None
+
+
+class MySqlChatSessionRepository:
+    """AI 需求助手会话：整包 JSON 存放，每项目保留上限条数（upsert 时淘汰）。"""
+
+    def __init__(self, engine: AsyncEngine) -> None:
+        self._engine = engine
+
+    def _session(self, row: Row[Any]) -> ChatSession:
+        return ChatSession.model_validate_json(row.payload)
+
+    async def upsert(self, session: ChatSession) -> ChatSession:
+        query = text(
+            """
+            INSERT INTO chat_sessions (id, project_id, payload, created_at, updated_at)
+            VALUES (:id, :pid, :payload, :created_at, :updated_at)
+            ON DUPLICATE KEY UPDATE payload = VALUES(payload),
+              updated_at = VALUES(updated_at)
+            """
+        )
+        # 淘汰：保留该项目最近活跃的 N 条（含刚写入的这一条），其余删除。
+        # MySQL 不允许 DELETE 直接引用同表的子查询，包一层派生表绕开限制。
+        evict = text(
+            f"""
+            DELETE FROM chat_sessions
+            WHERE project_id = :pid
+              AND id NOT IN (
+                SELECT keep_id FROM (
+                  SELECT id AS keep_id FROM chat_sessions
+                  WHERE project_id = :pid
+                  ORDER BY updated_at DESC, id DESC
+                  LIMIT {MAX_CHAT_SESSIONS_PER_PROJECT}
+                ) AS keep
+              )
+            """
+        )
+        async with self._engine.begin() as conn:
+            await conn.execute(
+                query,
+                {
+                    "id": session.id,
+                    "pid": session.project_id,
+                    "payload": session.model_dump_json(exclude_none=True),
+                    "created_at": _to_db(session.created_at),
+                    "updated_at": _to_db(session.updated_at),
+                },
+            )
+            await conn.execute(evict, {"pid": session.project_id})
+        return session
+
+    async def get(self, session_id: str) -> ChatSession | None:
+        query = text("SELECT payload FROM chat_sessions WHERE id = :id")
+        async with self._engine.connect() as conn:
+            row = (await conn.execute(query, {"id": session_id})).first()
+        return self._session(row) if row else None
+
+    async def list_by_project(self, project_id: str) -> list[ChatSession]:
+        query = text(
+            "SELECT payload FROM chat_sessions WHERE project_id = :pid"
+            " ORDER BY updated_at DESC, id DESC"
+        )
+        async with self._engine.connect() as conn:
+            rows = (await conn.execute(query, {"pid": project_id})).all()
+        return [self._session(row) for row in rows]
+
+    async def delete(self, session_id: str) -> bool:
+        query = text("DELETE FROM chat_sessions WHERE id = :id")
+        async with self._engine.begin() as conn:
+            result = await conn.execute(query, {"id": session_id})
+        return result.rowcount > 0
