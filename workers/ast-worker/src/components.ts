@@ -191,6 +191,93 @@ function looksLikeClassComponent(decl: Node): boolean {
   return decl.getMethod("render") !== undefined;
 }
 
+/** 体内是否含 JSX 节点；纯语法判断，不依赖类型检查器。 */
+function hasJsxBody(node: Node): boolean {
+  return node.getDescendants().some((descendant) => JSX_KINDS.has(descendant.getKind()));
+}
+
+/**
+ * 语法层的组件导出候选。
+ *
+ * 只用于「导出没有被解析成组件」的告警，不参与组件识别本身。即使
+ * `getExportedDeclarations()` 因为 allowJs 未生效等原因返回空 Map，
+ * 也能直接从 AST 看出文件到底导出了哪些含 JSX 的函数 / 类。
+ *
+ * 判定口径与 toComponent 保持一致：函数类看体内 JSX，类沿用
+ * looksLikeClassComponent，不做名字猜测，因此导出的常量、hook、工具函数
+ * 不会被误当成候选。
+ */
+function collectComponentExportCandidates(file: SourceFile, relativeFile: string): string[] {
+  // 先登记本文件的函数 / 函数变量声明，供 `export { X }` 与 `export default X` 反查
+  const localDeclarations = new Map<string, Node>();
+  for (const statement of file.getStatements()) {
+    if (MorphNode.isFunctionDeclaration(statement) || MorphNode.isClassDeclaration(statement)) {
+      const name = statement.getName();
+      if (name) localDeclarations.set(name, statement);
+      continue;
+    }
+    if (!MorphNode.isVariableStatement(statement)) continue;
+    for (const declaration of statement.getDeclarations()) {
+      const initializer = declaration.getInitializer();
+      if (initializer && (MorphNode.isArrowFunction(initializer) || MorphNode.isFunctionExpression(initializer))) {
+        localDeclarations.set(declaration.getName(), initializer);
+      }
+    }
+  }
+
+  const candidates = new Set<string>();
+  const addIfComponentLike = (name: string | undefined, node: Node): void => {
+    const isComponentLike = MorphNode.isClassDeclaration(node) ? looksLikeClassComponent(node) : hasJsxBody(node);
+    if (!isComponentLike) return;
+    candidates.add(name && name.length > 0 ? name : fallbackNameFromFile(relativeFile));
+  };
+
+  for (const statement of file.getStatements()) {
+    if (MorphNode.isFunctionDeclaration(statement) || MorphNode.isClassDeclaration(statement)) {
+      if (statement.isExported() || statement.isDefaultExport()) {
+        addIfComponentLike(statement.getName(), statement);
+      }
+      continue;
+    }
+
+    if (MorphNode.isVariableStatement(statement)) {
+      if (!statement.isExported() && !statement.isDefaultExport()) continue;
+      for (const declaration of statement.getDeclarations()) {
+        const initializer = declaration.getInitializer();
+        if (initializer && (MorphNode.isArrowFunction(initializer) || MorphNode.isFunctionExpression(initializer))) {
+          addIfComponentLike(declaration.getName(), initializer);
+        }
+      }
+      continue;
+    }
+
+    if (MorphNode.isExportDeclaration(statement)) {
+      // 带模块说明符的是跨文件再导出，不能算作本文件定义的组件
+      if (statement.getModuleSpecifier() !== undefined) continue;
+      for (const specifier of statement.getNamedExports()) {
+        const local = localDeclarations.get(specifier.getName());
+        if (local) addIfComponentLike(specifier.getName(), local);
+      }
+      continue;
+    }
+
+    if (MorphNode.isExportAssignment(statement)) {
+      // `export default Foo`：反查本地声明；`export default () => <div />` 直接判定
+      const expression = statement.getExpression();
+      if (MorphNode.isIdentifier(expression)) {
+        const local = localDeclarations.get(expression.getText());
+        if (local) addIfComponentLike(expression.getText(), local);
+        continue;
+      }
+      if (MorphNode.isArrowFunction(expression) || MorphNode.isFunctionExpression(expression)) {
+        addIfComponentLike(undefined, expression);
+      }
+    }
+  }
+
+  return [...candidates];
+}
+
 /**
  * 发现项目内所有组件。
  *
@@ -208,6 +295,9 @@ export function discoverComponents(rootPath: string, project: Project): Componen
     if (relativeFile === null) continue;
     if (!/\.(tsx|jsx|ts|js)$/.test(relativeFile)) continue;
 
+    // 本文件实际解析出的组件名，用于和语法层候选对账
+    const resolvedNames = new Set<string>();
+
     // getExportedDeclarations 会穿透 barrel；只保留定义在本文件的条目
     const exported = file.getExportedDeclarations();
 
@@ -217,6 +307,8 @@ export function discoverComponents(rootPath: string, project: Project): Componen
 
         const component = toComponent(decl, file, relativeFile);
         if (!component) continue;
+
+        resolvedNames.add(component.name);
 
         // 同一 AST 节点可能有多个导出名（具名 + default），合并为一个组件
         const existing = byId.get(component.id);
@@ -230,6 +322,22 @@ export function discoverComponents(rootPath: string, project: Project): Componen
         declarations.set(component.id, decl);
         definitionIndex.set(positionKey(relativeFile, decl.getStart()), component.id);
       }
+    }
+
+    // 语法的导出候选与实际解析结果对账：有候选却没建出组件，说明导出在
+    // 类型层不可见（典型是 allowJs 未生效），必须留下带文件名的告警，
+    // 不允许再出现"组件静默消失"。
+    const missing = collectComponentExportCandidates(file, relativeFile).filter(
+      (name) => !resolvedNames.has(name),
+    );
+    if (missing.length > 0) {
+      warnings.push({
+        code: "component_exports_unresolved",
+        severity: "warning",
+        stage: "static",
+        file: relativeFile,
+        message: `${relativeFile} 中以下导出具备组件结构（体内含 JSX 的函数/类），但未解析为组件：${missing.join("、")}。常见原因是 allowJs 未生效，导致 .js/.jsx 导出在类型层不可见。`,
+      });
     }
   }
 

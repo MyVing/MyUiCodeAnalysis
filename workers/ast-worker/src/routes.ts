@@ -51,6 +51,9 @@
  * - route → 页面组件的边 → 0.9：与 renders 边同档，符号与语法都确定，但未经类型检查
  */
 
+import { readdirSync, statSync, type Dirent } from "node:fs";
+import path from "node:path";
+
 import type { ArrayLiteralExpression, Node, Project, SourceFile } from "ts-morph";
 import { Node as MorphNode, SyntaxKind } from "ts-morph";
 
@@ -87,7 +90,7 @@ const ROUTE_FACTORIES: ReadonlySet<string> = new Set([
 ]);
 
 /** 路由节点 attrs.framework 的取值。 */
-export type RouteFramework = "react-router" | "next-app";
+export type RouteFramework = "react-router" | "next-app" | "docusaurus";
 
 export interface RouteAnalysisResult {
   /** 需要并入图 nodes 的 route 节点 */
@@ -300,6 +303,13 @@ interface CollectedRoute {
    * 场景不用这个字段——layout 由 element 的解析结果与 isLayout 判定得出。
    */
   inheritedLayoutComponentIds?: readonly string[];
+  /**
+   * 文件约定产出的路由。
+   *
+   * md/mdx 页面本来就没有组件节点，不能按「显式路由解析不到 element」告警；
+   * 代码页面缺默认导出时由文件路由扫描单独告警。
+   */
+  fileConvention?: boolean;
 }
 
 /** 同一 nodeId 下累积的声明。 */
@@ -326,6 +336,11 @@ class RouteCollector {
   private readonly buckets = new Map<string, RouteBucket>();
   private readonly pathOwners = new Map<string, string>();
   readonly warnings: Warning[] = [];
+
+  /** 当前已声明的路径快照；文件路由用它判断是否被显式配置占用。 */
+  paths(): ReadonlySet<string> {
+    return new Set(this.pathOwners.keys());
+  }
 
   add(route: CollectedRoute): void {
     const nodeId = `${route.file}#${route.path}`;
@@ -364,7 +379,7 @@ class RouteCollector {
       this.pathOwners.set(route.path, nodeId);
     }
 
-    if (route.pageComponentId === null) {
+    if (route.pageComponentId === null && route.fileConvention !== true) {
       this.warnings.push({
         code: "route_element_unresolved",
         severity: "warning",
@@ -869,6 +884,251 @@ function pickPageComponent(
 }
 
 /* ------------------------------------------------------------------ *
+ * Docusaurus 文件路由
+ * ------------------------------------------------------------------ */
+
+const DOCUSAURUS_CONFIG_NAMES = new Set([
+  "docusaurus.config.js",
+  "docusaurus.config.ts",
+  "docusaurus.config.mjs",
+  "docusaurus.config.cjs",
+]);
+
+const FILE_ROUTE_IGNORED_DIRS = new Set([
+  "node_modules",
+  "dist",
+  "build",
+  "out",
+  "coverage",
+  ".git",
+  ".docusaurus",
+  ".next",
+  ".turbo",
+]);
+
+/** 文件路由支持的后缀；页面目录也接受 md/mdx。 */
+const PAGE_FILE_PATTERN = /\.(?:tsx|jsx|ts|js|mdx?)$/i;
+const DOC_FILE_PATTERN = /\.(?:mdx?)$/i;
+
+function isDirectory(candidate: string): boolean {
+  try {
+    return statSync(candidate).isDirectory();
+  } catch {
+    return false;
+  }
+}
+
+/** 找 Docusaurus 站点根（含 docusaurus.config.* 的目录）。 */
+function findDocusaurusRoots(rootPath: string): string[] {
+  const roots: string[] = [];
+  const walk = (directory: string, depth: number): void => {
+    if (depth > 8) return;
+    let entries: Dirent[];
+    try {
+      entries = readdirSync(directory, { withFileTypes: true });
+    } catch {
+      return;
+    }
+    for (const entry of entries) {
+      if (entry.isSymbolicLink()) continue;
+      const fullPath = path.join(directory, entry.name);
+      if (entry.isDirectory()) {
+        const lower = entry.name.toLowerCase();
+        if (lower.startsWith(".") || FILE_ROUTE_IGNORED_DIRS.has(lower)) continue;
+        walk(fullPath, depth + 1);
+      } else if (entry.isFile() && DOCUSAURUS_CONFIG_NAMES.has(entry.name.toLowerCase())) {
+        roots.push(directory);
+      }
+    }
+  };
+  walk(rootPath, 0);
+  return [...new Set(roots)].sort();
+}
+
+/** 页面目录里的声明文件、测试文件不产路由。 */
+function isNonRouteFile(name: string): boolean {
+  const lower = name.toLowerCase();
+  return (
+    lower.endsWith(".d.ts") ||
+    /\.(?:test|spec)\.(?:tsx?|jsx?|mdx?)$/.test(lower)
+  );
+}
+
+/** 列出一个文件路由目录下的页面文件，跳过 Docusaurus 的下划线/点文件与构建目录。 */
+function listRouteFiles(directory: string, pattern: RegExp): string[] {
+  const files: string[] = [];
+  const walk = (current: string): void => {
+    let entries: Dirent[];
+    try {
+      entries = readdirSync(current, { withFileTypes: true });
+    } catch {
+      return;
+    }
+    for (const entry of entries) {
+      if (entry.isSymbolicLink()) continue;
+      const lower = entry.name.toLowerCase();
+      if (lower.startsWith("_") || lower.startsWith(".")) continue;
+      const fullPath = path.join(current, entry.name);
+      if (entry.isDirectory()) {
+        if (FILE_ROUTE_IGNORED_DIRS.has(lower)) continue;
+        walk(fullPath);
+      } else if (entry.isFile() && pattern.test(entry.name) && !isNonRouteFile(entry.name)) {
+        files.push(fullPath);
+      }
+    }
+  };
+  walk(directory);
+  return files.sort();
+}
+
+/** 把 `[id]` / `[...slug]` / `[[...slug]]` 转成路由动态段。 */
+function fileRouteSegment(segment: string): string | null {
+  const optionalCatchAll = /^\[\[\.\.\.(.+)\]\]$/.exec(segment);
+  if (optionalCatchAll) return `:${optionalCatchAll[1]}*?`;
+
+  const catchAll = /^\[\.\.\.(.+)\]$/.exec(segment);
+  if (catchAll) return `:${catchAll[1]}*`;
+
+  const dynamic = /^\[(.+)\]$/.exec(segment);
+  if (dynamic) return `:${dynamic[1]}`;
+
+  // 不认识的方括号形态不猜，保留告警
+  if (segment.includes("[") || segment.includes("]")) return null;
+  return segment;
+}
+
+/**
+ * 文件路径 → 路由路径。
+ *
+ * 规则：
+ *  - 去掉扩展名；`index` 映射到所在目录（根 `index` → `/`）
+ *  - 目录按层级拼接；Docusaurus docs 统一挂在 `/docs`
+ *  - `[id]` → `:id`，`[...slug]` → `:slug*`，`[[...slug]]` → `:slug*?`
+ */
+function filePathToRoute(
+  relativeToBase: string,
+  basePath: string,
+): { path: string; index: boolean } | null {
+  const normalized = relativeToBase.replace(/\\/g, "/");
+  const withoutExtension = normalized.replace(PAGE_FILE_PATTERN, "");
+  const rawSegments = withoutExtension.split("/").filter((segment) => segment.length > 0);
+  if (rawSegments.length === 0) return null;
+
+  let index = false;
+  if (rawSegments[rawSegments.length - 1] === "index") {
+    rawSegments.pop();
+    index = true;
+  }
+
+  const segments: string[] = [];
+  for (const segment of rawSegments) {
+    const converted = fileRouteSegment(segment);
+    if (converted === null) return null;
+    segments.push(converted);
+  }
+
+  const joined = [basePath, ...segments].filter((part) => part.length > 0).join("/");
+  return { path: normalizePath(joined === "" ? "/" : joined), index };
+}
+
+/**
+ * 给 Docusaurus 站点补文件约定路由。
+ *
+ * 只处理 `src/pages` 与 `docs` 的目录约定，不解析 Markdown 内容（frontmatter
+ * 的 id/slug 不参与路径推导）。显式路由已占用的路径跳过并告警，不覆盖。
+ */
+function addDocusaurusFileRoutes(
+  rootPath: string,
+  collector: RouteCollector,
+  componentsByFile: ReadonlyMap<string, readonly DiscoveredComponent[]>,
+): void {
+  const siteRoots = findDocusaurusRoots(rootPath);
+  if (siteRoots.length === 0) return;
+
+  const explicitPaths = collector.paths();
+  const seenFiles = new Set<string>();
+  const rootDocs = path.join(rootPath, "docs");
+
+  for (const siteRoot of siteRoots) {
+    const directories: { directory: string; basePath: string; pattern: RegExp }[] = [];
+    const pagesDir = path.join(siteRoot, "src", "pages");
+    if (isDirectory(pagesDir)) {
+      directories.push({ directory: pagesDir, basePath: "", pattern: PAGE_FILE_PATTERN });
+    }
+
+    const siteDocs = path.join(siteRoot, "docs");
+    if (isDirectory(siteDocs)) {
+      directories.push({ directory: siteDocs, basePath: "/docs", pattern: DOC_FILE_PATTERN });
+    }
+    // Docusaurus 常把 docs 放在站点根之外（本项目就是 website + 根 docs）
+    if (siteRoot !== rootPath && isDirectory(rootDocs)) {
+      directories.push({ directory: rootDocs, basePath: "/docs", pattern: DOC_FILE_PATTERN });
+    }
+
+    for (const { directory, basePath, pattern } of directories) {
+      for (const absolute of listRouteFiles(directory, pattern)) {
+        if (seenFiles.has(absolute)) continue;
+        seenFiles.add(absolute);
+
+        const relativeFile = toProjectRelative(rootPath, absolute);
+        if (relativeFile === null) continue;
+
+        const relativeToBase = path.relative(directory, absolute);
+        const parsed = filePathToRoute(relativeToBase, basePath);
+        if (!parsed) {
+          collector.warnings.push({
+            code: "file_route_path_unresolved",
+            severity: "warning",
+            stage: "static",
+            file: relativeFile,
+            loc: { line: 1, col: 1 },
+            message: `无法按目录约定推导 ${relativeFile} 的路由路径；保留文件但不产 route 节点`,
+          });
+          continue;
+        }
+
+        if (explicitPaths.has(parsed.path)) {
+          collector.warnings.push({
+            code: "file_route_shadowed",
+            severity: "warning",
+            stage: "static",
+            file: relativeFile,
+            loc: { line: 1, col: 1 },
+            message: `文件路由 ${parsed.path} 已被显式路由占用；保留显式路由，不重复产节点`,
+          });
+          continue;
+        }
+
+        const isMarkdown = DOC_FILE_PATTERN.test(absolute);
+        const pageComponent = isMarkdown ? null : pickPageComponent(relativeFile, componentsByFile);
+        if (!isMarkdown && !pageComponent) {
+          collector.warnings.push({
+            code: "file_route_component_missing",
+            severity: "warning",
+            stage: "static",
+            file: relativeFile,
+            loc: { line: 1, col: 1 },
+            message: `页面文件 ${relativeFile} 没有默认导出组件；只记录路由，不连边`,
+          });
+        }
+
+        collector.add({
+          path: parsed.path,
+          index: parsed.index,
+          framework: "docusaurus",
+          file: relativeFile,
+          loc: pageComponent?.loc ?? { line: 1, col: 1 },
+          pageComponentId: pageComponent?.id ?? null,
+          isLayout: false,
+          title: null,
+          fileConvention: true,
+        });
+      }
+    }
+  }
+}
+
+/* ------------------------------------------------------------------ *
  * 入口
  * ------------------------------------------------------------------ */
 
@@ -908,14 +1168,14 @@ export function analyzeRoutes(input: RouteAnalysisInput): RouteAnalysisResult {
     walkRouteElements(file, relativeFile, context, collector);
   }
 
-  if (framework === "next") {
-    const componentsByFile = new Map<string, DiscoveredComponent[]>();
-    for (const component of components) {
-      const list = componentsByFile.get(component.file);
-      if (list) list.push(component);
-      else componentsByFile.set(component.file, [component]);
-    }
+  const componentsByFile = new Map<string, DiscoveredComponent[]>();
+  for (const component of components) {
+    const list = componentsByFile.get(component.file);
+    if (list) list.push(component);
+    else componentsByFile.set(component.file, [component]);
+  }
 
+  if (framework === "next") {
     // 先收集 layout.tsx：`app/users/layout.tsx` 的目录前缀是 `app/users/`，
     // 以它开头的页面文件都在这个 layout 的子树里（含分组目录的原始段名，
     // 不做 URL 转换——文件约定按目录算，不按 URL 算）
@@ -979,6 +1239,9 @@ export function analyzeRoutes(input: RouteAnalysisInput): RouteAnalysisResult {
       });
     }
   }
+
+  // Docusaurus 等文件约定站点：显式路由收集完后再补，保证显式配置优先。
+  addDocusaurusFileRoutes(rootPath, collector, componentsByFile);
 
   const built = collector.build();
   return { routeNodes: built.routeNodes, edges: built.edges, warnings: collector.warnings };
