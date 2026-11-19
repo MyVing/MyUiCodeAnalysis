@@ -718,3 +718,78 @@ describe("layout / page 区分（差距表 #5）", () => {
     );
   });
 });
+
+describe("Docusaurus 文件路由", () => {
+  it("src/pages 的 index / 嵌套目录 / 动态段，以及 docs 的 md 页面", () => {
+    const result = analyzeSynthetic({
+      "website/docusaurus.config.ts": "export default {};",
+      "website/src/pages/index.tsx":
+        "export default function Home() { return <div />; }",
+      "website/src/pages/guide/index.tsx":
+        "export default function Guide() { return <div />; }",
+      "website/src/pages/users/[id].tsx":
+        "export default function UserDetail() { return <div />; }",
+      "website/src/pages/types.d.ts": "export type Page = true;\n",
+      "docs/intro.md": "# Intro\n",
+      "docs/guide/getting-started.md": "# Getting started\n",
+      "docs/guide/index.md": "# Guide\n",
+      "docs/api/[id].md": "# API item\n",
+    });
+
+    const home = routeByPath(result, "/");
+    expect(home.attrs.framework).toBe("docusaurus");
+    expect(home.attrs.pageComponentId).toBe("website/src/pages/index.tsx#Home");
+    expect(result.edges.some((edge) => edge.from === home.id && edge.to === "website/src/pages/index.tsx#Home")).toBe(
+      true,
+    );
+
+    expect(routeByPath(result, "/guide").attrs.pageComponentId).toBe(
+      "website/src/pages/guide/index.tsx#Guide",
+    );
+    expect(routeByPath(result, "/users/:id").attrs.params).toEqual(["id"]);
+    expect(routeByPath(result, "/docs/api/:id")).toBeDefined();
+
+    // md 页面只建 route，不造组件、不连边，也不报 route_element_unresolved
+    const docsIntro = routeByPath(result, "/docs/intro");
+    expect(docsIntro.attrs.pageComponentId).toBeUndefined();
+    expect(result.edges.some((edge) => edge.from === docsIntro.id)).toBe(false);
+    expect(
+      result.warnings.some((warning) => warning.code === "route_element_unresolved"),
+    ).toBe(false);
+
+    expect(routeByPath(result, "/docs/guide")).toBeDefined();
+    expect(routeByPath(result, "/docs/guide/getting-started")).toBeDefined();
+    expect(result.routeNodes.some((node) => node.name === "/types.d")).toBe(false);
+  });
+
+  it("显式路由优先：同路径的文件路由跳过并记 file_route_shadowed", () => {
+    const result = analyzeSynthetic({
+      "src/router.tsx": `
+        import { createBrowserRouter } from "react-router-dom";
+        import { UserList } from "./Pages";
+        export const router = createBrowserRouter([{ path: "/users", element: <UserList /> }]);
+      `,
+      "website/docusaurus.config.ts": "export default {};",
+      "website/src/pages/users.tsx": "export default function Page() { return <div />; }",
+    });
+
+    const users = result.routeNodes.filter((node) => node.name === "/users");
+    expect(users).toHaveLength(1);
+    expect(users[0]?.attrs.framework).toBe("react-router");
+    expect(result.warnings.some((warning) => warning.code === "file_route_shadowed")).toBe(true);
+  });
+
+  it("两个文件映射到同一路径时都保留，并记 duplicate_route_path", () => {
+    const result = analyzeSynthetic({
+      "website/docusaurus.config.ts": "export default {};",
+      "website/src/pages/foo.tsx": "export default function Foo() { return <div />; }",
+      "website/src/pages/foo/index.tsx":
+        "export default function FooIndex() { return <div />; }",
+    });
+
+    expect(result.routeNodes.filter((node) => node.name === "/foo")).toHaveLength(2);
+    expect(
+      result.warnings.some((warning) => warning.code === "duplicate_route_path"),
+    ).toBe(true);
+  });
+});

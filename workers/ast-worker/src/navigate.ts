@@ -163,10 +163,11 @@ function toSegments(raw: string): (string | null)[] {
 /**
  * 常量回溯的最大层数。
  *
- * `const A = ROUTES.HOME` 这类中转链是常见的，但自引用/循环导入会让回溯不收敛。
- * 三层足够覆盖「路由常量表 → 局部别名 → 使用处」，再多就不是「常量」了。
+ * 常量表 → 字段/索引 → map 回调参数 → 字面量会串起多次函数调用，层数过浅会
+ * 在真正读到字面量之前就截断。六层足以覆盖这些静态形态，同时防止自引用/循环
+ * 导入不收敛；再多就不属于「可在编译期确定」的常量了。
  */
-const MAX_CONSTANT_DEPTH = 3;
+const MAX_CONSTANT_DEPTH = 6;
 
 /**
  * 把标识符 / 属性访问追溯到它指向的字符串字面量。
@@ -178,67 +179,197 @@ const MAX_CONSTANT_DEPTH = 3;
  * 退化为「按名字匹配」的做法（用 `HOME` 去猜 `/`）是错的：同名常量在不同
  * 模块里可以有不同值，而且猜出来的路径会直接进图。
  */
-function readConstantString(node: Node, depth: number): NavigationTarget | null {
-  if (depth > MAX_CONSTANT_DEPTH) return null;
-
-  if (MorphNode.isIdentifier(node) || MorphNode.isPropertyAccessExpression(node)) {
-    let symbol = node.getSymbol();
-    if (symbol?.isAlias()) {
-      try {
-        symbol = symbol.getAliasedSymbol();
-      } catch {
-        // 别名解析失败（依赖未安装）时保留原符号，下面按「未命中」处理
-      }
-    }
-
-    for (const decl of symbol?.getDeclarations() ?? []) {
-      // `const PATH = "/x"` / `{ HOME: "/" }`：两种声明形态取值方式一致
-      const initializer =
-        MorphNode.isVariableDeclaration(decl) || MorphNode.isPropertyAssignment(decl)
-          ? decl.getInitializer()
-          : undefined;
-      if (!initializer) continue;
-
-      // `as const` / `satisfies` 不改变运行时值
-      let value = initializer;
-      if (MorphNode.isAsExpression(value) || MorphNode.isSatisfiesExpression(value)) {
-        value = value.getExpression();
-      }
-
-      const resolved = readTargetPath(value, depth + 1);
-      if (resolved) return resolved;
+function resolveAliasedSymbol(node: Node) {
+  let symbol = node.getSymbol();
+  if (symbol?.isAlias()) {
+    try {
+      symbol = symbol.getAliasedSymbol();
+    } catch {
+      // 别名解析失败（依赖未安装）时保留原符号，下面按「未命中」处理
     }
   }
+  return symbol;
+}
 
+/** 去掉不改变运行时值的包装表达式。 */
+function unwrapStaticExpression(node: Node): Node {
+  let current = node;
+  while (
+    MorphNode.isParenthesizedExpression(current) ||
+    MorphNode.isAsExpression(current) ||
+    MorphNode.isSatisfiesExpression(current)
+  ) {
+    current = current.getExpression();
+  }
+  return current;
+}
+
+/** 标识符是否指向函数参数（例如 map 回调参数）。 */
+function isParameterReference(node: Node): boolean {
+  if (!MorphNode.isIdentifier(node)) return false;
+  return (resolveAliasedSymbol(node)?.getDeclarations() ?? []).some((decl) =>
+    MorphNode.isParameterDeclaration(decl),
+  );
+}
+
+/**
+ * 把可在编译期确定值的表达式收窄到真正的字面量节点。
+ *
+ * 支持：
+ *  - `const X = "/x"` / `const X = OBJECT.field` / `OBJECT.field`
+ *  - `ARRAY[0]`
+ *  - `as const` / `satisfies` / 括号
+ *
+ * 不支持函数调用、条件表达式、map 回调参数本身等无法静态确定的形态；返回 null。
+ */
+function resolveStaticNode(node: Node | null, depth: number): Node | null {
+  if (!node || depth > MAX_CONSTANT_DEPTH) return null;
+  const current = unwrapStaticExpression(node);
+
+  if (MorphNode.isIdentifier(current)) {
+    for (const decl of resolveAliasedSymbol(current)?.getDeclarations() ?? []) {
+      if (MorphNode.isVariableDeclaration(decl) || MorphNode.isPropertyAssignment(decl)) {
+        const initializer = decl.getInitializer();
+        if (initializer) return resolveStaticNode(initializer, depth + 1);
+      }
+    }
+    return null;
+  }
+
+  if (MorphNode.isPropertyAccessExpression(current)) {
+    // `section.to`：section 是 map 回调参数，不能从参数声明里读值。
+    // 交给 readMappedTargets 按数组元素逐个求值；这里直接判为未命中。
+    if (isParameterReference(current.getExpression())) return null;
+
+    for (const decl of resolveAliasedSymbol(current)?.getDeclarations() ?? []) {
+      if (MorphNode.isVariableDeclaration(decl) || MorphNode.isPropertyAssignment(decl)) {
+        const initializer = decl.getInitializer();
+        if (initializer) return resolveStaticNode(initializer, depth + 1);
+      }
+    }
+
+    // 对象字面量字段：`({ path: "/x" }).path`
+    const base = resolveStaticNode(current.getExpression(), depth + 1);
+    if (base && MorphNode.isObjectLiteralExpression(base)) {
+      const property = base.getProperty(current.getName());
+      if (property && MorphNode.isPropertyAssignment(property)) {
+        const initializer = property.getInitializer();
+        if (initializer) return resolveStaticNode(initializer, depth + 1);
+      }
+      if (property && MorphNode.isShorthandPropertyAssignment(property)) {
+        return resolveStaticNode(property.getNameNode(), depth + 1);
+      }
+    }
+    return null;
+  }
+
+  if (MorphNode.isElementAccessExpression(current)) {
+    const base = resolveStaticNode(current.getExpression(), depth + 1);
+    const argument = current.getArgumentExpression();
+    if (
+      base &&
+      MorphNode.isArrayLiteralExpression(base) &&
+      argument &&
+      MorphNode.isNumericLiteral(argument)
+    ) {
+      const index = Number(argument.getLiteralText());
+      const element = base.getElements()[index];
+      if (element) return resolveStaticNode(element, depth + 1);
+    }
+    return null;
+  }
+
+  return current;
+}
+
+/**
+ * 读出完全静态的字符串值。
+ *
+ * 只处理字面量、静态模板、字面量 `+` 拼接和可回溯的常量；任何一段定不下来
+ * 都返回 null，由调用方保留「目标未解析」告警。
+ */
+function readStaticString(node: Node | null, depth = 0): string | null {
+  if (!node || depth > MAX_CONSTANT_DEPTH) return null;
+  const current = unwrapStaticExpression(node);
+
+  if (MorphNode.isStringLiteral(current) || MorphNode.isNoSubstitutionTemplateLiteral(current)) {
+    return current.getLiteralText();
+  }
+
+  if (MorphNode.isTemplateExpression(current)) {
+    let text = current.getHead().getLiteralText();
+    for (const span of current.getTemplateSpans()) {
+      const part = readStaticString(span.getExpression(), depth + 1);
+      if (part === null) return null;
+      text += `${part}${span.getLiteral().getLiteralText()}`;
+    }
+    return text;
+  }
+
+  if (
+    MorphNode.isBinaryExpression(current) &&
+    current.getOperatorToken().getKind() === SyntaxKind.PlusToken
+  ) {
+    const left = readStaticString(current.getLeft(), depth + 1);
+    const right = readStaticString(current.getRight(), depth + 1);
+    return left !== null && right !== null ? `${left}${right}` : null;
+  }
+
+  if (
+    MorphNode.isIdentifier(current) ||
+    MorphNode.isPropertyAccessExpression(current) ||
+    MorphNode.isElementAccessExpression(current)
+  ) {
+    const resolved = resolveStaticNode(current, depth + 1);
+    if (resolved && resolved !== current) return readStaticString(resolved, depth + 1);
+  }
+
+  return null;
+}
+
+function readConstantString(node: Node, depth: number): NavigationTarget | null {
+  if (depth > MAX_CONSTANT_DEPTH) return null;
+  if (
+    MorphNode.isIdentifier(node) ||
+    MorphNode.isPropertyAccessExpression(node) ||
+    MorphNode.isElementAccessExpression(node)
+  ) {
+    const resolved = resolveStaticNode(node, depth + 1);
+    if (resolved && resolved !== node) return readTargetPath(resolved, depth + 1);
+  }
   return null;
 }
 
 function readTargetPath(node: Node | null, depth = 0): NavigationTarget | null {
   if (!node || depth > MAX_CONSTANT_DEPTH) return null;
 
+  const current = unwrapStaticExpression(node);
+
   // `to={{ pathname: "/users/1", search: "?a=1" }}`
-  if (MorphNode.isObjectLiteralExpression(node)) {
-    const pathname = node.getProperty("pathname");
+  if (MorphNode.isObjectLiteralExpression(current)) {
+    const pathname = current.getProperty("pathname");
     if (!pathname || !MorphNode.isPropertyAssignment(pathname)) return null;
     return readTargetPath(pathname.getInitializer() ?? null, depth + 1);
   }
 
-  if (MorphNode.isStringLiteral(node) || MorphNode.isNoSubstitutionTemplateLiteral(node)) {
-    const raw = node.getLiteralText();
+  const staticString = readStaticString(current, depth + 1);
+  if (staticString !== null) {
     // 空字符串是「当前路由」而非根路径，两者语义不同，不能一概按 "/" 处理
-    if ((raw.split(/[?#]/)[0] ?? raw).length === 0) return null;
+    if ((staticString.split(/[?#]/)[0] ?? staticString).length === 0) return null;
     // 根路径 "/" 的分段为空数组，这是合法的目标，必须保留
-    return { segments: toSegments(raw), pattern: false };
+    return { segments: toSegments(staticString), pattern: false };
   }
 
-  if (MorphNode.isTemplateExpression(node)) {
+  if (MorphNode.isTemplateExpression(current)) {
     // 首个字面量块必须给出起始段：`${base}/x` 连从哪一节开始都定不下来
-    const head = node.getHead().getLiteralText();
+    const head = current.getHead().getLiteralText();
     if (!head.includes("/")) return null;
 
     let text = head;
-    for (const span of node.getTemplateSpans()) {
-      text += PLACEHOLDER + span.getLiteral().getLiteralText();
+    for (const span of current.getTemplateSpans()) {
+      const resolved = readStaticString(span.getExpression(), depth + 1);
+      text += resolved !== null ? resolved : PLACEHOLDER;
+      text += span.getLiteral().getLiteralText();
     }
 
     const segments = toSegments(text);
@@ -246,7 +377,81 @@ function readTargetPath(node: Node | null, depth = 0): NavigationTarget | null {
     return { segments, pattern: true };
   }
 
-  return readConstantString(node, depth);
+  return readConstantString(current, depth);
+}
+
+/** 读取模块级常量里的数组元素；只接受真正的数组字面量。 */
+function readStaticArrayElements(node: Node | null, depth: number): Node[] | null {
+  const resolved = resolveStaticNode(node, depth + 1);
+  if (!resolved || !MorphNode.isArrayLiteralExpression(resolved)) return null;
+  return resolved.getElements();
+}
+
+/** `array.map((item) => ...)` 里的 item 参数，回溯到 array 字面量元素。 */
+function mapParameterElements(identifier: Node, depth: number): Node[] | null {
+  if (!MorphNode.isIdentifier(identifier)) return null;
+
+  for (const decl of resolveAliasedSymbol(identifier)?.getDeclarations() ?? []) {
+    if (!MorphNode.isParameterDeclaration(decl)) continue;
+    const fn = decl.getParent();
+    if (!MorphNode.isArrowFunction(fn) && !MorphNode.isFunctionExpression(fn)) continue;
+
+    let call: Node | undefined = fn.getParent();
+    while (call && MorphNode.isParenthesizedExpression(call)) call = call.getParent();
+    if (!call || !MorphNode.isCallExpression(call)) continue;
+
+    const callee = call.getExpression();
+    if (!MorphNode.isPropertyAccessExpression(callee) || callee.getName() !== "map") continue;
+
+    const elements = readStaticArrayElements(callee.getExpression(), depth + 1);
+    if (elements && elements.length > 0) return elements;
+  }
+
+  return null;
+}
+
+/** 从对象字面量里取字段初始值；不是对象或字段定不下来时返回 null。 */
+function readObjectPropertyValue(node: Node, propertyName: string, depth: number): Node | null {
+  const resolved = resolveStaticNode(node, depth + 1);
+  if (!resolved || !MorphNode.isObjectLiteralExpression(resolved)) return null;
+
+  const property = resolved.getProperty(propertyName);
+  if (!property) return null;
+  if (MorphNode.isPropertyAssignment(property)) return property.getInitializer() ?? null;
+  if (MorphNode.isShorthandPropertyAssignment(property)) return property.getNameNode();
+  return null;
+}
+
+/**
+ * `sections.map((section) => <Link to={section.to}>...)`：
+ * 按数组元素逐个求值，返回全部目标；任何一个元素求不出来就整体放弃，
+ * 避免只连接一部分目标却让调用方以为已完整解析。
+ */
+function readMappedTargets(node: Node, depth: number): NavigationTarget[] | null {
+  if (depth > MAX_CONSTANT_DEPTH || !MorphNode.isPropertyAccessExpression(node)) return null;
+  const base = node.getExpression();
+  if (!MorphNode.isIdentifier(base)) return null;
+
+  const elements = mapParameterElements(base, depth + 1);
+  if (!elements) return null;
+
+  const targets: NavigationTarget[] = [];
+  for (const element of elements) {
+    const value = readObjectPropertyValue(element, node.getName(), depth + 1);
+    const target = readTargetPath(value, depth + 1);
+    if (!target) return null;
+    targets.push(target);
+  }
+  return targets.length > 0 ? targets : null;
+}
+
+/** 入口：先按 map 映射表展开，再走普通单目标解析。 */
+function readTargetPaths(node: Node | null, depth = 0): NavigationTarget[] | null {
+  if (!node) return null;
+  const mapped = readMappedTargets(node, depth);
+  if (mapped) return mapped;
+  const single = readTargetPath(node, depth);
+  return single ? [single] : null;
 }
 
 /** 一个跳转点：从哪、到哪、证据在哪。 */
@@ -478,9 +683,9 @@ export function analyzeNavigation(input: NavigationAnalysisInput): NavigationAna
         opening,
         isLink ? LINK_PATH_ATTRIBUTES : PATH_ATTRIBUTES,
       );
-      const target = readTargetPath(pathNode);
+      const targets = readTargetPaths(pathNode);
 
-      if (!target) {
+      if (!targets) {
         // 属性存在但定不下来 / 属性不存在（Link 不写 to 是错误用法）
         if (pathNode !== null || isLink) {
           warnings.push({
@@ -510,7 +715,9 @@ export function analyzeNavigation(input: NavigationAnalysisInput): NavigationAna
         });
       }
 
-      record({ fromId, target, file, loc: info.loc });
+      for (const target of targets) {
+        record({ fromId, target, file, loc: info.loc });
+      }
     }
 
     // --- 一次扫描：调用形态（每文件一次，与上面的元素遍历分开）---
@@ -518,8 +725,8 @@ export function analyzeNavigation(input: NavigationAnalysisInput): NavigationAna
       const pathNode = readNavigationCall(call, bindings);
       if (!pathNode) continue;
 
-      const target = readTargetPath(pathNode);
-      if (!target) {
+      const targets = readTargetPaths(pathNode);
+      if (!targets) {
         const pos = sourceFile.getLineAndColumnAtPos(call.getStart());
         warnings.push({
           code: "navigate_target_unresolved",
@@ -536,7 +743,9 @@ export function analyzeNavigation(input: NavigationAnalysisInput): NavigationAna
       if (!fromId) continue; // 模块顶层的调用不属于任何组件，无法作为边的起点
 
       const pos = sourceFile.getLineAndColumnAtPos(call.getStart());
-      record({ fromId, target, file, loc: { line: pos.line, col: pos.column } });
+      for (const target of targets) {
+        record({ fromId, target, file, loc: { line: pos.line, col: pos.column } });
+      }
     }
   }
 

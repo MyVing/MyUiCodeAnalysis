@@ -410,6 +410,114 @@ describe("导航边（合成项目）", () => {
     expect(navigation.warnings.some((w) => w.code === "navigate_target_unresolved")).toBe(true);
   });
 
+  it("模块级数组常量的数字索引与对象字段可静态求值", () => {
+    const { navigation } = setup(
+      withRoutes({
+        "src/Page.tsx": `
+          import { Link } from "react-router-dom";
+          const SECTIONS = [
+            { title: "Users", to: "/users" },
+            { title: "Order", to: "/orders/42/detail" },
+          ] as const;
+          export function Page() {
+            return <Link to={SECTIONS[0].to}>users</Link>;
+          }
+        `,
+      }),
+    );
+
+    expect(navigation.edges).toHaveLength(1);
+    expect(navigation.edges[0]?.to).toBe("src/router.tsx#/users");
+  });
+
+  it("map 回调参数按模块级映射表逐项展开，产出全部导航目标", () => {
+    const { navigation } = setup(
+      withRoutes({
+        "src/Page.tsx": `
+          import { Link } from "react-router-dom";
+          const SECTIONS = [
+            { title: "Users", to: "/users" },
+            { title: "Order", to: "/orders/42/detail" },
+          ] as const;
+          export function Page() {
+            return (
+              <nav>
+                {SECTIONS.map((section) => (
+                  <Link key={section.title} to={section.to}>{section.title}</Link>
+                ))}
+              </nav>
+            );
+          }
+        `,
+      }),
+    );
+
+    expect(navigation.edges.map((edge) => edge.to).sort()).toEqual([
+      "src/router.tsx#/orders/:orderNo/detail",
+      "src/router.tsx#/users",
+    ]);
+    expect(
+      navigation.warnings.some((warning) => warning.code === "navigate_target_unresolved"),
+    ).toBe(false);
+  });
+
+  it("静态模板字符串与字面量拼接可求值", () => {
+    const { navigation } = setup(
+      withRoutes({
+        "src/Page.tsx": `
+          import { Link } from "react-router-dom";
+          const BASE = "/users";
+          const ORDER = "/orders";
+          export function Page() {
+            return (
+              <div>
+                <Link to={\`\${BASE}/42\`}>user</Link>
+                <Link to={ORDER + "/42/detail"}>order</Link>
+              </div>
+            );
+          }
+        `,
+      }),
+    );
+
+    expect(navigation.edges.map((edge) => edge.to).sort()).toEqual([
+      "src/router.tsx#/orders/:orderNo/detail",
+      "src/router.tsx#/users/:userId",
+    ]);
+    expect(
+      navigation.warnings.some((warning) => warning.code === "navigate_target_unresolved"),
+    ).toBe(false);
+  });
+
+  it("映射表里有一项无法静态求值时整体不产边，保留告警", () => {
+    const { navigation } = setup(
+      withRoutes({
+        "src/Page.tsx": `
+          import { Link } from "react-router-dom";
+          declare function getTarget(): string;
+          const SECTIONS = [
+            { title: "Users", to: "/users" },
+            { title: "Dynamic", to: getTarget() },
+          ];
+          export function Page() {
+            return (
+              <nav>
+                {SECTIONS.map((section) => (
+                  <Link key={section.title} to={section.to}>{section.title}</Link>
+                ))}
+              </nav>
+            );
+          }
+        `,
+      }),
+    );
+
+    expect(navigation.edges).toEqual([]);
+    expect(
+      navigation.warnings.some((warning) => warning.code === "navigate_target_unresolved"),
+    ).toBe(true);
+  });
+
   it("模块顶层的 navigate 调用不属于任何组件，不产边", () => {
     const { navigation } = setup(
       withRoutes({
