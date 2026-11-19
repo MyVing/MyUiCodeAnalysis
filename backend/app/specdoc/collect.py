@@ -16,6 +16,7 @@ from dataclasses import dataclass, field
 from app.contracts import IRGraph, IRNode, NodeKind
 from app.contracts.requirement import RequirementMap, RequirementWarning, Severity
 from app.contracts.specdoc import Location, Page, VerifiedEvidence
+from app.contracts.specdoc import FieldMapping
 from app.contracts.specdoc import Source as DocSource
 from app.requirement.chains import ActionChain, derive_chains
 
@@ -50,6 +51,8 @@ class PageMaterial:
     chains: list[ActionChain] = field(default_factory=list)
     # LLM 引文语料：链路原文 + 元素文案 + 页面文案，去重保序
     corpus: tuple[str, ...] = ()
+    # 页面内 API 节点，供字段映射读取请求体包装事实
+    api_nodes: dict[str, IRNode] = field(default_factory=dict)
     # 被需求定位命中的链路 id
     matched_chain_ids: frozenset[str] = frozenset()
 
@@ -147,6 +150,12 @@ def collect_materials(requirement_map: RequirementMap, graph: IRGraph) -> Materi
             for element in element_nodes
         ]
         corpus = _page_corpus(node, element_nodes, chains)
+        api_nodes = {
+            item.id: item
+            for item in nodes.values()
+            if item.kind is NodeKind.api
+            and any(step.node_id == item.id for chain in chains for step in chain.steps)
+        }
         materials.pages.append(
             PageMaterial(
                 page=page,
@@ -154,6 +163,7 @@ def collect_materials(requirement_map: RequirementMap, graph: IRGraph) -> Materi
                 elements=element_sources,
                 chains=chains,
                 corpus=corpus,
+                api_nodes=api_nodes,
                 matched_chain_ids=frozenset(matched_chain_ids),
             )
         )
@@ -303,6 +313,77 @@ def _unique(items) -> list[str]:
     return list(dict.fromkeys(item for item in items if item and item.strip()))
 
 
+def deterministic_field_mappings(materials: Materials) -> list[FieldMapping]:
+    """从 IR 的表单注册事实与请求体包装生成可审计字段映射。"""
+    result: list[FieldMapping] = []
+    seen: set[tuple[str, str, str, str | None]] = set()
+    for material in materials.pages:
+        request_apis = [
+            (step.name, material.api_nodes.get(step.node_id))
+            for chain in material.chains
+            for step in chain.steps
+            if step.role == "api" and material.api_nodes.get(step.node_id) is not None
+        ]
+        request_apis = [
+            (name, node) for name, node in request_apis
+            if isinstance(node.attrs.get("requestBody"), dict)
+            and isinstance(node.attrs["requestBody"].get("wrapper"), str)
+        ]
+        for source in material.elements:
+            field = source.node.attrs.get("formField")
+            if not isinstance(field, dict) or not isinstance(field.get("name"), str):
+                continue
+            for api_name, api_node in request_apis:
+                body = api_node.attrs["requestBody"]
+                parts = api_name.split(None, 1)
+                method, url = (parts if len(parts) == 2 else ("GET", api_name))
+                backend = f"{body['wrapper']}.{field['name']}"
+                key = (field["name"], backend, f"{method} {url}", material.page.pageId)
+                if key in seen:
+                    continue
+                seen.add(key)
+                evidence = _field_mapping_evidence(source.node, field)
+                if evidence is None:
+                    continue
+                result.append(FieldMapping(
+                        frontField=field["name"],
+                        backendParam=backend,
+                        api=f"{method} {url}",
+                        pageId=material.page.pageId,
+                        quote=evidence.quote,
+                        evidence=[evidence],
+                    ))
+    return result
+
+
+def _field_mapping_evidence(node: IRNode, field: dict) -> VerifiedEvidence | None:
+    if not node.evidence:
+        return None
+    best = max(node.evidence, key=lambda item: item.confidence)
+    quote = field.get("quote")
+    if not isinstance(quote, str) or not quote:
+        return None
+    field_loc = field.get("loc")
+    if isinstance(field_loc, dict):
+        line = field_loc.get("line")
+        col = field_loc.get("col")
+        loc = (
+            Location(line=line, col=col)
+            if isinstance(line, int) and line >= 1 and isinstance(col, int) and col >= 1
+            else None
+        )
+    else:
+        loc = best.loc
+        loc = Location(line=loc.line, col=loc.col) if loc else None
+    return VerifiedEvidence(
+        nodeId=node.id,
+        quote=quote,
+        file=best.file,
+        loc=loc,
+        via="formField",
+        source=DocSource(best.source.value),
+        confidence=best.confidence,
+    )
 def element_evidence(node: IRNode) -> VerifiedEvidence | None:
     """确定性条目的证据：取 IR 节点置信度最高的一条证据 + 元素原文。
 

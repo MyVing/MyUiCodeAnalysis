@@ -35,7 +35,7 @@ from app.core.config import Settings
 from app.requirement.llm import LLMClient
 from app.schemas import Project, SpecDocTask
 from app.specdoc.apimap import build_api_mappings
-from app.specdoc.collect import Materials, collect_materials
+from app.specdoc.collect import Materials, collect_materials, deterministic_field_mappings
 from app.specdoc.elements import build_elements
 from app.specdoc.events import build_events
 from app.specdoc.infer import infer_sections
@@ -66,6 +66,8 @@ class SpecDocOrchestrator:
             task, requirement_map.requirement, requirement_map, materials
         )
         warnings.extend(_convert_warnings(infer_outcome.warnings))
+        deterministic_mappings = [] if task.dry_run else deterministic_field_mappings(materials)
+        field_mappings = _merge_field_mappings(deterministic_mappings, infer_outcome.field_mappings)
 
         steps = self._number_steps(infer_outcome.steps)
         rules = self._number_rules(infer_outcome.rules)
@@ -84,7 +86,7 @@ class SpecDocOrchestrator:
             elements=elements,
             events=events,
             rules=rules,
-            fieldMappings=infer_outcome.field_mappings,
+            fieldMappings=field_mappings,
             apiMappings=api_mappings,
             dropped=_convert_dropped(infer_outcome.dropped),
             warnings=_convert_warnings(warnings),
@@ -163,6 +165,18 @@ class SpecDocOrchestrator:
         return numbered
 
 
+def _merge_field_mappings(
+    deterministic: list[FieldMapping], inferred: list[FieldMapping]
+) -> list[FieldMapping]:
+    """确定性事实优先；模型仅补充静态分析未覆盖的映射。"""
+    result = list(deterministic)
+    keys = {(item.frontField, item.api, item.pageId) for item in deterministic}
+    for item in inferred:
+        key = (item.frontField, item.api, item.pageId)
+        if key not in keys:
+            result.append(item)
+            keys.add(key)
+    return result
 class _SkippedOutcome:
     """推断章节被跳过时的空产物。字段形状与 InferOutcome 对齐，调用方无感知。"""
 
@@ -172,6 +186,7 @@ class _SkippedOutcome:
         self.field_mappings: list[FieldMapping] = []
         self.dropped: list = []
         self.warnings: list[RequirementWarning] = warnings or []
+
 
 
 def _skipped_warning(code: str, message: str) -> list[RequirementWarning]:

@@ -152,6 +152,7 @@ async function analyze(request: WorkerRequest): Promise<WorkerResponse> {
     components: discovery.components,
     knownNodes,
     propsFields,
+    declarations: discovery.declarations,
     rootPath,
   });
   warnings.push(...eventsResult.warnings);

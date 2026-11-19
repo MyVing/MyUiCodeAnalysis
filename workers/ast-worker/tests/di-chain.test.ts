@@ -173,6 +173,57 @@ const HOOK_NODE_ID = "src/login/Login.tsx#Login/useLogin";
 const LOGIN_FN_ID = "src/application/session.service.ts#login";
 const API_ID = "api:POST:/users/login";
 
+describe("DI 链路：子组件 props 回调回溯", () => {
+  it("RegisterView 的 onSubmit 可回溯到父组件 useRegister hook", () => {
+    const parts = analyzeSynthetic({
+      "node_modules/ky/index.d.ts": `
+        declare const ky: { post(url: string, options?: unknown): Promise<unknown> };
+        export default ky;
+      `,
+      "src/di.ts": `export function inject<T>(_token: string, factory?: () => T): T { return factory!(); }`,
+      "src/application/user/user-service.interface.ts": `export interface UserService { register(data: unknown): Promise<void>; }`,
+      "src/application/api/user.service.ts": `
+        import ky from "ky";
+        import { UserService } from "../user/user-service.interface";
+        export class UserServiceImpl implements UserService {
+          private readonly http = ky;
+          async register(data: unknown) { await this.http.post("/users", { json: { user: data } }); }
+        }
+      `,
+      "src/app/register/useRegister.ts": `
+        import { inject } from "../../di";
+        import { UserService } from "../../application/user/user-service.interface";
+        export function useRegister() {
+          const userService = inject<UserService>("UserService");
+          const onSubmit = async (data: unknown) => { await userService.register(data); };
+          return { onSubmit };
+        }
+      `,
+      "src/app/register/Register.tsx": `
+        import { useRegister } from "./useRegister";
+        import { RegisterView } from "./RegisterView";
+        export function Register() {
+          const { onSubmit } = useRegister();
+          return <RegisterView onSubmit={onSubmit} />;
+        }
+      `,
+      "src/app/register/RegisterView.tsx": `
+        export function RegisterView({ onSubmit }: { onSubmit: (data: unknown) => Promise<void> }) {
+          return <form onSubmit={onSubmit}><button type="submit">Sign up</button></form>;
+        }
+      `,
+    });
+
+    const form = parts.events.elementNodes.find((node) => node.attrs.tag === "form");
+    expect(form).toBeDefined();
+    const submit = (form?.attrs.events as EventBinding[]).find((event) => event.name === "onSubmit");
+    expect(submit?.injected).toBe(true);
+    expect(submit?.targets).toEqual([{ id: "src/app/register/Register.tsx#Register/useRegister", kind: "hook" }]);
+    expect(edgeOf(parts.events.edges, "calls", form!.id, "src/app/register/Register.tsx#Register/useRegister")).toBeDefined();
+  });
+});
+
+
 describe("DI 链路：inject 客户端 + 接口实现 + 解构 hook", () => {
   const parts = analyzeSynthetic(LOGIN_FILES);
 

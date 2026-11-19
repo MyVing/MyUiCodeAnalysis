@@ -83,6 +83,8 @@ interface RequestSite {
   evidence: Evidence[];
   /** URL 来自源码里的原始写法；与 url 不同时前端可以并排展示 */
   urlRaw?: string;
+  /** 可静态确认的请求体字段包装（如 `{ json: { user: data } }`）。 */
+  requestBody?: { wrapper: string; source: string; quote: string; file: string; loc: { line: number; col: number } };
 }
 
 /** 请求封装器的签名：怎么从调用实参里取出 URL 与 method。 */
@@ -1025,6 +1027,7 @@ export function analyzeApi(input: ApiAnalysisInput): ApiAnalysisResult {
           method: site.method,
           url: site.url,
           ...(site.urlRaw ? { urlRaw: site.urlRaw } : {}),
+          ...(site.requestBody ? { requestBody: site.requestBody } : {}),
         },
         // 节点自身只承载一条证据；其余调用位置都进对应边的 evidence
         evidence: [first],
@@ -1441,6 +1444,23 @@ function buildInterfaceImplIndex(
   return index;
 }
 
+function requestBodyOf(call: CallExpression, rootPath: string): RequestSite["requestBody"] {
+  const [, options] = call.getArguments();
+  if (!options || !MorphNode.isObjectLiteralExpression(options)) return undefined;
+  const json = findPropertyInitializer(options, ["json"])?.node;
+  if (!json || !MorphNode.isObjectLiteralExpression(json)) return undefined;
+  const props = json.getProperties();
+  if (props.length !== 1 || !MorphNode.isPropertyAssignment(props[0])) return undefined;
+  const wrapper = props[0].getName();
+  const value = props[0].getInitializer();
+  if (!value || !MorphNode.isIdentifier(value)) return undefined;
+  const source = value.getText();
+  const file = toProjectRelative(rootPath, value.getSourceFile().getFilePath());
+  if (file === null) return undefined;
+  const pos = value.getSourceFile().getLineAndColumnAtPos(value.getStart());
+  return { wrapper, source, quote: props[0].getText(), file, loc: { line: pos.line, col: pos.column } };
+}
+
 /** 直接从 HTTP 客户端调用构造请求点。 */
 function buildDirectRequestSite(
   call: CallExpression,
@@ -1457,6 +1477,7 @@ function buildDirectRequestSite(
   const pos = urlNode.getSourceFile().getLineAndColumnAtPos(urlNode.getStart());
 
   const method = getMethodFromOptions(call) ?? inferMethodFromCallee(call) ?? DEFAULT_METHOD;
+  const requestBody = requestBodyOf(call, rootPath);
 
   // 一条证据、一个置信度：置信度描述的是「这条结论有多确定」，不是「调用点是不是
   // 真写了」。URL 经变量转手时结论弱一档，位置也指向变量初始化处而非调用处，
@@ -1473,6 +1494,7 @@ function buildDirectRequestSite(
       },
     ],
     ...(read.raw !== read.text ? { urlRaw: read.raw } : {}),
+    ...(requestBody ? { requestBody } : {}),
   };
 }
 

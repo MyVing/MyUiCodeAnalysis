@@ -320,6 +320,7 @@ interface ViewEntry {
   info: JsxElementInfo;
   role: ViewRole;
   viewText: string | null;
+  formField: { name: string; quote: string } | null;
   /** true 表示文案来自变量/表达式，定不下来；结构事实仍然成立 */
   textDynamic: boolean;
   columns: { title: string; dataIndex: string | null }[] | null;
@@ -423,6 +424,30 @@ function linkHrefOf(info: JsxElementInfo): string | null {
  * 会得到「共 条」这种残缺文案，检索时反而误导——含插值就当作定不下来，
  * 记进元素的 `viewTextDynamic`，**不拼凑**。
  */
+function formFieldOf(opening: Node): { name: string; quote: string; loc: { line: number; col: number } } | null {
+  if (!MorphNode.isJsxOpeningElement(opening) && !MorphNode.isJsxSelfClosingElement(opening)) {
+    return null;
+  }
+  for (const attr of opening.getAttributes()) {
+    if (!MorphNode.isJsxSpreadAttribute(attr)) continue;
+    const expression = attr.getExpression();
+    if (!expression || !MorphNode.isCallExpression(expression)) continue;
+    const callee = expression.getExpression();
+    if (!MorphNode.isIdentifier(callee) || callee.getText() !== "register") continue;
+    const first = expression.getArguments()[0];
+    if (!first || (!MorphNode.isStringLiteral(first) && !MorphNode.isNoSubstitutionTemplateLiteral(first))) {
+      continue;
+    }
+    const name = first.getLiteralText().trim();
+    if (name) {
+      const source = opening.getSourceFile();
+      const position = source.getLineAndColumnAtPos(expression.getStart());
+      return { name, quote: expression.getText(), loc: { line: position.line, col: position.column } };
+    }
+  }
+  return null;
+}
+
 function viewTextOf(opening: Node): string | null {
   for (const name of VIEW_TEXT_ATTRS) {
     const value = literalValue(attributeValue(opening, name));
@@ -550,7 +575,8 @@ export function analyzeView(input: ViewAnalysisInput): ViewAnalysisResult {
   for (const [file, fileEntries] of inventory.byFile) {
     for (const info of fileEntries) {
       const columnsResult = columnsOf(info.opening);
-      const viewText = viewTextOf(info.opening);
+    const viewText = viewTextOf(info.opening);
+      const formField = formFieldOf(info.opening);
       const decision = decideInclude(info, columnsResult, viewText);
       const edgeOnly = !decision.include && extraElementIds.has(info.id);
       if (!decision.include && !edgeOnly) continue;
@@ -607,6 +633,7 @@ export function analyzeView(input: ViewAnalysisInput): ViewAnalysisResult {
         info,
         role: decision.role,
         viewText,
+        formField,
         textDynamic,
         // columns 是**属性**上的结构，与元素是否收录无关：ProTable 这类业务封装
         // 组件只有靠 columns 才能进视图层，所以要在 decideInclude 里先算出来
@@ -619,7 +646,7 @@ export function analyzeView(input: ViewAnalysisInput): ViewAnalysisResult {
   // 第二遍：产节点与 contains 边
   const edges = new Map<string, IREdge>();
   for (const entry of entries.values()) {
-    const { info, role, viewText, columns, textDynamic, edgeOnly } = entry;
+    const { info, role, viewText, formField, columns, textDynamic, edgeOnly } = entry;
     const evidence: Evidence = {
       source: "static",
       confidence: STRUCTURE_CONFIDENCE,
@@ -641,6 +668,7 @@ export function analyzeView(input: ViewAnalysisInput): ViewAnalysisResult {
           target: info.isHost ? "host" : "component",
           viewRole: role,
           ...(viewText ? { viewText } : {}),
+          ...(formField ? { formField } : {}),
           // 文案来自变量而定不下来：如实标注，别让读者以为元素没有文案
           ...(textDynamic ? { viewTextDynamic: true } : {}),
           ...(columns ? { columns } : {}),

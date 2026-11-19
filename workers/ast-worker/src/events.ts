@@ -140,6 +140,8 @@ export interface EventsAnalysisInput {
   knownNodes: readonly IRNode[];
   /** 组件 id → props 字段名；来自 props 分析结果 */
   propsFields: ReadonlyMap<string, readonly string[]>;
+  /** 组件 id → 定义节点；用于解析 JSX 中的子组件标签 */
+  declarations?: ReadonlyMap<string, Node>;
   /** 项目根目录，符号解析要把绝对路径收敛成 IR 用的相对路径 */
   rootPath: string;
 }
@@ -162,6 +164,8 @@ interface NameHit {
   isSetter: boolean;
 }
 
+type PropTargets = ReadonlyMap<string, readonly NameHit[]>;
+
 /**
  * 事件处理的落点解析器。
  *
@@ -176,6 +180,8 @@ interface HandlerResolver {
   byName(name: string): NameHit | null;
   /** 标识符 → 跨文件函数身份；局部名字或解析不到都返回 null */
   bySymbol(identifier: Identifier): FunctionIdentity | null;
+  /** 父组件传入的 props 回调 → 父组件真实目标 */
+  byPropTarget(name: string): NameHit | null;
   /** 名字是否是 props 字段（外部注入的回调） */
   isPropCallback(name: string): boolean;
 }
@@ -246,6 +252,8 @@ function buildResolver(
   table: NameTable,
   rootPath: string,
   registerFn: (identity: FunctionIdentity) => void,
+  propTargets: PropTargets = new Map(),
+  componentId = "",
 ): HandlerResolver {
   return {
     byName(name) {
@@ -266,6 +274,10 @@ function buildResolver(
         return identity;
       }
       return null;
+    },
+  byPropTarget(name) {
+      const hits = propTargets.get(`${componentId}:${name}`) ?? [];
+      return hits.length === 1 ? (hits[0] ?? null) : null;
     },
     isPropCallback(name) {
       return table.propNames.has(name);
@@ -428,6 +440,24 @@ function describeEvent(
       };
     }
 
+    // 两条路都没有时，若这是子组件 props，则尝试回溯父组件传入的表达式。
+    // 即使成功，injected 仍保留为 true：逻辑来自父组件，只是现在能确认其落点。
+    const propTarget = resolver.byPropTarget(handlerName);
+    if (propTarget) {
+      const targets = [{ id: propTarget.id, kind: propTarget.kind }];
+      return {
+        binding: {
+          name,
+          handler,
+          kind: "reference",
+          handlerName,
+          targets,
+          injected: true,
+        },
+        targets,
+      };
+    }
+
     // 两条路都没有，而名字在 props 字段里 = 由父组件注入。
     // 这个标记让"没有入边"成为一条结论，而不是看起来像链路缺失。
     return {
@@ -450,7 +480,7 @@ function describeEvent(
 }
 
 export function analyzeEvents(input: EventsAnalysisInput): EventsAnalysisResult {
-  const { inventory, components, knownNodes, propsFields, rootPath } = input;
+  const { inventory, components, knownNodes, propsFields, declarations, rootPath } = input;
 
   const warnings: Warning[] = [];
   const edges = new Map<string, IREdge>();
@@ -486,6 +516,7 @@ export function analyzeEvents(input: EventsAnalysisInput): EventsAnalysisResult 
   };
 
   // 一次扫描全部文件，而不是「每个组件扫一遍项目」——后者是 O(组件数 × 文件数)。
+  const propTargets = new Map<string, NameHit[]>();
   const resolvers = new Map<string, HandlerResolver>();
   for (const component of components) {
     resolvers.set(
@@ -494,8 +525,76 @@ export function analyzeEvents(input: EventsAnalysisInput): EventsAnalysisResult 
         buildNameTable(component, knownNodes, propsFields),
         rootPath,
         registerFn,
+        propTargets,
+        component.id,
       ),
     );
+  }
+
+  // 子组件的事件 prop 需要回到父组件 JSX 实例解析：
+  // `<RegisterView onSubmit={onSubmit} />` → RegisterView 的 `onSubmit`
+  // → Register 父组件里的 hook 绑定。只收唯一、可静态解析的目标。
+  const componentByDeclaration = new Map<number, string>();
+  const componentByName = new Map<string, string>();
+  for (const component of components) {
+    const declaration = declarations?.get(component.id);
+    if (declaration) componentByDeclaration.set(declaration.getStart(), component.id);
+    componentByName.set(component.name, component.id);
+  }
+  for (const fileEntries of inventory.byFile.values()) {
+    for (const info of fileEntries) {
+      const opening = info.opening;
+      if (!MorphNode.isJsxOpeningElement(opening) && !MorphNode.isJsxSelfClosingElement(opening)) {
+        continue;
+      }
+      const tagNode = opening.getTagNameNode();
+      const childDeclarations = tagNode
+        ? resolveIdentifierDeclarations(tagNode)
+        : [];
+      const childId = childDeclarations
+        .map((decl) => componentByDeclaration.get(decl.getStart()))
+        .find((id): id is string => id !== undefined)
+        ?? componentByName.get(tagNode?.getText() ?? "");
+      if (!childId || childId === info.componentId) continue;
+
+      const parentResolver = resolvers.get(info.componentId);
+      if (!parentResolver) continue;
+      for (const attr of opening.getAttributes()) {
+        if (!MorphNode.isJsxAttribute(attr)) continue;
+        const propName = attr.getNameNode().getText();
+        if (!EVENT_ATTR_PATTERN.test(propName)) continue;
+        const initializer = attr.getInitializer();
+        if (!initializer || !MorphNode.isJsxExpression(initializer)) continue;
+        const expression = initializer.getExpression();
+        if (!expression) continue;
+
+        const hits: NameHit[] = [];
+        if (MorphNode.isIdentifier(expression)) {
+          // 只有父子组件使用同名事件 prop 时才回溯：`onSubmit={onSubmit}`。
+          // 名称不同（如 `onClick={onSelect}`）可能只是 props 转发，
+          // 在没有完整别名数据流时保持 injected，避免误连。
+          if (propName !== expression.getText()) continue;
+          const local = parentResolver.byName(expression.getText());
+          if (local) hits.push(local);
+          else {
+            const identity = parentResolver.bySymbol(expression);
+            if (identity) hits.push({ id: identity.id, kind: "fn", isSetter: false });
+          }
+        } else if (MorphNode.isArrowFunction(expression) || MorphNode.isFunctionExpression(expression)) {
+          const effects = collectInlineEffects(expression, parentResolver);
+          for (const write of effects.writes) hits.push({ id: write, kind: "state", isSetter: true });
+          for (const call of effects.calls) hits.push({ id: call.id, kind: call.kind, isSetter: false });
+        }
+        const unique = [...new Map(hits.map((hit) => [hit.id, hit])).values()];
+        const only = unique[0];
+        if (only && unique.length === 1) {
+          const key = `${childId}:${propName}`;
+          const existing = propTargets.get(key) ?? [];
+          if (!existing.some((hit) => hit.id === only.id)) existing.push(only);
+          propTargets.set(key, existing);
+        }
+      }
+    }
   }
 
   for (const fileEntries of inventory.byFile.values()) {
