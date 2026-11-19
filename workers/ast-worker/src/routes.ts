@@ -175,6 +175,68 @@ function literalString(node: Node | null): string | null {
   return null;
 }
 
+/** 解析简单路径常量和 `paths.users.getHref()` 工厂调用。 */
+function staticPathString(node: Node | null, depth = 0): string | null {
+  if (!node || depth > 8) return null;
+  let current = node;
+  while (MorphNode.isParenthesizedExpression(current) || MorphNode.isAsExpression(current) || MorphNode.isSatisfiesExpression(current)) {
+    current = current.getExpression();
+  }
+  const literal = literalString(current);
+  if (literal !== null) return literal;
+  if (MorphNode.isTemplateExpression(current)) {
+    let text = current.getHead().getLiteralText();
+    for (const span of current.getTemplateSpans()) {
+      const value = staticPathString(span.getExpression(), depth + 1);
+      if (value === null) return null;
+      text += value + span.getLiteral().getLiteralText();
+    }
+    return text;
+  }
+  if (MorphNode.isBinaryExpression(current) && current.getOperatorToken().getKind() === SyntaxKind.PlusToken) {
+    const left = staticPathString(current.getLeft(), depth + 1);
+    const right = staticPathString(current.getRight(), depth + 1);
+    return left !== null && right !== null ? left + right : null;
+  }
+  if (MorphNode.isCallExpression(current) && MorphNode.isPropertyAccessExpression(current.getExpression())) {
+    const callee = current.getExpression();
+    if (!callee.getText().endsWith(".getHref")) return null;
+    let symbol = callee.getSymbol();
+    if (symbol?.isAlias()) {
+      try { symbol = symbol.getAliasedSymbol(); } catch { return null; }
+    }
+    for (const declaration of symbol?.getDeclarations() ?? []) {
+      let fn: Node | null = null;
+      if (MorphNode.isPropertyAssignment(declaration)) fn = declaration.getInitializer() ?? null;
+      else if (MorphNode.isMethodDeclaration(declaration)) fn = declaration;
+      if (!fn || (!MorphNode.isArrowFunction(fn) && !MorphNode.isFunctionExpression(fn) && !MorphNode.isMethodDeclaration(fn))) continue;
+      const body = fn.getBody();
+      if (!body) continue;
+      if (!MorphNode.isBlock(body)) return staticPathString(body, depth + 1);
+      const statement = body.getStatements().find((item) => MorphNode.isReturnStatement(item));
+      if (statement && MorphNode.isReturnStatement(statement)) {
+        const expression = statement.getExpression();
+        if (expression) return staticPathString(expression, depth + 1);
+      }
+    }
+    return null;
+  }
+  if (MorphNode.isPropertyAccessExpression(current)) {
+    let symbol = current.getSymbol();
+    if (symbol?.isAlias()) {
+      try { symbol = symbol.getAliasedSymbol(); } catch { return null; }
+    }
+    for (const declaration of symbol?.getDeclarations() ?? []) {
+      if (MorphNode.isVariableDeclaration(declaration) || MorphNode.isPropertyAssignment(declaration)) {
+        const initializer = declaration.getInitializer();
+        const value = staticPathString(initializer ?? null, depth + 1);
+        if (value !== null) return value;
+      }
+    }
+  }
+  return null;
+}
+
 /**
  * 从一个「指向页面的表达式」解析出组件 id。
  *
@@ -604,7 +666,7 @@ function walkRouteObjects(
 
     let pathLiteral: string | null = null;
     if (MorphNode.isPropertyAssignment(pathProp)) {
-      pathLiteral = literalString(pathProp.getInitializer() ?? null);
+      pathLiteral = staticPathString(pathProp.getInitializer() ?? null);
     }
 
     if (pathLiteral === null && !isIndex) {
@@ -767,7 +829,7 @@ function walkRouteElements(
 
     let pathLiteral: string | null = null;
     if (pathAttr !== undefined) {
-      pathLiteral = literalString(attributeValueNode(pathAttr));
+      pathLiteral = staticPathString(attributeValueNode(pathAttr));
     }
 
     if (pathLiteral === null && !isIndex) {

@@ -22,6 +22,10 @@ export interface WorkerRequest {
   changedFiles?: string[];
   /** 项目类型，决定路由与 RSC 语义 */
   framework?: "react" | "next";
+  /** 可选源码目录与生产代码排除策略。 */
+  sourceRoots?: string[];
+  excludeTests?: boolean;
+  excludeStorybook?: boolean;
 }
 
 /** Worker 成功响应。 */

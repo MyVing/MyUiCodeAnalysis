@@ -17,13 +17,28 @@ from __future__ import annotations
 from dataclasses import dataclass
 from datetime import UTC, datetime
 
-from app.contracts import IRGraph, RequirementMap
-from app.contracts.requirement import Feature, Match, Source, Subgraph, SubgraphCounts
+from app.contracts import EdgeKind, IRGraph, NodeKind, RequirementMap
+from app.contracts.requirement import (
+    Candidate,
+    Feature,
+    Match,
+    Signal,
+    SignalKind,
+    Source,
+    Subgraph,
+    SubgraphCounts,
+)
 from app.core.config import Settings
 from app.requirement.features import decompose
 from app.requirement.judge import parse_json
 from app.requirement.llm import LLMClient
-from app.requirement.recall import CandidateDetail, recall
+from app.requirement.recall import (
+    CandidateDetail,
+    collect_page_evidences,
+    page_nodes,
+    recall,
+    route_target_pages,
+)
 from app.schemas import Project, SpecDocTask
 from app.specdoc.orchestrator import SpecDocOrchestrator
 from app.specdoc.render import render_markdown
@@ -47,9 +62,9 @@ _NO_MATCH_REPLY = (
     "带上页面名称、界面文案或接口地址（如 GET /api/xxx）会更容易命中；"
     "也可以在「需求定位」里提交完整需求查看完整候选。"
 )
-_NO_GRAPH_REPLY = (
-    "当前项目还没有可用的代码解析产物。请先在项目里完成一次代码分析"
-    "（并确保分析成功），之后我就能基于真实代码回答交互视图与逻辑的问题了。"
+_NO_ROUTE_REPLY = (
+    "图中没有找到路由「{route}」。请确认路由填写的是代码中的实际路径，"
+    "并确保项目已完成最新一次代码分析。"
 )
 
 
@@ -89,6 +104,70 @@ async def decide_intent(llm: LLMClient, messages: list[dict[str, str]]) -> _Inte
     )
 
 
+def locate_route_feature(graph: IRGraph, route_path: str) -> CandidateDetail | None:
+    """按图中的 route 节点精确定位页面，不经过词表或模型。"""
+    route = _normalize_route(route_path)
+    nodes = {node.id: node for node in graph.nodes}
+    pages, _route_by_page, _layout_ids = page_nodes(graph)
+    page_ids = {page.id for page in pages}
+    route_nodes = [
+        node
+        for node in graph.nodes
+        if node.kind is NodeKind.route and _normalize_route(node.name) == route
+    ]
+    if not route_nodes:
+        return None
+    targets = route_target_pages(graph, nodes)
+    page_ids_for_route = [
+        page_id for node in route_nodes for page_id in targets.get(node.id, [])
+    ]
+    page_ids_for_route = list(
+        dict.fromkeys(page_id for page_id in page_ids_for_route if page_id in page_ids)
+    )
+    if not page_ids_for_route:
+        return None
+    page = nodes.get(page_ids_for_route[0])
+    if page is None:
+        return None
+    evidence = collect_page_evidences(graph, [page], set()).get(page.id, [])
+    route_node = route_nodes[0]
+    candidate = Candidate(
+        nodeId=page.id,
+        routeId=route_node.id,
+        name=page.name,
+        file=page.file,
+        score=1.0,
+        signals=[Signal(kind=SignalKind.routePath, value=route, score=1.0)],
+        anchorNodeIds=[page.id, route_node.id],
+        anchorEdgeIds=[
+            edge.id
+            for edge in graph.edges
+            if edge.kind is EdgeKind.renders
+            and edge.from_ == route_node.id
+            and edge.to == page.id
+        ]
+        or None,
+    )
+    return CandidateDetail(
+        candidate=candidate,
+        ui_texts=[item.text for item in evidence if item.kind is SignalKind.uiText],
+        prop_names=[item.text for item in evidence if item.kind is SignalKind.propName],
+        prop_descriptions=[
+            item.text for item in evidence if item.kind is SignalKind.propDescription
+        ],
+        api_urls=[item.text for item in evidence if item.kind is SignalKind.apiUrl],
+        quote_corpus=[item.text for item in evidence],
+        evidence=evidence,
+    )
+
+
+def _normalize_route(value: str) -> str:
+    route = value.strip().replace("\\\\", "/")
+    if not route.startswith("/"):
+        route = "/" + route
+    return route.rstrip("/") or "/" if route != "/" else "/"
+
+
 def locate_feature(
     graph: IRGraph, feature_text: str, top_k: int = 3
 ) -> CandidateDetail | None:
@@ -108,10 +187,17 @@ async def build_chat_doc(
     graph: IRGraph,
     llm: LLMClient,
     settings: Settings,
+    *,
+    route_path: str | None = None,
+    fallback_text: str | None = None,
 ) -> ChatDocOutcome:
-    """定位 + 装配 + 渲染。对话产物即时返回、不落库。"""
-    best = locate_feature(graph, feature_text)
+    """定位 + 装配 + 渲染。路由直达优先，旧流程支持原文回退。"""
+    best = locate_route_feature(graph, route_path) if route_path else locate_feature(graph, feature_text)
+    if best is None and fallback_text and not route_path:
+        best = locate_feature(graph, fallback_text)
     if best is None:
+        if route_path:
+            return ChatDocOutcome(reply=_NO_ROUTE_REPLY.format(route=_normalize_route(route_path)))
         return ChatDocOutcome(reply=_NO_MATCH_REPLY)
 
     requirement_map = _synthetic_requirement_map(project, best, feature_text, graph)

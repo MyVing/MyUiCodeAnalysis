@@ -108,7 +108,21 @@ class AnalysisService:
             return
 
         if outcome.ok and outcome.graph is not None:
-            await self._repository.save_graph(project.id, outcome.graph)
+            try:
+                await self._repository.save_graph(project.id, outcome.graph)
+            except Exception as error:  # noqa: BLE001 - 持久化失败必须落任务状态
+                logger.exception("分析产物落库失败：%s", task.id)
+                await self._repository.update_task(
+                    task.model_copy(
+                        update={
+                            "status": "failed",
+                            "finished_at": datetime.now(UTC),
+                            "error_code": "graph_persistence_failed",
+                            "error_message": str(error),
+                        }
+                    )
+                )
+                return
             await self._repository.update_task(
                 task.model_copy(
                     update={

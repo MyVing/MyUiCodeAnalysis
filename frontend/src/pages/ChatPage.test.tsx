@@ -86,6 +86,19 @@ describe("ChatPage", () => {
     deleteChatSession.mockReset().mockResolvedValue(undefined);
   });
 
+  it("填写路由后按路由参数发送，消息内容不被污染", async () => {
+    chatRequirement.mockResolvedValueOnce({ reply: "已定位到 Register" });
+    renderChat();
+    await userEvent.type(screen.getByTestId("chat-route-input"), "/register");
+    await sendMessage("前端交互视图");
+
+    await waitFor(() => expect(chatRequirement).toHaveBeenCalledTimes(1));
+    expect(chatRequirement.mock.calls[0]?.[1]).toEqual({
+      messages: [{ role: "user", content: "前端交互视图" }],
+      routePath: "/register",
+    });
+  });
+
   it("发送消息后展示用户与 AI 消息，历史全量回传", async () => {
     chatRequirement.mockResolvedValueOnce({
       reply: "筛选什么字段？",
@@ -103,6 +116,7 @@ describe("ChatPage", () => {
     });
     expect(screen.queryByTestId("chat-pending")).not.toBeInTheDocument();
   });
+
 
   it("回复成功后整段会话落库，历史列表刷新", async () => {
     chatRequirement.mockResolvedValueOnce({

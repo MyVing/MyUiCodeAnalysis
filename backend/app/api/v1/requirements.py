@@ -111,7 +111,10 @@ async def requirement_chat(
     messages = [{"role": item.role, "content": item.content} for item in payload.messages]
     try:
         reply, draft, doc_markdown, doc_page = await chat_service.chat(
-            messages, project=project, graph=graph
+            messages,
+            project=project,
+            graph=graph,
+            route_path=payload.route_path,
         )
     except RequirementChatPreconditionError as error:
         raise HTTPException(

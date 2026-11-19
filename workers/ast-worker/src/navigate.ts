@@ -340,10 +340,71 @@ function readConstantString(node: Node, depth: number): NavigationTarget | null 
   return null;
 }
 
+/**
+ * 读取简单路径工厂的返回值，例如 `paths.users.getHref()`。
+ * 只追踪对象属性上的无副作用箭头/函数返回值，不执行任意代码。
+ */
+function readPathFactoryCall(call: Node, depth: number): NavigationTarget | null {
+  if (depth > MAX_CONSTANT_DEPTH || !MorphNode.isCallExpression(call)) return null;
+  const callee = call.getExpression();
+  if (!MorphNode.isPropertyAccessExpression(callee)) return null;
+  const declarations = resolveAliasedSymbol(callee)?.getDeclarations() ?? [];
+  for (const declaration of declarations) {
+    let body: Node | undefined;
+    let parameters: readonly Node[] = [];
+    if (MorphNode.isPropertyAssignment(declaration)) {
+      const initializer = declaration.getInitializer();
+      if (initializer && (MorphNode.isArrowFunction(initializer) || MorphNode.isFunctionExpression(initializer))) {
+        parameters = initializer.getParameters();
+        body = initializer.getBody();
+      }
+    } else if (MorphNode.isMethodDeclaration(declaration)) {
+      parameters = declaration.getParameters();
+      body = declaration.getBody();
+    }
+    if (!body) continue;
+    let returnExpression: Node | undefined;
+    if (MorphNode.isBlock(body)) {
+      const returnStatement = body.getStatements().find((statement) => MorphNode.isReturnStatement(statement));
+      returnExpression = returnStatement && MorphNode.isReturnStatement(returnStatement)
+        ? returnStatement.getExpression() ?? undefined
+        : undefined;
+    } else {
+      returnExpression = body;
+    }
+    if (!returnExpression) continue;
+    if (MorphNode.isTemplateExpression(returnExpression)) {
+      let text = returnExpression.getHead().getLiteralText();
+      for (const span of returnExpression.getTemplateSpans()) {
+        const expression = span.getExpression();
+        const index = parameters.findIndex((parameter) => parameter.getText().replace(/:.*/, "").trim() === expression.getText());
+        const argument = index >= 0 ? call.getArguments()[index] : null;
+        const value = argument ? readStaticString(argument, depth + 1) : null;
+        text += value ?? PLACEHOLDER;
+        text += span.getLiteral().getLiteralText();
+      }
+      return readTargetPathFromText(text);
+    }
+    return readTargetPath(returnExpression, depth + 1);
+  }
+  return null;
+}
+
+function readTargetPathFromText(text: string): NavigationTarget | null {
+  if ((text.split(/[?#]/)[0] ?? text).length === 0) return null;
+  const segments = toSegments(text);
+  return segments.length > 0 || text === "/" ? { segments, pattern: text.includes(PLACEHOLDER) } : null;
+}
+
 function readTargetPath(node: Node | null, depth = 0): NavigationTarget | null {
   if (!node || depth > MAX_CONSTANT_DEPTH) return null;
 
   const current = unwrapStaticExpression(node);
+
+  if (MorphNode.isCallExpression(current)) {
+    const factoryTarget = readPathFactoryCall(current, depth + 1);
+    if (factoryTarget) return factoryTarget;
+  }
 
   // `to={{ pathname: "/users/1", search: "?a=1" }}`
   if (MorphNode.isObjectLiteralExpression(current)) {

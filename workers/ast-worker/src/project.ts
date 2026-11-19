@@ -112,6 +112,14 @@ function ensureAllowJs(project: Project, configLabel: string, configDiagnostics:
   );
 }
 
+export interface ProjectScanOptions {
+  /** 相对 rootPath 的源码目录；缺省时扫描整个项目。 */
+  sourceRoots?: readonly string[];
+  /** 是否排除测试/Storybook 文件，默认保留旧行为。 */
+  excludeTests?: boolean;
+  excludeStorybook?: boolean;
+}
+
 /** 全量分析的构建结果。告警随 Project 一起返回，由入口并入 IRGraph。 */
 export interface FullProjectResult {
   project: Project;
@@ -356,12 +364,12 @@ function loadConfigCandidates(rootPath: string): {
 }
 
 /** glob 兜底：没有可用 tsconfig 时仍要尽力扫出源文件。 */
-function createGlobProject(rootPath: string, warnings: Warning[]): FullProjectResult {
+function createGlobProject(rootPath: string, warnings: Warning[], options: ProjectScanOptions = {}): FullProjectResult {
   const project = new Project({
     skipAddingFilesFromTsConfig: true,
     compilerOptions: { ...FALLBACK_COMPILER_OPTIONS },
   });
-  project.addSourceFilesAtPaths(sourceGlobs(rootPath));
+  project.addSourceFilesAtPaths(sourceGlobs(rootPath, options));
 
   if (project.getSourceFiles().length === 0) {
     warnings.push(
@@ -375,12 +383,20 @@ function createGlobProject(rootPath: string, warnings: Warning[]): FullProjectRe
 }
 
 /** 全量与兜底路径共用的源码 glob，保证两条路径扫描范围一致。 */
-function sourceGlobs(rootPath: string): string[] {
+function sourceGlobs(rootPath: string, options: ProjectScanOptions = {}): string[] {
   const root = rootPath.replace(/\\/g, "/").replace(/\/$/, "");
-  return [
-    `${root}/**/*.{ts,tsx,js,jsx}`,
-    ...EXCLUDED_DIRS.map((dir) => `!${root}/**/${dir}/**`),
-  ];
+  const roots = options.sourceRoots?.length
+    ? options.sourceRoots.map((sourceRoot) => `${root}/${sourceRoot.replace(/\\/g, "/").replace(/^\//, "").replace(/\/$/, "")}`)
+    : [root];
+  const globs = roots.map((sourceRoot) => `${sourceRoot}/**/*.{ts,tsx,js,jsx}`);
+  const excluded = [...EXCLUDED_DIRS].map((dir) => `!${root}/**/${dir}/**`);
+  if (options.excludeTests) {
+    excluded.push(`!${root}/**/__tests__/**`, `!${root}/**/*.test.*`, `!${root}/**/*.spec.*`);
+  }
+  if (options.excludeStorybook) {
+    excluded.push(`!${root}/**/*.stories.*`, `!${root}/**/storybook/**`);
+  }
+  return [...globs, ...excluded];
 }
 
 /**
@@ -390,7 +406,7 @@ function sourceGlobs(rootPath: string): string[] {
  * workspace 包的唯一可靠来源，禁止退化为按名称匹配。solution-style 配置
  * 会改用 references 里装载源文件最多的子配置。
  */
-export function createFullProject(rootPath: string): FullProjectResult {
+export function createFullProject(rootPath: string, options: ProjectScanOptions = {}): FullProjectResult {
   const warnings: Warning[] = [];
   const rootConfigPath = path.join(rootPath, "tsconfig.json");
 
@@ -405,7 +421,7 @@ export function createFullProject(rootPath: string): FullProjectResult {
           "未找到 tsconfig.json（含子目录），路径别名（paths）无法解析，跨目录别名 import 将被记为未解析；组件发现仍按相对路径工作。",
         ),
       );
-      return createGlobProject(rootPath, warnings);
+      return createGlobProject(rootPath, warnings, options);
     }
 
     const { chosen, candidates, scannedCount } = discoverNestedConfig(rootPath, scan);
@@ -416,7 +432,7 @@ export function createFullProject(rootPath: string): FullProjectResult {
           `发现 ${candidates.length} 份子目录 tsconfig，但没有任何一份装载到已扫描的源文件（候选：${describeNestedCandidates(rootPath, candidates)}）；已退化为目录扫描。`,
         ),
       );
-      return createGlobProject(rootPath, warnings);
+      return createGlobProject(rootPath, warnings, options);
     }
 
     const chosenPath = relativePath(rootPath, chosen.configPath);
@@ -460,7 +476,7 @@ export function createFullProject(rootPath: string): FullProjectResult {
           `子目录配置装载失败（${chosenPath}）：${detail}；已退化为目录扫描，别名解析不可用。`,
         ),
       );
-      return createGlobProject(rootPath, warnings);
+      return createGlobProject(rootPath, warnings, options);
     }
 
     if (nestedProject.getSourceFiles().length === 0) {
@@ -470,7 +486,7 @@ export function createFullProject(rootPath: string): FullProjectResult {
           `子目录配置 ${chosenPath} 装载后没有任何可分析源文件，已退化为目录扫描。`,
         ),
       );
-      return createGlobProject(rootPath, warnings);
+      return createGlobProject(rootPath, warnings, options);
     }
 
     // 嵌套配置常见于「外壳仓库 + website 子项目」，其 tsconfig 往往 extends

@@ -57,6 +57,15 @@ class Settings(BaseSettings):
     # MySQL 8 空闲 8 小时会断连；recycle + pre_ping 双保险防 "server has gone away"
     db_pool_recycle_seconds: int = 1800
     db_echo: bool = False
+    # 图产物容量保护：超过 legacy 阈值的 JSON 自动写入 graph_revisions/chunks。
+    # 阈值按 UTF-8 字节计，必须低于数据库 max_allowed_packet 并留出协议开销。
+    graph_legacy_max_bytes: int = 4 * 1024 * 1024
+    graph_chunk_bytes: int = 512 * 1024
+    graph_max_bytes: int = 512 * 1024 * 1024
+    graph_chunked_enabled: bool = True
+    graph_chunked_read_enabled: bool = True
+    graph_legacy_fallback_enabled: bool = True
+    graph_writing_ttl_seconds: int = 3600
 
     # 需求定位的模型接入。
     # 默认关闭：关闭时接口仍可用，但只能 dry-run（只跑确定性召回，不调模型），

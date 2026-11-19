@@ -24,7 +24,7 @@ import { analyzeHooks } from "./hooks.js";
 import { buildGraph } from "./ir-builder.js";
 import { buildJsxInventory } from "./jsx-inventory.js";
 import { analyzeNavigation } from "./navigate.js";
-import { createFullProject, createIncrementalProject } from "./project.js";
+import { createFullProject, createIncrementalProject, type ProjectScanOptions } from "./project.js";
 import { analyzeProps } from "./props.js";
 import type { WorkerRequest, WorkerResponse } from "./protocol.js";
 import { analyzeRenders } from "./renders.js";
@@ -65,12 +65,18 @@ async function analyze(request: WorkerRequest): Promise<WorkerResponse> {
 
   const warnings: Warning[] = [];
 
+  const scanOptions: ProjectScanOptions = {
+    ...(request.sourceRoots ? { sourceRoots: request.sourceRoots } : {}),
+    ...(request.excludeTests !== undefined ? { excludeTests: request.excludeTests } : {}),
+    ...(request.excludeStorybook !== undefined ? { excludeStorybook: request.excludeStorybook } : {}),
+  };
+
   let project;
   if (isIncremental) {
     project = createIncrementalProject(rootPath, changedFiles);
     log(`增量模式：${project.getSourceFiles().length} 个源文件（${changedFiles.length} 个变更）`);
   } else {
-    const full = createFullProject(rootPath);
+    const full = createFullProject(rootPath, scanOptions);
     project = full.project;
     // 配置层的缺口（无 tsconfig / solution-style 换配置 / 扫描不到源文件）
     // 由 project.ts 判定并随结果返回，入口只负责并入告警

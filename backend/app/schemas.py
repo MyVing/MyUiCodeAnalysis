@@ -215,13 +215,23 @@ class ChatMessage(ApiModel):
 
 
 class RequirementChatStart(ApiModel):
-    """一次需求对话的输入：全量历史 + 可选的首条草稿上下文。
+    """一次需求对话的输入：全量历史 + 可选的路由直达定位。
 
     上限 40 条：防止单请求被塞入超长会话烧掉模型预算——真聊到 40 条
     说明该提炼草稿了，前端应该在那时点「填入输入框」。
     """
 
     messages: list[ChatMessage] = Field(min_length=1, max_length=40)
+    # 填写后按代码图中的 route 精确定位，绕过意图改写与词法召回。
+    route_path: str | None = Field(default=None, max_length=512)
+
+    @field_validator("route_path")
+    @classmethod
+    def strip_route_path(cls, value: str | None) -> str | None:
+        if value is None:
+            return None
+        stripped = value.strip()
+        return stripped or None
 
 
 class RequirementChatResult(ApiModel):

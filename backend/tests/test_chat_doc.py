@@ -11,7 +11,7 @@ from app.api.deps import get_analysis_repository, get_llm_client
 from app.contracts.requirement import Candidate, Signal, SignalKind
 from app.core.config import Settings
 from app.requirement.chat import RequirementChatService
-from app.requirement.chat_doc import _synthetic_requirement_map
+from app.requirement.chat_doc import _synthetic_requirement_map, locate_route_feature
 from app.requirement.recall import CandidateDetail
 from app.schemas import Project
 from tests.conftest import settings_with
@@ -100,7 +100,63 @@ async def test_doc_query_locates_page_and_returns_markdown() -> None:
     assert len(llm.calls) == 3
 
 
-async def test_clarify_intent_keeps_draft_flow() -> None:
+async def test_route_path_locates_page_without_intent_rewrite() -> None:
+    """显式路由不依赖模型 featureText 或词表即可定位页面。"""
+    llm = FakeLLMClient([
+        json.dumps(_VALID_STEPS),
+        json.dumps(_VALID_RULES),
+        json.dumps(_VALID_MAPPINGS),
+    ])
+    best = locate_route_feature(spec_graph(), "/transfer/")
+    assert best is not None
+    assert best.candidate.name == "Transfer"
+    reply, draft, doc_markdown, doc_page = await _service(llm).chat(
+        [{"role": "user", "content": "请查看这个页面"}],
+        project=_PROJECT,
+        graph=spec_graph(),
+        route_path=" /transfer/ ",
+    )
+    assert draft is None
+    assert doc_page == "Transfer"
+    assert doc_markdown is not None
+    assert "已定位到页面" in reply
+    assert len(llm.message_calls) == 0
+    assert len(llm.calls) == 3
+
+
+async def test_route_path_not_found_has_route_guidance() -> None:
+    llm = FakeLLMClient([])
+    reply, draft, doc_markdown, doc_page = await _service(llm).chat(
+        [{"role": "user", "content": "请查看这个页面"}],
+        project=_PROJECT,
+        graph=spec_graph(),
+        route_path="/missing",
+    )
+    assert "没有找到路由" in reply
+    assert draft is None and doc_markdown is None and doc_page is None
+    assert len(llm.message_calls) == 0
+
+
+async def test_raw_query_fallback_preserves_explicit_route_anchor() -> None:
+    """模型把路由改写成中文时，原始用户消息仍可作为召回兜底。"""
+    llm = FakeLLMClient(
+        [
+            json.dumps({"intent": "doc_query", "featureText": "转账页面"}),
+            json.dumps(_VALID_STEPS),
+            json.dumps(_VALID_RULES),
+            json.dumps(_VALID_MAPPINGS),
+        ]
+    )
+    reply, _draft, markdown, page = await _service(llm).chat(
+        [{"role": "user", "content": "/transfer 的前端交互视图"}],
+        project=_PROJECT,
+        graph=spec_graph(),
+    )
+    assert page == "Transfer"
+    assert markdown is not None
+    assert "已定位到页面" in reply
+
+
     """澄清类消息不走文档生成：单次模型调用，草稿照常返回。"""
     llm = FakeLLMClient(
         [

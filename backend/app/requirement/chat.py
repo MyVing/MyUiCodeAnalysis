@@ -54,6 +54,7 @@ class RequirementChatService:
         *,
         project: Project | None = None,
         graph: IRGraph | None = None,
+        route_path: str | None = None,
     ) -> tuple[str, str | None, str | None, str | None]:
         """返回 (reply, draft_requirement, doc_markdown, doc_page)。
 
@@ -67,10 +68,29 @@ class RequirementChatService:
                 "模型未启用：需要配置 llm_enabled 与 llm_api_key 后才能使用 AI 对话",
             )
         if graph is not None and project is not None and self._settings is not None:
+            latest_user_text = next(
+                (item["content"] for item in reversed(messages) if item["role"] == "user"),
+                "",
+            )
+            if route_path:
+                outcome = await build_chat_doc(
+                    project,
+                    latest_user_text or route_path,
+                    graph,
+                    self._llm,
+                    self._settings,
+                    route_path=route_path,
+                )
+                return outcome.reply, None, outcome.doc_markdown, outcome.page_name
             intent = await decide_intent(self._llm, messages)
             if intent.intent == "doc_query" and intent.feature_text:
                 outcome = await build_chat_doc(
-                    project, intent.feature_text, graph, self._llm, self._settings
+                    project,
+                    intent.feature_text,
+                    graph,
+                    self._llm,
+                    self._settings,
+                    fallback_text=latest_user_text,
                 )
                 return outcome.reply, None, outcome.doc_markdown, outcome.page_name
         content = await self._llm.chat_messages(

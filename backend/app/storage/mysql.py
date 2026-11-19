@@ -12,6 +12,7 @@
 - 不做内存实现那种「每项目 5 张图」的有界淘汰：持久化的意义就是保留历史。
 """
 
+import hashlib
 import json
 import logging
 from datetime import UTC, datetime
@@ -94,8 +95,46 @@ DDL_STATEMENTS: tuple[str, ...] = (
       kind VARCHAR(8) NOT NULL DEFAULT 'static',
       payload JSON NOT NULL,
       created_at DATETIME(6) NOT NULL,
+      updated_at DATETIME(6) NOT NULL,
       CONSTRAINT uq_graph_version UNIQUE (project_id, analysis_id, kind),
-      KEY idx_graph_latest (project_id, id)
+      KEY idx_graph_latest (project_id, updated_at, id)
+    ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4
+    """,
+    """
+    CREATE TABLE IF NOT EXISTS graph_revisions (
+      revision_id BIGINT AUTO_INCREMENT PRIMARY KEY,
+      project_id VARCHAR(32) NOT NULL,
+      analysis_id VARCHAR(32) NOT NULL,
+      kind VARCHAR(8) NOT NULL,
+      state ENUM('writing','published','failed') NOT NULL,
+      schema_version VARCHAR(16) NOT NULL,
+      payload_bytes BIGINT NOT NULL,
+      payload_sha256 CHAR(64) NOT NULL,
+      node_count INT NOT NULL,
+      edge_count INT NOT NULL,
+      chunk_count INT NOT NULL,
+      created_at DATETIME(6) NOT NULL,
+      updated_at DATETIME(6) NOT NULL,
+      published_at DATETIME(6) NULL,
+      error_code VARCHAR(64) NULL,
+      error_message TEXT NULL,
+      CONSTRAINT uq_graph_revision_version UNIQUE (project_id, analysis_id, kind),
+      CONSTRAINT fk_graph_revisions_project FOREIGN KEY (project_id)
+        REFERENCES projects(id) ON DELETE CASCADE,
+      KEY idx_graph_revisions_latest (project_id, state, published_at, revision_id)
+    ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4
+    """,
+    """
+    CREATE TABLE IF NOT EXISTS graph_revision_chunks (
+      revision_id BIGINT NOT NULL,
+      chunk_no INT NOT NULL,
+      data LONGTEXT NOT NULL,
+      byte_length INT NOT NULL,
+      chunk_sha256 CHAR(64) NOT NULL,
+      created_at DATETIME(6) NOT NULL,
+      PRIMARY KEY (revision_id, chunk_no),
+      CONSTRAINT fk_graph_revision_chunks_revision FOREIGN KEY (revision_id)
+        REFERENCES graph_revisions(revision_id) ON DELETE CASCADE
     ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4
     """,
     """
@@ -282,15 +321,46 @@ _PROJECT_COLUMNS: dict[str, str] = {
     "last_synced_at": "DATETIME(6) NULL",
 }
 _REMOTE_INDEX = "uq_projects_remote"
+_GRAPH_INDEX = "idx_graph_latest_v2"
+
+
+def _graph_payload(graph: IRGraph) -> tuple[str, bytes, str]:
+    """序列化图并计算稳定摘要，所有大小均按 UTF-8 字节计。"""
+    payload = graph.model_dump_json(exclude_none=True)
+    payload_bytes = payload.encode("utf-8")
+    digest = hashlib.sha256(payload_bytes).hexdigest()
+    return payload, payload_bytes, digest
+
+
+class GraphStorageError(RuntimeError):
+    """图产物已写入但无法通过完整性校验。"""
 
 
 def _is_duplicate_key(error: IntegrityError) -> bool:
-    # pymysql 的 ER_DUP_ENTRY = 1062；外键等其他完整性违规必须如实抛出，
-    # 否则「项目不存在导致的 FK 失败」会被误判成并发冲突而静默丢任务。
+    # pymysql 的 ER_DUP_ENTRY = 1062；外键等其他完整性违规必须如实抛出。
     args = getattr(getattr(error, "orig", None), "args", None)
     if not args:
         return False
     return int(args[0]) == 1062
+
+
+def _split_utf8(payload: bytes, chunk_size: int) -> list[bytes]:
+    """按 UTF-8 字符边界切分，避免把多字节字符拆到两个 chunk。"""
+    chunks: list[bytes] = []
+    start = 0
+    while start < len(payload):
+        end = min(start + chunk_size, len(payload))
+        while end > start:
+            try:
+                payload[start:end].decode("utf-8")
+                break
+            except UnicodeDecodeError:
+                end -= 1
+        if end == start:
+            raise GraphStorageError("chunk 大小不足以容纳一个 UTF-8 字符")
+        chunks.append(payload[start:end])
+        start = end
+    return chunks
 
 
 def _to_db(value: datetime) -> datetime:
@@ -353,12 +423,64 @@ async def _ensure_project_columns(conn: Any) -> None:
         logger.info("projects 表补充唯一索引 %s", _REMOTE_INDEX)
 
 
+async def _ensure_graph_schema(conn: Any) -> None:
+    """补齐旧 graphs 表的更新时间列和可用于 latest 查询的索引。"""
+    columns = (
+        await conn.execute(
+            text(
+                """
+                SELECT COLUMN_NAME FROM information_schema.COLUMNS
+                WHERE TABLE_SCHEMA = DATABASE() AND TABLE_NAME = 'graphs'
+                """
+            )
+        )
+    ).all()
+    existing_columns = {str(row[0]) for row in columns}
+    if "updated_at" not in existing_columns:
+        await conn.execute(text("ALTER TABLE graphs ADD COLUMN updated_at DATETIME(6) NULL"))
+        await conn.execute(
+            text("UPDATE graphs SET updated_at = created_at WHERE updated_at IS NULL")
+        )
+        logger.info("graphs 表补充列 updated_at")
+
+    index_rows = (
+        await conn.execute(
+            text(
+                """
+                SELECT INDEX_NAME, SEQ_IN_INDEX, COLUMN_NAME
+                FROM information_schema.STATISTICS
+                WHERE TABLE_SCHEMA = DATABASE() AND TABLE_NAME = 'graphs'
+                  AND INDEX_NAME = :name
+                ORDER BY SEQ_IN_INDEX
+                """
+            ),
+            {"name": _GRAPH_INDEX},
+        )
+    ).all()
+    index_columns = [str(row[2]) for row in index_rows]
+    if index_columns != ["project_id", "updated_at", "id"]:
+        if index_rows:
+            # 索引名存在但列顺序错误时，不能继续 FORCE INDEX：否则仍可能
+            # 触发 filesort，甚至把错误的历史索引当成修复已完成。
+            await conn.execute(text(f"ALTER TABLE graphs DROP INDEX {_GRAPH_INDEX}"))
+            logger.warning(
+                "graphs 表索引 %s 列顺序异常：%s；已删除并重建",
+                _GRAPH_INDEX,
+                index_columns,
+            )
+        await conn.execute(
+            text(f"ALTER TABLE graphs ADD KEY {_GRAPH_INDEX} (project_id, updated_at, id)")
+        )
+        logger.info("graphs 表补充索引 %s", _GRAPH_INDEX)
+
+
 async def init_schema(engine: AsyncEngine) -> None:
-    """幂等建表；单写入方（单进程编排）下 CREATE TABLE IF NOT EXISTS 足够。"""
+    """幂等建表，并补齐历史库缺少的图索引与列。"""
     async with engine.begin() as conn:
         for statement in DDL_STATEMENTS:
             await conn.execute(text(statement))
         await _ensure_project_columns(conn)
+        await _ensure_graph_schema(conn)
 
 
 async def run_boot_recovery(engine: AsyncEngine) -> int:
@@ -497,8 +619,9 @@ class MySqlProjectRepository:
 
 
 class MySqlAnalysisRepository:
-    def __init__(self, engine: AsyncEngine) -> None:
+    def __init__(self, engine: AsyncEngine, settings: Settings | None = None) -> None:
         self._engine = engine
+        self._settings = settings or Settings()
 
     def _task(self, row: Row[Any]) -> AnalysisTask:
         return AnalysisTask(
@@ -601,14 +724,37 @@ class MySqlAnalysisRepository:
         return [self._task(row) for row in rows]
 
     async def save_graph(self, project_id: str, graph: IRGraph) -> None:
+        await self._save_graph(project_id, graph, "static")
+
+    async def save_merged_graph(self, project_id: str, graph: IRGraph) -> None:
+        """合并图沿用 graphs 表（kind='merged'），同一分析多次采集后覆盖。"""
+        await self._save_graph(project_id, graph, "merged")
+
+    async def _save_graph(self, project_id: str, graph: IRGraph, kind: str) -> None:
         analysis_id = graph.analysisId
         if analysis_id is None:
             raise ValueError("分析产物缺少 analysisId，无法入库")
+        payload, payload_bytes, digest = _graph_payload(graph)
+        if len(payload_bytes) > self._settings.graph_max_bytes:
+            raise GraphStorageError(
+                f"图产物大小 {len(payload_bytes)} bytes 超过上限 "
+                f"{self._settings.graph_max_bytes} bytes"
+            )
+        now = _to_db(datetime.now(UTC))
+        if (
+            self._settings.graph_chunked_enabled
+            and len(payload_bytes) > self._settings.graph_legacy_max_bytes
+        ):
+            await self._save_chunked_graph(
+                project_id, graph, kind, payload_bytes, digest, now
+            )
+            return
         query = text(
-            """
-            INSERT INTO graphs (project_id, analysis_id, kind, payload, created_at)
-            VALUES (:pid, :aid, 'static', :payload, :created_at)
-            ON DUPLICATE KEY UPDATE payload = VALUES(payload), created_at = VALUES(created_at)
+            f"""
+            INSERT INTO graphs (project_id, analysis_id, kind, payload, created_at, updated_at)
+            VALUES (:pid, :aid, '{kind}', :payload, :created_at, :updated_at)
+            ON DUPLICATE KEY UPDATE payload = VALUES(payload),
+              updated_at = VALUES(updated_at)
             """
         )
         async with self._engine.begin() as conn:
@@ -617,36 +763,188 @@ class MySqlAnalysisRepository:
                 {
                     "pid": project_id,
                     "aid": analysis_id,
-                    "payload": graph.model_dump_json(exclude_none=True),
-                    "created_at": _to_db(datetime.now(UTC)),
+                    "payload": payload,
+                    "created_at": now,
+                    "updated_at": now,
                 },
             )
+        logger.info(
+            "图产物已保存：project=%s analysis=%s kind=%s bytes=%d sha256=%s",
+            project_id,
+            analysis_id,
+            kind,
+            len(payload_bytes),
+            digest,
+        )
 
-    async def save_merged_graph(self, project_id: str, graph: IRGraph) -> None:
-        """合并图沿用 graphs 表（kind='merged'），同一分析多次采集后覆盖为最新结果。"""
+    async def _save_chunked_graph(
+        self,
+        project_id: str,
+        graph: IRGraph,
+        kind: str,
+        payload_bytes: bytes,
+        digest: str,
+        now: datetime,
+    ) -> None:
+        """以 writing -> published 状态写入分块图，避免读到半成品。"""
+        chunk_size = max(1, self._settings.graph_chunk_bytes)
+        chunks = _split_utf8(payload_bytes, chunk_size)
         analysis_id = graph.analysisId
-        if analysis_id is None:
-            raise ValueError("合并产物缺少 analysisId，无法入库")
-        query = text(
-            """
-            INSERT INTO graphs (project_id, analysis_id, kind, payload, created_at)
-            VALUES (:pid, :aid, 'merged', :payload, :created_at)
-            ON DUPLICATE KEY UPDATE payload = VALUES(payload), created_at = VALUES(created_at)
-            """
-        )
+        assert analysis_id is not None
         async with self._engine.begin() as conn:
             await conn.execute(
-                query,
+                text(
+                    """
+                    INSERT INTO graph_revisions (
+                      project_id, analysis_id, kind, state, schema_version,
+                      payload_bytes, payload_sha256, node_count, edge_count,
+                      chunk_count, created_at, updated_at
+                    ) VALUES (
+                      :pid, :aid, :kind, 'writing', :version,
+                      :payload_bytes, :payload_sha256, :node_count, :edge_count,
+                      :chunk_count, :created_at, :updated_at
+                    )
+                    ON DUPLICATE KEY UPDATE
+                      state = 'writing', schema_version = VALUES(schema_version),
+                      payload_bytes = VALUES(payload_bytes),
+                      payload_sha256 = VALUES(payload_sha256),
+                      node_count = VALUES(node_count), edge_count = VALUES(edge_count),
+                      chunk_count = VALUES(chunk_count), updated_at = VALUES(updated_at),
+                      published_at = NULL, error_code = NULL, error_message = NULL
+                    """
+                ),
                 {
                     "pid": project_id,
                     "aid": analysis_id,
-                    "payload": graph.model_dump_json(exclude_none=True),
-                    "created_at": _to_db(datetime.now(UTC)),
+                    "kind": kind,
+                    "version": graph.version,
+                    "payload_bytes": len(payload_bytes),
+                    "payload_sha256": digest,
+                    "node_count": len(graph.nodes),
+                    "edge_count": len(graph.edges),
+                    "chunk_count": len(chunks),
+                    "created_at": now,
+                    "updated_at": now,
                 },
             )
+            revision = (
+                await conn.execute(
+                    text(
+                        """
+                        SELECT revision_id FROM graph_revisions
+                        WHERE project_id = :pid AND analysis_id = :aid AND kind = :kind
+                        """
+                    ),
+                    {"pid": project_id, "aid": analysis_id, "kind": kind},
+                )
+            ).first()
+            if revision is None:
+                raise GraphStorageError("分块图版本创建后无法读取 revision_id")
+            revision_id = int(revision.revision_id)
+            await conn.execute(
+                text("DELETE FROM graph_revision_chunks WHERE revision_id = :revision_id"),
+                {"revision_id": revision_id},
+            )
+            for chunk_no, chunk in enumerate(chunks):
+                await conn.execute(
+                    text(
+                        """
+                        INSERT INTO graph_revision_chunks
+                          (revision_id, chunk_no, data, byte_length, chunk_sha256, created_at)
+                        VALUES (
+                          :revision_id, :chunk_no, :data, :byte_length,
+                          :chunk_sha256, :created_at
+                        )
+                        """
+                    ),
+                    {
+                        "revision_id": revision_id,
+                        "chunk_no": chunk_no,
+                        "data": chunk.decode("utf-8"),
+                        "byte_length": len(chunk),
+                        "chunk_sha256": hashlib.sha256(chunk).hexdigest(),
+                        "created_at": now,
+                    },
+                )
+            await conn.execute(
+                text(
+                    """
+                    UPDATE graph_revisions
+                    SET state = 'published', published_at = :published_at, updated_at = :updated_at
+                    WHERE revision_id = :revision_id
+                    """
+                ),
+                {"revision_id": revision_id, "published_at": now, "updated_at": now},
+            )
+        logger.info(
+            "图产物已分块保存：project=%s analysis=%s kind=%s bytes=%d chunks=%d sha256=%s",
+            project_id,
+            analysis_id,
+            kind,
+            len(payload_bytes),
+            len(chunks),
+            digest,
+        )
+
+    async def _read_chunked_graph(
+        self, project_id: str, analysis_id: str, kind: str
+    ) -> IRGraph | None:
+        async with self._engine.connect() as conn:
+            revision = (
+                await conn.execute(
+                    text(
+                        """
+                        SELECT revision_id, payload_bytes, payload_sha256, chunk_count
+                        FROM graph_revisions
+                        WHERE project_id = :pid AND analysis_id = :aid
+                          AND kind = :kind AND state = 'published'
+                        """
+                    ),
+                    {"pid": project_id, "aid": analysis_id, "kind": kind},
+                )
+            ).first()
+            if revision is None:
+                return None
+            rows = (
+                await conn.execute(
+                    text(
+                        """
+                        SELECT chunk_no, data, byte_length, chunk_sha256
+                        FROM graph_revision_chunks
+                        WHERE revision_id = :revision_id ORDER BY chunk_no
+                        """
+                    ),
+                    {"revision_id": revision.revision_id},
+                )
+            ).all()
+        if len(rows) != int(revision.chunk_count):
+            raise GraphStorageError("分块图数量不完整，拒绝读取")
+        parts: list[bytes] = []
+        for expected_no, row in enumerate(rows):
+            chunk = str(row.data).encode("utf-8")
+            if int(row.chunk_no) != expected_no or len(chunk) != int(row.byte_length):
+                raise GraphStorageError("分块图序号或大小校验失败")
+            if hashlib.sha256(chunk).hexdigest() != str(row.chunk_sha256):
+                raise GraphStorageError("分块图校验和不匹配")
+            parts.append(chunk)
+        payload_bytes = b"".join(parts)
+        if len(payload_bytes) != int(revision.payload_bytes):
+            raise GraphStorageError("分块图总大小校验失败")
+        if hashlib.sha256(payload_bytes).hexdigest() != str(revision.payload_sha256):
+            raise GraphStorageError("分块图总校验和不匹配")
+        try:
+            graph = IRGraph.model_validate_json(payload_bytes)
+        except ValueError as error:
+            raise GraphStorageError(f"分块图不符合 IR 契约：{error}") from error
+        if graph.analysisId != analysis_id:
+            raise GraphStorageError("分块图 analysisId 与查询条件不一致")
+        return graph
 
     async def get_graph(self, project_id: str, analysis_id: str) -> IRGraph | None:
-        # 同一 analysisId 可能有 static 与 merged 两行：这里只取静态图
+        if self._settings.graph_chunked_read_enabled:
+            chunked = await self._read_chunked_graph(project_id, analysis_id, "static")
+            if chunked is not None:
+                return chunked
         query = text(
             """
             SELECT payload FROM graphs
@@ -658,6 +956,10 @@ class MySqlAnalysisRepository:
         return IRGraph.model_validate_json(row.payload) if row else None
 
     async def get_merged_graph(self, project_id: str, analysis_id: str) -> IRGraph | None:
+        if self._settings.graph_chunked_read_enabled:
+            chunked = await self._read_chunked_graph(project_id, analysis_id, "merged")
+            if chunked is not None:
+                return chunked
         query = text(
             """
             SELECT payload FROM graphs
@@ -669,17 +971,37 @@ class MySqlAnalysisRepository:
         return IRGraph.model_validate_json(row.payload) if row else None
 
     async def get_latest_graph(self, project_id: str) -> IRGraph | None:
-        # merged 按写入时间排在对应 static 之后；若之后又跑了新分析，static 的
-        # id 更大、自然重新成为最新——按 id 排序就是正确的时序语义
+        if self._settings.graph_chunked_read_enabled:
+            async with self._engine.connect() as conn:
+                revision = (
+                    await conn.execute(
+                        text(
+                            """
+                            SELECT analysis_id, kind FROM graph_revisions
+                            WHERE project_id = :pid AND state = 'published'
+                            ORDER BY published_at DESC, revision_id DESC LIMIT 1
+                            """
+                        ),
+                        {"pid": project_id},
+                    )
+                ).first()
+            if revision is not None:
+                chunked = await self._read_chunked_graph(
+                    project_id, str(revision.analysis_id), str(revision.kind)
+                )
+                if chunked is not None:
+                    return chunked
         query = text(
             """
-            SELECT payload FROM graphs WHERE project_id = :pid
-            ORDER BY id DESC LIMIT 1
+            SELECT payload FROM graphs FORCE INDEX (idx_graph_latest_v2)
+            WHERE project_id = :pid
+            ORDER BY updated_at DESC, id DESC LIMIT 1
             """
         )
         async with self._engine.connect() as conn:
             row = (await conn.execute(query, {"pid": project_id})).first()
         return IRGraph.model_validate_json(row.payload) if row else None
+
 
     async def save_page_profiles(self, project_id: str, payload: ProfilePayload) -> None:
         query = text(

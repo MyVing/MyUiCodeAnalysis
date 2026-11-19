@@ -36,6 +36,8 @@ TABLES = (
     "requirement_maps",
     "requirement_tasks",
     "graphs",
+    "graph_revision_chunks",
+    "graph_revisions",
     "analysis_tasks",
     "projects",
 )
@@ -392,7 +394,7 @@ async def test_chat_session_upsert_and_eviction(engine) -> None:
             updated_at=datetime.now(UTC),
         )
 
-    for index in range(11):
+    for index in range(1, 12):
         await repo.upsert(_session(index))
 
     listed = await repo.list_by_project("prj_test000001")

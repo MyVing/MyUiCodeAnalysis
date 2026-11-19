@@ -207,6 +207,7 @@ export interface ChatMessage {
 
 export interface RequirementChatStart {
   messages: ChatMessage[];
+  routePath?: string;
 }
 
 export interface RequirementChatResult {

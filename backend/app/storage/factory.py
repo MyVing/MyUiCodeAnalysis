@@ -64,7 +64,7 @@ def create_storage(settings: Settings) -> Storage:
     engine = create_engine_from_url(settings)
     return Storage(
         projects=MySqlProjectRepository(engine),
-        analyses=MySqlAnalysisRepository(engine),
+        analyses=MySqlAnalysisRepository(engine, settings),
         requirements=MySqlRequirementRepository(engine),
         runtimes=MySqlRuntimeRepository(engine),
         explores=MySqlExploreRepository(engine),

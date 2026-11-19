@@ -42,6 +42,8 @@ export default function ChatPage() {
   const [sessionId, setSessionId] = useState<string | null>(null);
   const [messages, setMessages] = useState<ChatMessage[]>([]);
   const [input, setInput] = useState("");
+  const [routePath, setRoutePath] = useState("");
+  const lastRoutePath = useRef("");
   const [draft, setDraft] = useState<string | null>(null);
   const [lastError, setLastError] = useState<string | null>(null);
   const listRef = useRef<HTMLDivElement>(null);
@@ -95,12 +97,15 @@ export default function ChatPage() {
   });
 
   const chat = useMutation({
-    mutationFn: (history: ChatMessage[]) =>
-      api.chatRequirement(projectId ?? "", { messages: history }),
-    onSuccess: (result, history) => {
+    mutationFn: (request: { history: ChatMessage[]; routePath?: string }) =>
+      api.chatRequirement(projectId ?? "", {
+        messages: request.history,
+        ...(request.routePath ? { routePath: request.routePath } : {}),
+      }),
+    onSuccess: (result, request) => {
       setLastError(null);
       const full: ChatMessage[] = [
-        ...history,
+        ...request.history,
         {
           role: "assistant",
           content: result.reply,
@@ -137,6 +142,8 @@ export default function ChatPage() {
     setSessionId(null);
     setMessages([]);
     setDraft(null);
+    setRoutePath("");
+    lastRoutePath.current = "";
     setLastError(null);
   };
 
@@ -148,7 +155,9 @@ export default function ChatPage() {
     setMessages(history);
     setInput("");
     setDraft(null);
-    chat.mutate(history);
+    const selectedRoute = routePath.trim() || lastRoutePath.current || undefined;
+    lastRoutePath.current = selectedRoute ?? "";
+    chat.mutate({ history, routePath: selectedRoute });
   };
 
   const clear = () => {
@@ -322,7 +331,12 @@ export default function ChatPage() {
                 <span className="min-w-0 flex-1">{lastError}</span>
                 <button
                   type="button"
-                  onClick={() => chat.mutate(messages)}
+                  onClick={() =>
+                    chat.mutate({
+                      history: messages,
+                      routePath: lastRoutePath.current || undefined,
+                    })
+                  }
                   className="app-btn-ghost shrink-0"
                   data-testid="chat-retry"
                 >
@@ -332,8 +346,17 @@ export default function ChatPage() {
               </div>
             )}
 
-            <form onSubmit={send} className="flex items-end gap-2">
-              <textarea
+            <form onSubmit={send} className="space-y-2">
+              <input
+                value={routePath}
+                onChange={(event) => setRoutePath(event.target.value)}
+                placeholder="可选：直接定位路由，如 /register"
+                disabled={chat.isPending}
+                data-testid="chat-route-input"
+                className="app-input w-full text-xs"
+              />
+              <div className="flex items-end gap-2">
+                <textarea
                 value={input}
                 onChange={(event) => setInput(event.target.value)}
                 onKeyDown={(event) => {
@@ -357,6 +380,7 @@ export default function ChatPage() {
                 <Send size={13} />
                 发送
               </button>
+              </div>
             </form>
           </div>
         </div>
