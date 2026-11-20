@@ -25,6 +25,7 @@ logger = logging.getLogger(__name__)
 STDERR_TAIL_LIMIT = 2000
 
 type FrameworkName = Literal["react", "next"]
+type ScopeMode = Literal["all", "primary"]
 
 
 @dataclass(frozen=True)
@@ -34,6 +35,10 @@ class WorkerRequest:
     analysis_id: str
     changed_files: list[str] | None = None
     framework: FrameworkName | None = None
+    source_roots: list[str] | None = None
+    exclude_tests: bool | None = None
+    exclude_storybook: bool | None = None
+    scope_mode: ScopeMode | None = None
 
     def to_payload(self) -> dict[str, object]:
         """序列化为 worker 协议的 camelCase 请求体。"""
@@ -46,6 +51,14 @@ class WorkerRequest:
             payload["changedFiles"] = self.changed_files
         if self.framework:
             payload["framework"] = self.framework
+        if self.source_roots:
+            payload["sourceRoots"] = self.source_roots
+        if self.exclude_tests is not None:
+            payload["excludeTests"] = self.exclude_tests
+        if self.exclude_storybook is not None:
+            payload["excludeStorybook"] = self.exclude_storybook
+        if self.scope_mode:
+            payload["scopeMode"] = self.scope_mode
         return payload
 
 

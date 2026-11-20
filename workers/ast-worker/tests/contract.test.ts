@@ -24,7 +24,7 @@ import { analyzeProps } from "../src/props.js";
 import { createResolutionIndex } from "../src/resolver.js";
 import { analyzeRoutes } from "../src/routes.js";
 import { analyzeView } from "../src/view.js";
-import { buildWrapperAttrs, loadWrapperMappings } from "../src/wrappers.js";
+import { buildWrapperAttrs, inferWrappers, loadWrapperMappings } from "../src/wrappers.js";
 
 const here = path.dirname(fileURLToPath(import.meta.url));
 const REPO_ROOT = path.resolve(here, "..", "..", "..");
@@ -104,6 +104,12 @@ function analyzeFixture(analysisId = "an_test"): IRGraph {
     extraElementIds: new Set(events.elementNodes.map((node) => node.id)),
   });
   const wrappers = loadWrapperMappings(FIXTURE_ROOT, discovery.components);
+  const inferredWrappers = inferWrappers(
+    FIXTURE_ROOT,
+    project,
+    discovery.components,
+    discovery.declarations,
+  );
   const routes = analyzeRoutes({
     rootPath: FIXTURE_ROOT,
     project,
@@ -130,6 +136,7 @@ function analyzeFixture(analysisId = "an_test"): IRGraph {
     wrappers: buildWrapperAttrs(
       wrappers.byComponent,
       new Set(renders.edges.map((edge) => `${edge.from} ${edge.to}`)),
+      inferredWrappers.byComponent,
     ),
     edges: [
       ...renders.edges,
@@ -373,6 +380,11 @@ describe("ast-worker IR 输出符合契约", () => {
     ).toBe(true);
   });
 
+  it("封装注解写入 attrs.wrapper 且不破坏 IR 契约", () => {
+    const wrappers = graph.nodes.filter((node) => node.attrs.wrapper !== undefined);
+    expect(wrappers.length).toBeGreaterThan(0);
+    checkContract(graph);
+  });
   it("同一份源码多次分析产物稳定（节点与边顺序不抖动）", () => {
     const again = analyzeFixture();
     expect(again.nodes.map((n) => n.id)).toEqual(graph.nodes.map((n) => n.id));

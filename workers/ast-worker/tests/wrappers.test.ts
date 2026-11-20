@@ -23,6 +23,7 @@ import { createResolutionIndex } from "../src/resolver.js";
 import {
   buildWrapperAttrs,
   externalNodeId,
+  inferWrappers,
   loadWrapperMappings,
   parseWrapperMapping,
   resolveWrappers,
@@ -196,6 +197,51 @@ describe("映射不发明结构", () => {
   });
 });
 
+describe("结构性封装推断", () => {
+  it("无 mapping 也能识别 Provider、Layout、Guard、Link 和 children wrapper", () => {
+    const dir = makeProject({
+      "src/wrappers.tsx": `
+        import { Link as RouterLink, Navigate, Outlet } from "react-router";
+        export function AppProvider({ children }: { children: unknown }) {
+          return <QueryClientProvider>{children}</QueryClientProvider>;
+        }
+        export function DashboardLayout({ children }: { children: unknown }) {
+          return <main><Outlet />{children}</main>;
+        }
+        export function ProtectedRoute({ children }: { children: unknown }) {
+          return <>{user ? children : <Navigate to="/login" />}</>;
+        }
+        export function AppLink(props: { children: unknown; to: string }) {
+          return <RouterLink {...props}>{props.children}</RouterLink>;
+        }
+      `,
+    });
+    const { project } = createFullProject(dir);
+    const discovery = discoverComponents(dir, project);
+    const inferred = inferWrappers(dir, project, discovery.components, discovery.declarations);
+
+    const byName = (name: string) => inferred.byComponent.get(
+      discovery.components.find((component) => component.name === name)?.id ?? "",
+    );
+    expect(byName("AppProvider")?.categories).toEqual(["children", "provider"]);
+    expect(byName("DashboardLayout")?.categories).toEqual(["children", "layout"]);
+    expect(byName("ProtectedRoute")?.categories).toEqual(["children", "route-guard"]);
+    expect(byName("AppLink")?.categories).toContain("link");
+  });
+
+  it("结构推断结果可合并进 wrapper attrs，且不新增节点/边", () => {
+    const dir = makeProject({
+      "src/Provider.tsx": `export function Provider({ children }: { children: unknown }) { return <Ctx.Provider>{children}</Ctx.Provider>; }`,
+    });
+    const { project } = createFullProject(dir);
+    const discovery = discoverComponents(dir, project);
+    const inferred = inferWrappers(dir, project, discovery.components, discovery.declarations);
+    const attrs = buildWrapperAttrs(new Map(), new Set(), inferred.byComponent);
+    const wrapper = attrs.get(discovery.components[0]?.id ?? "");
+    expect(wrapper).toMatchObject({ inferred: true, categories: ["children", "provider"] });
+    expect(attrs.size).toBe(1);
+  });
+});
 describe("从项目根目录加载", () => {
   it("真实样本仓的 mapping.json 生效，且渲染边连得上 → resolved: true", () => {
     const { project } = createFullProject(FIXTURE_ROOT);

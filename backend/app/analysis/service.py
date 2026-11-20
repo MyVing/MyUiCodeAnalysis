@@ -72,12 +72,29 @@ class AnalysisService:
                 )
             )
 
-        background = asyncio.get_running_loop().create_task(self._execute(project, task))
+        background = asyncio.get_running_loop().create_task(
+            self._execute(project, task, payload)
+        )
         self._background.add(background)
         background.add_done_callback(self._background.discard)
         return task
 
-    async def _execute(self, project: Project, task: AnalysisTask) -> None:
+    def _source_roots(self, project: Project, options: AnalysisStart) -> list[str] | None:
+        """为多应用仓库选择与 framework 对应的主应用目录。"""
+        if options.source_roots:
+            return options.source_roots
+        candidates = {
+            "react": "apps/react-vite",
+            "next": "apps/nextjs-app",
+        }
+        candidate = candidates.get(project.framework)
+        if candidate and os.path.isdir(os.path.join(project.root_path, candidate)):
+            return [candidate]
+        return None
+
+    async def _execute(
+        self, project: Project, task: AnalysisTask, options: AnalysisStart
+    ) -> None:
         # 必须沿用 update_task 的返回值：仓储返回的是持久化后的任务快照，
         # 若继续用入参 task（started_at 为 None）做后续全字段更新，
         # 会把刚写入的 started_at 覆盖回 NULL。
@@ -89,6 +106,10 @@ class AnalysisService:
             root_path=project.root_path,
             analysis_id=task.analysis_id,
             framework=project.framework,
+            source_roots=self._source_roots(project, options),
+            exclude_tests=options.exclude_tests,
+            exclude_storybook=options.exclude_storybook,
+            scope_mode=options.scope_mode,
         )
         try:
             outcome = await self._runner.run(request, self._settings.worker_timeout_seconds)

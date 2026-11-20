@@ -159,7 +159,44 @@ def test_reserved_fields_are_echoed(
     assert final["requirement"] == "用户列表增加状态筛选"
 
 
-def test_task_not_found_returns_404(client: TestClient) -> None:
+def test_analysis_scope_options_are_forwarded_to_worker(
+    client: TestClient, fake_runner: FakeWorkerRunner, analysis_project: dict[str, object]
+) -> None:
+    start = client.post(
+        f"/api/v1/projects/{analysis_project['id']}/analyses",
+        json={
+            "sourceRoots": ["apps/react-vite"],
+            "excludeTests": True,
+            "excludeStorybook": True,
+            "scopeMode": "primary",
+        },
+    )
+    assert start.status_code == 202
+
+    final = wait_for_final_task(client, start.json()["id"])
+    assert final["status"] == "succeeded"
+    request = fake_runner.requests[0]
+    assert request.source_roots == ["apps/react-vite"]
+    assert request.exclude_tests is True
+    assert request.exclude_storybook is True
+    assert request.scope_mode == "primary"
+
+
+def test_analysis_scope_defaults_to_primary_and_excludes_nonproduction_files(
+    client: TestClient, fake_runner: FakeWorkerRunner, analysis_project: dict[str, object]
+) -> None:
+    start = client.post(f"/api/v1/projects/{analysis_project['id']}/analyses")
+    assert start.status_code == 202
+
+    final = wait_for_final_task(client, start.json()["id"])
+    assert final["status"] == "succeeded"
+    request = fake_runner.requests[0]
+    assert request.source_roots is None
+    assert request.exclude_tests is True
+    assert request.exclude_storybook is True
+    assert request.scope_mode == "primary"
+
+
     response = client.get("/api/v1/tasks/task_missing")
     assert response.status_code == 404
 
