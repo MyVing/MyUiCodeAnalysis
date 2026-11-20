@@ -32,7 +32,7 @@ import { createResolutionIndex } from "./resolver.js";
 import { analyzeRoutes } from "./routes.js";
 import { analyzeUiText } from "./ui-text.js";
 import { analyzeView } from "./view.js";
-import { buildWrapperAttrs, loadWrapperMappings } from "./wrappers.js";
+import { buildWrapperAttrs, inferWrappers, loadWrapperMappings } from "./wrappers.js";
 
 function log(message: string): void {
   process.stderr.write(`[ast-worker] ${message}\n`);
@@ -69,6 +69,7 @@ async function analyze(request: WorkerRequest): Promise<WorkerResponse> {
     ...(request.sourceRoots ? { sourceRoots: request.sourceRoots } : {}),
     ...(request.excludeTests !== undefined ? { excludeTests: request.excludeTests } : {}),
     ...(request.excludeStorybook !== undefined ? { excludeStorybook: request.excludeStorybook } : {}),
+    ...(request.scopeMode ? { scopeMode: request.scopeMode } : {}),
   };
 
   let project;
@@ -180,6 +181,13 @@ async function analyze(request: WorkerRequest): Promise<WorkerResponse> {
   // 因此不告警；存在但格式不对才告警——那是配置写错了，必须让人看见。
   const wrapperResult = loadWrapperMappings(rootPath, discovery.components);
   warnings.push(...wrapperResult.warnings);
+  const inferredWrappers = inferWrappers(
+    rootPath,
+    project,
+    discovery.components,
+    discovery.declarations,
+  );
+  warnings.push(...inferredWrappers.warnings);
 
   // 可见文案：需求检索的召回入口。纯语法事实，不依赖其他分析器的结论，
   // 但它需要组件归属索引，因此放在组件发现之后。
@@ -230,17 +238,10 @@ async function analyze(request: WorkerRequest): Promise<WorkerResponse> {
       `${hooksResult.hookNodes.length} 个 hook、${hooksResult.stateNodes.length} 个状态，` +
       `${apiResult.apiNodes.length} 个接口、${apiResult.fnNodes.length} 个请求链函数，` +
       `${eventsResult.elementNodes.length} 个事件元素、${viewResult.elementNodes.length} 个视图节点，` +
-      `${wrapperResult.byComponent.size} 个封装组件，` +
+      `${inferredWrappers.byComponent.size + [...wrapperResult.byComponent.keys()].filter((id) => !inferredWrappers.byComponent.has(id)).length} 个封装组件，` +
       `${textCount} 条可见文案、${routesResult.routeNodes.length} 个路由、` +
       `${navigationResult.edges.length} 条导航边，` +
       `${warnings.length} 条告警`,
-  );
-
-  // 封装注解要带「渲染边是否真的连到了目标」：封装里用动态组件时可能是 false，
-  // 这种"声明了但没连上"必须如实反映，不能假装成功。
-  const wrapperAttrs = buildWrapperAttrs(
-    wrapperResult.byComponent,
-    new Set(renders.edges.map((edge) => `${edge.from} ${edge.to}`)),
   );
 
   return {
@@ -249,7 +250,11 @@ async function analyze(request: WorkerRequest): Promise<WorkerResponse> {
       request,
       components: discovery.components,
       props: propsResult.byComponent,
-      wrappers: wrapperAttrs,
+      wrappers: buildWrapperAttrs(
+        wrapperResult.byComponent,
+        new Set(renders.edges.map((edge) => `${edge.from} ${edge.to}`)),
+        inferredWrappers.byComponent,
+      ),
       texts: uiTextResult.byComponent,
       edges: [
         ...renders.edges,

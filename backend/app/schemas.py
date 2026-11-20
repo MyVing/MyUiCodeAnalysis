@@ -127,6 +127,11 @@ class AnalysisStart(ApiModel):
     requirement: str | None = Field(default=None, max_length=10000)
     base_commit: str | None = Field(default=None, max_length=128)
     target_commit: str | None = Field(default=None, max_length=128)
+    # 大型 monorepo 默认只分析主应用，避免多个 app、测试和 Storybook 被静默合并。
+    source_roots: list[str] | None = Field(default=None, max_length=32)
+    exclude_tests: bool = True
+    exclude_storybook: bool = True
+    scope_mode: Literal["all", "primary"] = "primary"
 
 
 class AnalysisTask(ApiModel):

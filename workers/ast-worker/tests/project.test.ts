@@ -260,4 +260,74 @@ describe("全量分析的 tsconfig 装载", () => {
     expect(result.project.getSourceFiles()).toEqual([]);
     expect(result.warnings.map((warning) => warning.code)).toContain("empty_project");
   });
+
+  it("primary scope 不会加载其他引用配置，sourceRoots 只保留指定应用", () => {
+    const root = makeProject({
+      "tsconfig.json": JSON.stringify({
+        files: [],
+        references: [{ path: "./tsconfig.app.json" }, { path: "./tsconfig.admin.json" }],
+      }),
+      "tsconfig.app.json": JSON.stringify({
+        compilerOptions: { jsx: "react-jsx" },
+        include: ["apps/main/src"],
+      }),
+      "tsconfig.admin.json": JSON.stringify({
+        compilerOptions: { jsx: "react-jsx" },
+        include: ["apps/admin/src"],
+      }),
+      "apps/main/src/App.tsx": COMPONENT_SOURCE,
+      "apps/admin/src/Admin.tsx": COMPONENT_SOURCE,
+    });
+
+    const result = createFullProject(root, {
+      scopeMode: "primary",
+      sourceRoots: ["apps/main"],
+    });
+    const loaded = result.project.getSourceFiles().map((file) => file.getFilePath());
+
+    expect(loaded.some((file) => file.endsWith("apps/main/src/App.tsx"))).toBe(true);
+    expect(loaded.some((file) => file.endsWith("apps/admin/src/Admin.tsx"))).toBe(false);
+  });
+
+  it("普通 tsconfig 的 primary scope 不会把 include 之外的源码加入项目", () => {
+    const root = makeProject({
+      "tsconfig.json": JSON.stringify({
+        compilerOptions: { jsx: "react-jsx" },
+        include: ["apps/main/src"],
+      }),
+      "apps/main/src/App.tsx": COMPONENT_SOURCE,
+      "apps/admin/src/Admin.tsx": COMPONENT_SOURCE,
+    });
+
+    const result = createFullProject(root, { scopeMode: "primary" });
+    const loaded = result.project.getSourceFiles().map((file) => file.getBaseName());
+
+    expect(loaded).toContain("App.tsx");
+    expect(loaded).not.toContain("Admin.tsx");
+  });
+
+  it("显式排除测试和 Storybook 文件", () => {
+    const root = makeProject({
+      "tsconfig.json": JSON.stringify({
+        compilerOptions: { jsx: "react-jsx" },
+        include: ["src"],
+      }),
+      "src/App.tsx": COMPONENT_SOURCE,
+      "src/App.test.tsx": COMPONENT_SOURCE,
+      "src/App.stories.tsx": COMPONENT_SOURCE,
+      "src/__tests__/helper.ts": "export const helper = 1;\n",
+    });
+
+    const result = createFullProject(root, {
+      scopeMode: "primary",
+      excludeTests: true,
+      excludeStorybook: true,
+    });
+    const loaded = result.project.getSourceFiles().map((file) => file.getFilePath());
+
+    expect(loaded.some((file) => file.endsWith("src/App.tsx"))).toBe(true);
+    expect(loaded.some((file) => file.endsWith("App.test.tsx"))).toBe(false);
+    expect(loaded.some((file) => file.endsWith("App.stories.tsx"))).toBe(false);
+    expect(loaded.some((file) => file.endsWith("__tests__/helper.ts"))).toBe(false);
+  });
 });

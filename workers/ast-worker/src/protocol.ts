@@ -26,6 +26,8 @@ export interface WorkerRequest {
   sourceRoots?: string[];
   excludeTests?: boolean;
   excludeStorybook?: boolean;
+  /** 多应用仓库的扫描口径：all 保持旧行为，primary 只分析主 tsconfig 对应应用。 */
+  scopeMode?: "all" | "primary";
 }
 
 /** Worker 成功响应。 */

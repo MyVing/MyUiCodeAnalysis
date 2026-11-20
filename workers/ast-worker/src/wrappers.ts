@@ -28,6 +28,7 @@ import path from "node:path";
 
 import type { Warning } from "@uicodeanalysis/contracts";
 import type { WrapperMapping, WrapperRule } from "@uicodeanalysis/contracts";
+import { SyntaxKind, type Node, type Project } from "ts-morph";
 
 import type { DiscoveredComponent } from "./components.js";
 
@@ -52,6 +53,96 @@ export interface WrapperMappingResult {
   byComponent: Map<string, ResolvedWrapper>;
   warnings: Warning[];
 }
+
+export interface InferredWrapper {
+  componentId: string;
+  categories: string[];
+  evidence: string[];
+}
+
+export interface WrapperInferenceResult {
+  byComponent: Map<string, InferredWrapper>;
+  warnings: Warning[];
+}
+
+/** 结构性封装推断：只读取组件定义 AST，不执行源码。 */
+export function inferWrappers(
+  rootPath: string,
+  project: Project,
+  components: readonly DiscoveredComponent[],
+  declarations: ReadonlyMap<string, Node>,
+): WrapperInferenceResult {
+  const byComponent = new Map<string, InferredWrapper>();
+  const warnings: Warning[] = [];
+  void rootPath;
+
+  for (const component of components) {
+    const declaration = declarations.get(component.id);
+    if (!declaration) continue;
+    const text = declaration.getText();
+    const categories = new Set<string>();
+    const evidence = new Set<string>();
+    const jsxTags = [
+      ...declaration.getDescendantsOfKind(SyntaxKind.JsxOpeningElement),
+      ...declaration.getDescendantsOfKind(SyntaxKind.JsxSelfClosingElement),
+    ].map((node) => node.getTagNameNode().getText());
+    const hasChildrenProp = /\bchildren\b/.test(text);
+    const hasChildrenUse = /\{\s*children\s*\}/.test(text) || /\.children\b/.test(text);
+
+    if (hasChildrenProp && hasChildrenUse) {
+      categories.add("children");
+      evidence.add("accepts and renders children");
+    }
+    if (jsxTags.some((tag) => tag.endsWith("Provider") || tag === "Context.Provider")) {
+      categories.add("provider");
+      evidence.add("renders a Provider element");
+    }
+    if (jsxTags.includes("Outlet")) {
+      categories.add("layout");
+      evidence.add("renders react-router Outlet");
+    }
+    if (jsxTags.includes("Navigate") || /\b(?:redirect|useNavigate)\s*\(/.test(text)) {
+      categories.add("route-guard");
+      evidence.add("contains route redirect/navigation guard logic");
+    }
+    if (
+      jsxTags.some((tag) => /(?:^|\.)?(?:Link|NavLink|RouterLink)$/.test(tag)) ||
+      /\b(?:router|link)\s*:\s*.*\b(?:to|href)\b/.test(text)
+    ) {
+      categories.add("link");
+      evidence.add("renders a link component");
+    }
+
+    const structuralTag = (tag: string): boolean =>
+      tag.endsWith("Provider") ||
+      tag === "Context.Provider" ||
+      tag === "Outlet" ||
+      tag === "Navigate" ||
+      /(?:^|\.)?(?:Link|NavLink|RouterLink)$/.test(tag);
+    const hasComposedUiTag = jsxTags.some(
+      (tag) => /^[A-Z]/.test(tag) && !structuralTag(tag),
+    );
+    if (
+      hasComposedUiTag &&
+      !categories.has("provider") &&
+      (hasChildrenUse || /\.\.\.props|\.\.\.rest/.test(text))
+    ) {
+      categories.add("ui");
+      evidence.add("forwards children or props to a composed UI component");
+    }
+
+    if (categories.size > 0) {
+      byComponent.set(component.id, {
+        componentId: component.id,
+        categories: [...categories].sort(),
+        evidence: [...evidence].sort(),
+      });
+    }
+  }
+  void project;
+  return { byComponent, warnings };
+}
+
 
 /**
  * 校验并收窄映射文件。
@@ -245,14 +336,31 @@ export function loadWrapperMappings(
 export function buildWrapperAttrs(
   byComponent: ReadonlyMap<string, ResolvedWrapper>,
   renderedTargets: ReadonlySet<string>,
+  inferred: ReadonlyMap<string, InferredWrapper> = new Map(),
 ): Map<string, Record<string, unknown>> {
   const attrs = new Map<string, Record<string, unknown>>();
   for (const [componentId, wrapper] of byComponent) {
     const targetId = externalNodeId(wrapper.package, wrapper.target);
     attrs.set(
       componentId,
-      serializeWrapper(wrapper, targetId, renderedTargets.has(`${componentId} ${targetId}`)),
+      {
+        ...serializeWrapper(wrapper, targetId, renderedTargets.has(`${componentId} ${targetId}`)),
+        ...(inferred.has(componentId)
+          ? {
+              categories: inferred.get(componentId)?.categories,
+              evidence: inferred.get(componentId)?.evidence,
+            }
+          : {}),
+      },
     );
+  }
+  for (const [componentId, wrapper] of inferred) {
+    if (attrs.has(componentId)) continue;
+    attrs.set(componentId, {
+      categories: wrapper.categories,
+      evidence: wrapper.evidence,
+      inferred: true,
+    });
   }
   return attrs;
 }

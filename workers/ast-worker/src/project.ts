@@ -118,6 +118,8 @@ export interface ProjectScanOptions {
   /** 是否排除测试/Storybook 文件，默认保留旧行为。 */
   excludeTests?: boolean;
   excludeStorybook?: boolean;
+  /** all 保持兼容行为；primary 只装载主配置声明的文件。 */
+  scopeMode?: "all" | "primary";
 }
 
 /** 全量分析的构建结果。告警随 Project 一起返回，由入口并入 IRGraph。 */
@@ -245,8 +247,19 @@ function countInProject(rootPath: string, fileNames: readonly string[], sourceKe
 function discoverNestedConfig(
   rootPath: string,
   scan: ProjectTreeScan,
+  options: ProjectScanOptions = {},
 ): { chosen: NestedConfigCandidate | null; candidates: NestedConfigCandidate[]; scannedCount: number } {
-  const sourceKeys = new Set(scan.sourceFiles.map(normalizePath));
+  const sourceRoots = (options.sourceRoots ?? [])
+    .map((sourceRoot) => sourceRoot.replace(/\\/g, "/").replace(/^\/+|\/+$/g, ""))
+    .filter(Boolean)
+    .map((sourceRoot) => normalizePath(path.join(rootPath, sourceRoot)));
+  const scopedSourceFiles = sourceRoots.length
+    ? scan.sourceFiles.filter((fileName) => {
+        const normalized = normalizePath(fileName);
+        return sourceRoots.some((root) => normalized === root || normalized.startsWith(`${root}/`));
+      })
+    : scan.sourceFiles;
+  const sourceKeys = new Set(scopedSourceFiles.map(normalizePath));
   const candidates: NestedConfigCandidate[] = [];
 
   for (const configPath of scan.configPaths) {
@@ -275,7 +288,7 @@ function discoverNestedConfig(
   return {
     chosen: eligible[0] ?? null,
     candidates,
-    scannedCount: scan.sourceFiles.length,
+    scannedCount: scopedSourceFiles.length,
   };
 }
 
@@ -382,6 +395,39 @@ function createGlobProject(rootPath: string, warnings: Warning[], options: Proje
   return { project, fromTsConfig: false, tsConfigPath: null, warnings };
 }
 
+/** 过滤 tsconfig 已解析文件，使显式 scope 不会被 ts-morph 的默认装载绕过。 */
+function scopedConfigFiles(
+  rootPath: string,
+  files: readonly string[],
+  options: ProjectScanOptions,
+): string[] {
+  const normalizedRoot = normalizePath(rootPath);
+  const roots = (options.sourceRoots ?? [])
+    .map((sourceRoot) => sourceRoot.replace(/\\/g, "/").replace(/^\/+|\/+$/g, ""))
+    .filter(Boolean)
+    .map((sourceRoot) => normalizePath(path.join(rootPath, sourceRoot)));
+
+  return files.filter((fileName) => {
+    const normalized = normalizePath(fileName);
+    if (!normalized.startsWith(`${normalizedRoot}/`)) return false;
+    if (roots.length > 0 && !roots.some((root) => normalized === root || normalized.startsWith(`${root}/`))) {
+      return false;
+    }
+    const relative = normalized.slice(normalizedRoot.length + 1);
+    const segments = relative.split("/");
+    if (segments.some((segment) => EXCLUDED_DIRS.some((excluded) => segment === excluded.toLowerCase()))) {
+      return false;
+    }
+    if (options.excludeTests && (segments.includes("__tests__") || /\.(?:test|spec)\.[^.]+$/i.test(relative))) {
+      return false;
+    }
+    if (options.excludeStorybook && (segments.includes("storybook") || /\.stories\.[^.]+$/i.test(relative))) {
+      return false;
+    }
+    return SOURCE_FILE_PATTERN.test(fileName);
+  });
+}
+
 /** 全量与兜底路径共用的源码 glob，保证两条路径扫描范围一致。 */
 function sourceGlobs(rootPath: string, options: ProjectScanOptions = {}): string[] {
   const root = rootPath.replace(/\\/g, "/").replace(/\/$/, "");
@@ -424,7 +470,7 @@ export function createFullProject(rootPath: string, options: ProjectScanOptions 
       return createGlobProject(rootPath, warnings, options);
     }
 
-    const { chosen, candidates, scannedCount } = discoverNestedConfig(rootPath, scan);
+    const { chosen, candidates, scannedCount } = discoverNestedConfig(rootPath, scan, options);
     if (chosen === null) {
       warnings.push(
         staticWarning(
@@ -467,7 +513,11 @@ export function createFullProject(rootPath: string, options: ProjectScanOptions 
         tsConfigFilePath: chosen.configPath,
         skipAddingFilesFromTsConfig: true,
       });
-      nestedProject.addSourceFilesAtPaths(sourceGlobs(rootPath));
+      const nestedFiles =
+        options.scopeMode === "primary" || (options.sourceRoots?.length ?? 0) > 0
+          ? scopedConfigFiles(rootPath, chosen.parsed.fileNames, options)
+          : sourceGlobs(rootPath, options);
+      nestedProject.addSourceFilesAtPaths(nestedFiles);
     } catch (error) {
       const detail = error instanceof Error ? error.message : String(error);
       warnings.push(
@@ -515,15 +565,26 @@ export function createFullProject(rootPath: string, options: ProjectScanOptions 
           : "tsconfig.json 未装载到任何源文件（检查 include / files 是否指向存在的目录），已退化为目录扫描。",
       ),
     );
-    return createGlobProject(rootPath, warnings);
+    return createGlobProject(rootPath, warnings, options);
   }
 
   let project: Project;
   try {
+    // 显式 scope 时跳过 ts-morph 自动读取 tsconfig 文件列表，避免把 monorepo
+    // 中的其他 app 一并装载；paths/baseUrl 仍来自同一份主配置。
     project = new Project({
       tsConfigFilePath: primary.configPath,
-      skipAddingFilesFromTsConfig: false,
+      skipAddingFilesFromTsConfig: true,
     });
+    const hasFileFilters =
+      options.scopeMode === "primary" ||
+      (options.sourceRoots?.length ?? 0) > 0 ||
+      options.excludeTests === true ||
+      options.excludeStorybook === true;
+    const primaryFiles = hasFileFilters
+      ? scopedConfigFiles(rootPath, primary.parsed.fileNames, options)
+      : primary.parsed.fileNames;
+    project.addSourceFilesAtPaths(primaryFiles);
   } catch (error) {
     const detail = error instanceof Error ? error.message : String(error);
     warnings.push(
@@ -532,7 +593,7 @@ export function createFullProject(rootPath: string, options: ProjectScanOptions 
         `tsconfig 装载失败（${path.basename(primary.configPath)}）：${detail}；已退化为目录扫描，别名解析不可用。`,
       ),
     );
-    return createGlobProject(rootPath, warnings);
+    return createGlobProject(rootPath, warnings, options);
   }
 
   if (project.getSourceFiles().length === 0) {
@@ -542,16 +603,22 @@ export function createFullProject(rootPath: string, options: ProjectScanOptions 
         `tsconfig 记录的文件都无法加载（${path.basename(primary.configPath)}），已退化为目录扫描。`,
       ),
     );
-    return createGlobProject(rootPath, warnings);
+    return createGlobProject(rootPath, warnings, options);
   }
 
   // solution-style 属于正确处理的常态（create-vite 等模板默认如此），不产告警；
   // 实际选用的配置见入口日志，避免每张真实图都挂一条常驻提示。
 
 
-  // 其他引用配置的源文件（如 monorepo 的 ui 包）一并加入：只分析主配置会漏掉它们。
-  // 别名解析仍以主配置的 paths 为准；跨配置别名不一致属于已知边界。
-  const extraFiles = candidates.slice(1).flatMap((candidate) => candidate.parsed.fileNames);
+  // 没有显式 scope 时保留旧行为；primary 或 sourceRoots 时只加入主配置过滤后的文件。
+  const hasFileFilters =
+    options.scopeMode === "primary" ||
+    (options.sourceRoots?.length ?? 0) > 0 ||
+    options.excludeTests === true ||
+    options.excludeStorybook === true;
+  const extraFiles = hasFileFilters
+    ? []
+    : candidates.slice(1).flatMap((candidate) => candidate.parsed.fileNames);
   if (extraFiles.length > 0) {
     project.addSourceFilesAtPaths(extraFiles);
   }
