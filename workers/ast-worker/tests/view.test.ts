@@ -93,6 +93,29 @@ function edgeOf(
   return edge;
 }
 
+describe("封装表单控件字段", () => {
+  it("从 registration={register('field')} 提取字段注册事实", () => {
+    const result = analyzeSynthetic({
+      "src/Form.tsx": `declare function register(name: string): unknown; export function Form() { return <Input label="Title" registration={register('title')} />; }`,
+    }).view;
+
+    const input = nodeOf(result, "src/Form.tsx#Form/jsx:Input");
+    expect(input.attrs.formField).toMatchObject({
+      name: "title",
+      quote: "register('title')",
+      loc: { line: 1 },
+    });
+  });
+
+  it("动态 registration 字段不猜测字段名", () => {
+    const result = analyzeSynthetic({
+      "src/Form.tsx": `declare function register(name: string): unknown; export function Form({ name }: { name: string }) { return <Input registration={register(name)} />; }`,
+    }).view;
+
+    expect(nodeOf(result, "src/Form.tsx#Form/jsx:Input").attrs.formField).toBeUndefined();
+  });
+});
+
 describe("视图层（真实样本仓）", () => {
   const result = analyze(FIXTURE_ROOT).view;
 

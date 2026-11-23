@@ -84,7 +84,20 @@ interface RequestSite {
   /** URL 来自源码里的原始写法；与 url 不同时前端可以并排展示 */
   urlRaw?: string;
   /** 可静态确认的请求体字段包装（如 `{ json: { user: data } }`）。 */
-  requestBody?: { wrapper: string; source: string; quote: string; file: string; loc: { line: number; col: number } };
+  requestBody?: {
+    wrapper: string;
+    source: string;
+    quote: string;
+    file: string;
+    loc: { line: number; col: number };
+    fields?: Array<{
+      name: string;
+      source: string;
+      quote: string;
+      file: string;
+      loc: { line: number; col: number };
+    }>;
+  };
 }
 
 /** 请求封装器的签名：怎么从调用实参里取出 URL 与 method。 */
@@ -1446,19 +1459,167 @@ function buildInterfaceImplIndex(
 
 function requestBodyOf(call: CallExpression, rootPath: string): RequestSite["requestBody"] {
   const [, options] = call.getArguments();
-  if (!options || !MorphNode.isObjectLiteralExpression(options)) return undefined;
-  const json = findPropertyInitializer(options, ["json"])?.node;
-  if (!json || !MorphNode.isObjectLiteralExpression(json)) return undefined;
-  const props = json.getProperties();
-  if (props.length !== 1 || !MorphNode.isPropertyAssignment(props[0])) return undefined;
-  const wrapper = props[0].getName();
-  const value = props[0].getInitializer();
-  if (!value || !MorphNode.isIdentifier(value)) return undefined;
-  const source = value.getText();
-  const file = toProjectRelative(rootPath, value.getSourceFile().getFilePath());
+  if (!options) return undefined;
+
+  // axios-style method call: a POST/PUT/PATCH second argument is the payload even
+  // when it is a parameter identifier rather than an inline object literal.
+  const inferredMethod = inferMethodFromCallee(call);
+  if (inferredMethod && ["POST", "PUT", "PATCH"].includes(inferredMethod)) {
+    const body = requestBodyFromPayload(options, rootPath);
+    if (body) return body;
+  }
+
+  // ky/fetch 风格：options.json = { user: payload }。
+  if (MorphNode.isObjectLiteralExpression(options)) {
+    const json = findPropertyInitializer(options, ["json"])?.node;
+    const jsonBody = requestBodyFromPayload(json, rootPath);
+    if (jsonBody) return jsonBody;
+
+    // fetch/axios 风格：options.data/body = { user: payload }。
+    const configuredBody = findPropertyInitializer(options, ["data", "body"])?.node;
+    const configured = requestBodyFromPayload(configuredBody, rootPath);
+    if (configured) return configured;
+
+    // axios.post(url, { user: payload })：第二个参数本身就是请求体。
+    // fetch/ky 的第二个参数是配置对象，不能把配置字段误当成业务字段。
+    const method = inferMethodFromCallee(call);
+    if (method && ["POST", "PUT", "PATCH"].includes(method)) {
+      return requestBodyFromPayload(options, rootPath);
+    }
+  }
+
+  return undefined;
+}
+
+function requestBodyFromPayload(
+  payload: Node | undefined,
+  rootPath: string,
+): RequestSite["requestBody"] {
+  if (payload && MorphNode.isIdentifier(payload)) {
+    const symbol = payload.getSymbol();
+    const declarations = symbol?.getDeclarations() ?? [];
+    if (declarations.length === 1 && MorphNode.isBindingElement(declarations[0]!)) {
+      const binding = declarations[0]!;
+      const name = binding.getName();
+      const pattern = binding.getParent();
+      const parameter = pattern?.getParent();
+      if (MorphNode.isObjectBindingPattern(pattern) && parameter && MorphNode.isParameterDeclaration(parameter)) {
+        const owner = parameter.getParent();
+        if (!owner || !(MorphNode.isFunctionDeclaration(owner) || MorphNode.isArrowFunction(owner) || MorphNode.isFunctionExpression(owner) || MorphNode.isMethodDeclaration(owner))) return undefined;
+        const parameterName = parameter.getNameNode();
+        const property = MorphNode.isObjectBindingPattern(parameterName)
+          ? parameterName.getElements().find((item) => item.getName() === name)
+          : undefined;
+        if (!property) return undefined;
+
+        // The destructured parameter property is the payload sent to the client.
+        // Record its statically declared object fields only when each field has a
+        // project-source declaration that can serve as auditable evidence.
+        const type = payload.getType();
+        const typeProperties = type.getProperties();
+        const fields: NonNullable<NonNullable<RequestSite["requestBody"]>["fields"]> = [];
+        let fieldsAreStatic = typeProperties.length > 0;
+        for (const field of typeProperties) {
+          const declaration = field.getDeclarations()?.find((item) => isProjectSource(rootPath, item.getSourceFile().getFilePath()));
+          if (!declaration) {
+            fieldsAreStatic = false;
+            break;
+          }
+          const fieldFile = toProjectRelative(rootPath, declaration.getSourceFile().getFilePath());
+          if (fieldFile === null) {
+            fieldsAreStatic = false;
+            break;
+          }
+          const fieldNameNode = MorphNode.isPropertySignature(declaration) || MorphNode.isPropertyDeclaration(declaration)
+            ? declaration.getNameNode()
+            : declaration;
+          const fieldPos = declaration.getSourceFile().getLineAndColumnAtPos(fieldNameNode.getStart());
+          fields.push({
+            name: field.getName(),
+            source: field.getName(),
+            quote: fieldNameNode.getText(),
+            file: fieldFile,
+            loc: { line: fieldPos.line, col: fieldPos.column },
+          });
+        }
+        const file = toProjectRelative(rootPath, payload.getSourceFile().getFilePath());
+        if (file === null) return undefined;
+        const pos = payload.getSourceFile().getLineAndColumnAtPos(payload.getStart());
+        return {
+          wrapper: "",
+          source: payload.getText(),
+          quote: payload.getText(),
+          file,
+          loc: { line: pos.line, col: pos.column },
+          ...(fieldsAreStatic ? { fields } : {}),
+        };
+      }
+    }
+    return undefined;
+  }
+  if (!payload || !MorphNode.isObjectLiteralExpression(payload)) return undefined;
+  const props = payload.getProperties();
+  if (props.length === 0) return undefined;
+
+  if (props.length === 1 && MorphNode.isShorthandPropertyAssignment(props[0])) {
+    const shorthand = props[0];
+    const name = shorthand.getName();
+    const file = toProjectRelative(rootPath, shorthand.getSourceFile().getFilePath());
+    if (file === null) return undefined;
+    const pos = shorthand.getSourceFile().getLineAndColumnAtPos(shorthand.getStart());
+    return {
+      wrapper: name,
+      source: name,
+      quote: shorthand.getText(),
+      file,
+      loc: { line: pos.line, col: pos.column },
+    };
+  }
+
+  const assignments = props.filter(
+    (prop): prop is import("ts-morph").PropertyAssignment => MorphNode.isPropertyAssignment(prop),
+  );
+  if (assignments.length !== props.length) return undefined;
+  const wrapperProp = assignments.length === 1 ? assignments[0] : null;
+  const wrapper = wrapperProp?.getName() ?? "";
+  const wrapperValue = wrapperProp?.getInitializer();
+  if (wrapperProp && (!wrapperValue || !MorphNode.isIdentifier(wrapperValue))) return undefined;
+
+  const sourceNode = wrapperValue ?? payload;
+  const source = sourceNode.getText();
+  const file = toProjectRelative(rootPath, sourceNode.getSourceFile().getFilePath());
   if (file === null) return undefined;
-  const pos = value.getSourceFile().getLineAndColumnAtPos(value.getStart());
-  return { wrapper, source, quote: props[0].getText(), file, loc: { line: pos.line, col: pos.column } };
+  const pos = sourceNode.getSourceFile().getLineAndColumnAtPos(sourceNode.getStart());
+  const fields = assignments.map((prop) => {
+    const value = prop.getInitializer();
+    if (!value || !MorphNode.isIdentifier(value)) return null;
+    const fieldFile = toProjectRelative(rootPath, value.getSourceFile().getFilePath());
+    if (fieldFile === null) return null;
+    const fieldPos = value.getSourceFile().getLineAndColumnAtPos(value.getStart());
+    return {
+      name: prop.getName(),
+      source: value.getText(),
+      quote: prop.getText(),
+      file: fieldFile,
+      loc: { line: fieldPos.line, col: fieldPos.column },
+    };
+  });
+  if (fields.some((field) => field === null)) return undefined;
+
+  return {
+    wrapper,
+    source,
+    quote: wrapperProp?.getText() ?? assignments.map((prop) => prop.getText()).join(", "),
+    file,
+    loc: { line: pos.line, col: pos.column },
+    ...(wrapperProp
+      ? {}
+      : {
+          fields: fields as NonNullable<
+            NonNullable<RequestSite["requestBody"]>["fields"]
+          >,
+        }),
+  };
 }
 
 /** 直接从 HTTP 客户端调用构造请求点。 */

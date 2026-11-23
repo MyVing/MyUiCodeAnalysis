@@ -159,6 +159,7 @@ async function analyze(request: WorkerRequest): Promise<WorkerResponse> {
     components: discovery.components,
     knownNodes,
     propsFields,
+    mutationTargets: hooksResult.mutationTargets,
     declarations: discovery.declarations,
     rootPath,
   });

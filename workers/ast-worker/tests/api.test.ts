@@ -289,6 +289,58 @@ describe("API 链路的边界（合成项目）", () => {
     expect(apiIds(result)).toEqual(["api:GET:/api/items", "api:POST:/api/items"]);
   });
 
+  it("请求体字段包装支持 axios data、fetch body 和直接对象参数", () => {
+    const result = analyzeSynthetic({
+      "node_modules/axios/index.d.ts": `
+        declare const axios: { post(url: string, data?: unknown): Promise<unknown> };
+        export default axios;
+      `,
+      "src/Payloads.tsx": `
+        import axios from "axios";
+        export function Payloads() {
+          const user = { name: "Ada" };
+          axios.post("/api/axios-data", { user });
+          fetch("/api/fetch-body", { body: { profile: user } });
+          fetch("/api/fetch-json", { json: { account: user } });
+          return <div />;
+        }
+      `,
+    });
+
+    const bodies = new Map(
+      result.apiNodes.map((node) => [node.attrs.url as string, node.attrs.requestBody]),
+    );
+    expect(bodies.get("/api/axios-data")).toMatchObject({ wrapper: "user", source: "user" });
+    expect(bodies.get("/api/fetch-body")).toMatchObject({ wrapper: "profile", source: "user" });
+    expect(bodies.get("/api/fetch-json")).toMatchObject({ wrapper: "account", source: "user" });
+  });
+
+  it("动态请求体不冒充静态字段包装", () => {
+    const result = analyzeSynthetic({
+      "src/DynamicBody.tsx": `
+        function buildPayload(user: unknown) { return { user }; }
+        export function DynamicBody() {
+          const payload = buildPayload({ name: "Ada" });
+          fetch("/api/dynamic-body", { body: payload });
+          return <div />;
+        }
+      `,
+    });
+
+    expect(result.apiNodes[0]?.attrs.requestBody).toBeUndefined();
+  });
+
+  it("从解构参数的静态类型提取直接请求体字段", () => {
+    const result = analyzeSynthetic({
+      "node_modules/axios/index.d.ts": `declare const axios: { post(url: string, data?: unknown): Promise<unknown> }; export default axios;`,
+      "src/create.ts": `import axios from "axios"; type Input = { title: string; body: string }; export function create({ data }: { data: Input }) { return axios.post("/api/create", data); }`,
+    });
+
+    const body = result.apiNodes[0]?.attrs.requestBody;
+    expect(body).toMatchObject({ wrapper: "", source: "data" });
+    expect((body as { fields?: Array<{ name: string }> } | undefined)?.fields?.map((field) => field.name)).toEqual(["title", "body"]);
+  });
+
   it("封装器的默认方法参与判定：调用点不传 method 时取解构默认值", () => {
     const result = analyzeSynthetic({
       "src/http.ts": `

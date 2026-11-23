@@ -60,6 +60,7 @@ function analyze(rootPath: string): EventsAnalysisResult {
     ),
     components: discovery.components,
     knownNodes: [...hooks.hookNodes, ...hooks.stateNodes, ...api.apiNodes, ...api.fnNodes],
+    mutationTargets: hooks.mutationTargets,
     propsFields: new Map(
       [...props.byComponent].map(([id, info]) => [id, info.fields.map((f) => f.name)]),
     ),
@@ -341,6 +342,29 @@ describe("事件分析的边界（合成项目）", () => {
     });
 
     expect(after.elementNodes.map((n) => n.id)).toEqual(before.elementNodes.map((n) => n.id));
+  });
+});
+
+describe("React Query mutation 事件链", () => {
+  it("通过自定义 hook 将 Form mutate 连接到唯一 mutationFn", () => {
+    const result = analyzeSynthetic({
+      "src/api.ts": `export function createDiscussion(input: { data: unknown }) { return fetch("/discussions", { method: "POST", body: JSON.stringify(input.data) }); }`,
+      "src/hooks.ts": `import { createDiscussion } from "./api"; declare function useMutation(config: { mutationFn: typeof createDiscussion }): unknown; export function useCreateDiscussion() { return useMutation({ mutationFn: createDiscussion }); }`,
+      "src/Form.tsx": `import { useCreateDiscussion } from "./hooks"; export function Form() { const mutation = useCreateDiscussion(); return <form onSubmit={() => mutation.mutate({ data: {} })} />; }`,
+    });
+
+    const form = elementOf(result, "src/Form.tsx#Form/jsx:form");
+    const event = bindingOf(form, "onSubmit");
+    expect(event.targets).toEqual([{ id: "src/api.ts#createDiscussion", kind: "fn" }]);
+    edgeOf(result, "calls", form.id, "src/api.ts#createDiscussion");
+    expect(result.fnNodes.some((node) => node.id === "src/api.ts#createDiscussion")).toBe(false);
+  });
+
+  it("不把无关对象的 mutate 方法猜成 mutationFn", () => {
+    const result = analyzeSynthetic({
+      "src/Form.tsx": `export function Form({ other }: { other: { mutate(): void } }) { return <form onSubmit={() => other.mutate()} />; }`,
+    });
+    expect(bindingOf(elementOf(result, "src/Form.tsx#Form/jsx:form"), "onSubmit").targets).toEqual([]);
   });
 });
 

@@ -131,13 +131,10 @@ export interface EventsAnalysisInput {
   /** 统一元素清单：id、归属、file/loc 都取自这里，不再自行计算 */
   inventory: JsxInventory;
   components: readonly DiscoveredComponent[];
-  /**
-   * 已经产出的节点（hook / state / fn）。
-   *
-   * 传节点而不是重算一遍：事件分析要回答「处理函数落到谁」，而"谁"只能是
-   * 图上真实存在的节点。凭空造一个 handler 节点会让同一个函数在图上出现两次。
-   */
+  /** 已经产出的 hook / state / fn 节点。 */
   knownNodes: readonly IRNode[];
+  /** 组件级 mutation result 变量 → 唯一静态 mutationFn 函数节点。 */
+  mutationTargets?: ReadonlyMap<string, string>;
   /** 组件 id → props 字段名；来自 props 分析结果 */
   propsFields: ReadonlyMap<string, readonly string[]>;
   /** 组件 id → 定义节点；用于解析 JSX 中的子组件标签 */
@@ -154,6 +151,7 @@ interface NameTable {
   setters: Map<string, string>;
   /** 组件的 props 字段名：命中它们说明是外部注入的回调。 */
   propNames: Set<string>;
+  mutationTargets: Map<string, string>;
 }
 
 /** 局部名字命中时的落点。 */
@@ -182,8 +180,8 @@ interface HandlerResolver {
   bySymbol(identifier: Identifier): FunctionIdentity | null;
   /** 父组件传入的 props 回调 → 父组件真实目标 */
   byPropTarget(name: string): NameHit | null;
-  /** 名字是否是 props 字段（外部注入的回调） */
   isPropCallback(name: string): boolean;
+  mutationTarget(name: string): string | null;
 }
 
 /**
@@ -196,6 +194,7 @@ function buildNameTable(
   component: DiscoveredComponent,
   knownNodes: readonly IRNode[],
   propsFields: ReadonlyMap<string, readonly string[]>,
+  mutationTargets: ReadonlyMap<string, string> = new Map(),
 ): NameTable {
   const targets = new Map<string, { id: string; kind: IRNode["kind"] }>();
   const setters = new Map<string, string>();
@@ -238,7 +237,12 @@ function buildNameTable(
     }
   }
 
-  return { targets, setters, propNames };
+  const scopedMutationTargets = new Map<string, string>();
+  const prefix = `${component.id}:`;
+  for (const [key, value] of mutationTargets) {
+    if (key.startsWith(prefix)) scopedMutationTargets.set(key.slice(prefix.length), value);
+  }
+  return { targets, setters, propNames, mutationTargets: scopedMutationTargets };
 }
 
 /**
@@ -281,6 +285,9 @@ function buildResolver(
     },
     isPropCallback(name) {
       return table.propNames.has(name);
+    },
+    mutationTarget(name) {
+      return table.mutationTargets.get(name) ?? null;
     },
   };
 }
@@ -332,6 +339,16 @@ function collectInlineEffects(
 
   for (const call of fn.getDescendantsOfKind(SyntaxKind.CallExpression)) {
     const expr = call.getExpression();
+    if (MorphNode.isPropertyAccessExpression(expr) && ["mutate", "mutateAsync"].includes(expr.getName())) {
+      const receiver = expr.getExpression();
+      if (MorphNode.isIdentifier(receiver)) {
+        const targetId = resolver.mutationTarget(receiver.getText());
+        if (targetId && !calls.some((entry) => entry.id === targetId)) {
+          calls.push({ id: targetId, kind: "fn" });
+        }
+      }
+      continue;
+    }
     const name = MorphNode.isIdentifier(expr)
       ? expr.getText()
       : MorphNode.isPropertyAccessExpression(expr)
@@ -480,7 +497,7 @@ function describeEvent(
 }
 
 export function analyzeEvents(input: EventsAnalysisInput): EventsAnalysisResult {
-  const { inventory, components, knownNodes, propsFields, declarations, rootPath } = input;
+  const { inventory, components, knownNodes, mutationTargets = new Map(), propsFields, declarations, rootPath } = input;
 
   const warnings: Warning[] = [];
   const edges = new Map<string, IREdge>();
@@ -522,7 +539,7 @@ export function analyzeEvents(input: EventsAnalysisInput): EventsAnalysisResult 
     resolvers.set(
       component.id,
       buildResolver(
-        buildNameTable(component, knownNodes, propsFields),
+        buildNameTable(component, knownNodes, propsFields, mutationTargets),
         rootPath,
         registerFn,
         propTargets,

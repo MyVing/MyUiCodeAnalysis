@@ -429,15 +429,31 @@ function formFieldOf(opening: Node): { name: string; quote: string; loc: { line:
     return null;
   }
   for (const attr of opening.getAttributes()) {
+    if (!MorphNode.isJsxAttribute(attr)) continue;
+    const name = attr.getNameNode().getText();
+    const initializer = attr.getInitializer();
+    const expression = initializer && MorphNode.isJsxExpression(initializer)
+      ? initializer.getExpression()
+      : null;
+    if (name !== "registration" || !expression || !MorphNode.isCallExpression(expression)) continue;
+    const callee = expression.getExpression();
+    if (!MorphNode.isIdentifier(callee) || callee.getText() !== "register") continue;
+    const first = expression.getArguments()[0];
+    if (!first || (!MorphNode.isStringLiteral(first) && !MorphNode.isNoSubstitutionTemplateLiteral(first))) continue;
+    const fieldName = first.getLiteralText().trim();
+    if (!fieldName) continue;
+    const source = opening.getSourceFile();
+    const position = source.getLineAndColumnAtPos(expression.getStart());
+    return { name: fieldName, quote: expression.getText(), loc: { line: position.line, col: position.column } };
+  }
+  for (const attr of opening.getAttributes()) {
     if (!MorphNode.isJsxSpreadAttribute(attr)) continue;
     const expression = attr.getExpression();
     if (!expression || !MorphNode.isCallExpression(expression)) continue;
     const callee = expression.getExpression();
     if (!MorphNode.isIdentifier(callee) || callee.getText() !== "register") continue;
     const first = expression.getArguments()[0];
-    if (!first || (!MorphNode.isStringLiteral(first) && !MorphNode.isNoSubstitutionTemplateLiteral(first))) {
-      continue;
-    }
+    if (!first || (!MorphNode.isStringLiteral(first) && !MorphNode.isNoSubstitutionTemplateLiteral(first))) continue;
     const name = first.getLiteralText().trim();
     if (name) {
       const source = opening.getSourceFile();

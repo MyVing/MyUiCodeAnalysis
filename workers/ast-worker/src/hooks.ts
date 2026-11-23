@@ -27,13 +27,14 @@
  */
 
 import type { CallExpression, Identifier, Node, SourceFile } from "ts-morph";
-import { Node as MorphNode } from "ts-morph";
+import { Node as MorphNode, SyntaxKind } from "ts-morph";
 
 import type { Evidence, IREdge, IRNode, Warning } from "@uicodeanalysis/contracts";
 
 import type { DiscoveredComponent } from "./components.js";
 import { isProjectSource, toProjectRelative } from "./paths.js";
 import { positionKey } from "./positions.js";
+import { functionIdentity, functionNodeOf, resolveIdentifierDeclarations, type FunctionIdentity } from "./symbols.js";
 
 /** 组件里的 hook 调用是语法事实。 */
 const CALL_CONFIDENCE = 1;
@@ -66,6 +67,8 @@ export interface HooksAnalysisResult {
    * 这是事实：它是组件挂载时执行的，不是某个人手动触发的动作。
    */
   callbackOwners: ReadonlyMap<string, string>;
+  /** 组件内 mutation result 变量 → 静态确认的 mutationFn fn 节点 id。 */
+  mutationTargets: ReadonlyMap<string, string>;
   warnings: Warning[];
 }
 
@@ -318,6 +321,7 @@ export function analyzeHooks(input: HooksAnalysisInput): HooksAnalysisResult {
   const warnings: Warning[] = [];
   const hookCounters = new Map<string, number>();
   const callbackOwners = new Map<string, string>();
+  const mutationTargets = new Map<string, string>();
 
   for (const component of components) {
     const decl = declarations.get(component.id);
@@ -408,6 +412,12 @@ export function analyzeHooks(input: HooksAnalysisInput): HooksAnalysisResult {
       // 自定义 hook：定义体在别的文件里，其内部绑定回调的归属登记到本调用点节点
       if (!classification.builtin) {
         registerCustomHookCallbackBodies(call, nodeId, rootPath, callbackOwners);
+        registerCustomHookMutationTargets(call, component.id, rootPath, mutationTargets);
+      }
+
+      if (hookName === "useMutation" && boundName) {
+        const target = mutationFunctionTarget(call, rootPath);
+        if (target) mutationTargets.set(`${component.id}:${boundName}`, target.id);
       }
 
       addEdge(edges, {
@@ -427,10 +437,52 @@ export function analyzeHooks(input: HooksAnalysisInput): HooksAnalysisResult {
     }
   }
 
-  return { hookNodes, stateNodes, edges: [...edges.values()], callbackOwners, warnings };
+  return { hookNodes, stateNodes, edges: [...edges.values()], callbackOwners, mutationTargets, warnings };
 }
 
 /** 沿父链找包住调用表达式的变量声明；只走 3 层以内（初始化表达式 → 声明）。 */
+function mutationFunctionTarget(call: CallExpression, rootPath: string): FunctionIdentity | null {
+  const config = call.getArguments()[0];
+  if (!config || !MorphNode.isObjectLiteralExpression(config)) return null;
+  const properties = config.getProperties().filter(
+    (property) => MorphNode.isPropertyAssignment(property) && property.getName() === "mutationFn",
+  );
+  if (properties.length !== 1 || !MorphNode.isPropertyAssignment(properties[0]!)) return null;
+  const initializer = properties[0]!.getInitializer();
+  if (!MorphNode.isIdentifier(initializer)) return null;
+  const declarations = resolveIdentifierDeclarations(initializer);
+  if (declarations.length !== 1) return null;
+  const fn = functionNodeOf(declarations[0]!);
+  return fn ? functionIdentity(fn, rootPath) : null;
+}
+
+/** 把自定义 hook 返回的 mutation result 关联到其唯一、静态可见 mutationFn。 */
+function registerCustomHookMutationTargets(
+  call: CallExpression,
+  componentId: string,
+  rootPath: string,
+  targets: Map<string, string>,
+): void {
+  const callee = call.getExpression();
+  if (!MorphNode.isIdentifier(callee)) return;
+  const declarations = resolveIdentifierDeclarations(callee);
+  if (declarations.length !== 1) return;
+  const hook = functionNodeOf(declarations[0]!);
+  if (!hook) return;
+  const mutationCalls = hook.getDescendantsOfKind(SyntaxKind.CallExpression).filter((inner) => {
+    const expr = inner.getExpression();
+    return MorphNode.isIdentifier(expr) && expr.getText() === "useMutation";
+  });
+  if (mutationCalls.length !== 1) return;
+  const target = mutationFunctionTarget(mutationCalls[0]!, rootPath);
+  if (!target) return;
+  const declaration = findOwningVariableDeclaration(call);
+  if (!declaration || !MorphNode.isVariableDeclaration(declaration)) return;
+  const nameNode = declaration.getNameNode();
+  if (!MorphNode.isIdentifier(nameNode)) return;
+  targets.set(`${componentId}:${nameNode.getText()}`, target.id);
+}
+
 function findOwningVariableDeclaration(call: CallExpression): Node | null {
   let current: Node | undefined = call.getParent();
   let depth = 0;
