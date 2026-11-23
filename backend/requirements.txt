@@ -30,6 +30,8 @@ certifi==2026.10.23
     #   httpx
     #   langchain-core
     #   requests
+cffi==2.1.1 ; platform_python_implementation != 'PyPy'
+    # via cryptography
 charset-normalizer==3.5.2
     # via requests
 click==8.5.1
@@ -38,6 +40,8 @@ click==8.5.1
     #   uvicorn
 colorama==0.4.6 ; sys_platform == 'win32'
     # via pytest
+cryptography==50.0.2
+    # via uicodeanalysis-backend
 datamodel-code-generator==0.96.0
 distro==1.9.0
     # via langsmith
@@ -148,6 +152,8 @@ platformdirs==4.14.5 ; sys_platform != 'emscripten'
     # via black
 pluggy==1.7.0
     # via pytest
+pycparser==3.12 ; implementation_name != 'PyPy' and platform_python_implementation != 'PyPy'
+    # via cffi
 pydantic==2.14.3
     # via
     #   datamodel-code-generator

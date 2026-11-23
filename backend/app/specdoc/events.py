@@ -105,13 +105,15 @@ def _confidence(material: PageMaterial, chain: ActionChain) -> float | None:
 def build_events(material: PageMaterial) -> tuple[list[Event], list]:
     """装配一个页面的事件清单与告警。
 
-    id 规则：evt.{pageNo}.{序号}（链路按 id 排序后顺序编号）。
+    id 规则：evt.{pageNo}.{序号}（链路按 id 排序后顺序编号）。同一提交事件
+    可能同时出现在父组件透传和子表单上；只有 handler 身份、事件类型和接口
+    集合都一致时才归并，避免把真实的两个入口误折叠。
     """
     from app.contracts.requirement import RequirementWarning, Severity
 
-    events: list[Event] = []
+    candidates: list[tuple[ActionChain, list[HttpCall], Handler | None, str | None]] = []
     warnings: list[RequirementWarning] = []
-    for index, chain in enumerate(sorted(material.chains, key=lambda item: item.id), start=1):
+    for chain in sorted(material.chains, key=lambda item: item.id):
         calls = _http_calls(chain)
         if not calls:
             continue
@@ -128,7 +130,6 @@ def build_events(material: PageMaterial) -> tuple[list[Event], list]:
             )
         handler = _handler_for(chain)
         if handler is None:
-            # 没有可指认的 handler 段：事件来源不完整，如实标注为元素级触发
             warnings.append(
                 RequirementWarning(
                     code="handler_unresolved",
@@ -136,12 +137,25 @@ def build_events(material: PageMaterial) -> tuple[list[Event], list]:
                     message=f"链路 {chain.id} 缺少 handler 段，事件归到元素级触发。",
                 )
             )
+        candidates.append((chain, calls, handler, _event_type(material, chain)))
+
+    grouped: dict[tuple, tuple[ActionChain, list[HttpCall], Handler | None, str | None]] = {}
+    for candidate in candidates:
+        key = _dedupe_key(candidate[0], candidate[1], candidate[2], candidate[3])
+        current = grouped.get(key)
+        if current is None or _event_preference(material, candidate[0]) < _event_preference(material, current[0]):
+            grouped[key] = candidate
+
+    events: list[Event] = []
+    for index, (chain, calls, handler, event_type) in enumerate(
+        sorted(grouped.values(), key=lambda item: item[0].id), start=1
+    ):
         events.append(
             Event(
                 id=f"evt.{material.page.pageNo}.{index}",
                 pageId=material.page.pageId,
                 elementId=chain.element.node_id,
-                eventType=_event_type(material, chain),
+                eventType=event_type,
                 handler=handler or Handler(name=chain.element.name),
                 httpCalls=calls,
                 chainId=chain.id,
@@ -150,3 +164,36 @@ def build_events(material: PageMaterial) -> tuple[list[Event], list]:
             )
         )
     return events, warnings
+
+
+def _dedupe_key(
+    chain: ActionChain,
+    calls: list[HttpCall],
+    handler: Handler | None,
+    event_type: str | None,
+) -> tuple:
+    """Return a conservative identity for parent/child duplicate submissions."""
+    if handler is None:
+        handler_key = ("element", chain.element.node_id)
+    elif handler.file and handler.loc is not None:
+        handler_key = ("location", handler.file, handler.loc.line, handler.loc.col, handler.name)
+    elif handler.file:
+        handler_key = ("file_name", handler.file, handler.name)
+    else:
+        handler_key = ("name", handler.name)
+    calls_key = tuple((call.method, call.url) for call in calls)
+    return (event_type, handler_key, calls_key)
+
+
+def _event_preference(material: PageMaterial, chain: ActionChain) -> tuple[int, str]:
+    """Prefer a concrete form/control over a component-level duplicate."""
+    for source in material.elements:
+        if source.node.id != chain.element.node_id:
+            continue
+        tag = source.node.attrs.get("tag")
+        if isinstance(tag, str) and tag.lower() == "form":
+            return (0, chain.id)
+        if isinstance(tag, str) and tag.lower() in {"button", "input", "select", "textarea"}:
+            return (1, chain.id)
+        return (2, chain.id)
+    return (3, chain.id)

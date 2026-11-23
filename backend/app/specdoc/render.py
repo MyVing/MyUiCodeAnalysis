@@ -83,7 +83,7 @@ def render_markdown(doc: SpecDocMap) -> str:
             parts.append("| 步骤 | 操作 |")
             parts.append("| --- | --- |")
             for index, action in enumerate(step.actions, start=1):
-                parts.append(f"| {index} | {action} |")
+                parts.append(f"| {index} | {action.root} |")
             if step.evidence:
                 parts.append("")
                 parts.append(f"依据：{_evidence_text(step.evidence[0])}")

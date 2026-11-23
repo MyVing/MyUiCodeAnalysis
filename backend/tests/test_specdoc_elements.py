@@ -5,7 +5,7 @@ from __future__ import annotations
 from app.contracts import EdgeKind, NodeKind
 from app.contracts.specdoc import ElementKind, Source
 from app.specdoc.apimap import build_api_mappings
-from app.specdoc.collect import collect_materials
+from app.specdoc.collect import collect_materials, deterministic_field_mappings
 from app.specdoc.elements import build_elements, classify_element
 from app.specdoc.events import build_events
 from tests.specdoc_fixture import spec_graph, spec_requirement_map
@@ -169,6 +169,128 @@ def test_api_mappings_dedupe_by_url() -> None:
     assert row.elementId == transfer_event.elementId
 
 
+def test_parent_child_submit_chains_are_merged() -> None:
+    """父组件透传与表单提交指向同一 handler/API 时只保留表单事件。"""
+    from tests.graph_fixture import edge as make_edge
+    from tests.graph_fixture import node as make_node
+
+    graph_ = spec_graph()
+    button = next(item for item in graph_.nodes if item.id.endswith("jsx:button"))
+    button.attrs["events"][0]["name"] = "onSubmit"
+    form_id = "src/pages/Transfer.tsx#Transfer/jsx:form"
+    graph_.nodes.append(
+        make_node(
+            form_id,
+            NodeKind.element,
+            "<form>",
+            file="src/pages/Transfer.tsx",
+            attrs={
+                "tag": "form",
+                "viewRole": "container",
+                "events": [
+                    {
+                        "name": "onSubmit",
+                        "handlerName": "handleTransfer",
+                        "targets": [{"id": "src/pages/Transfer.tsx#handleTransfer"}],
+                    }
+                ],
+            },
+        )
+    )
+    graph_.edges.extend(
+        [
+            make_edge("src/pages/Transfer.tsx#Transfer", form_id, EdgeKind.contains),
+            make_edge(form_id, "src/pages/Transfer.tsx#handleTransfer", EdgeKind.calls),
+        ]
+    )
+
+    material = collect_materials(spec_requirement_map(graph_), graph_).pages[0]
+    events, _ = build_events(material)
+
+    assert len(events) == 2
+    transfer_events = [item for item in events if item.httpCalls[0].url == "/api/transfer"]
+    assert len(transfer_events) == 1
+    assert transfer_events[0].elementId == form_id
+
+
+def test_different_handlers_are_not_merged_even_when_api_matches() -> None:
+    """相同接口但 handler 不同仍代表两个真实入口。"""
+    from tests.graph_fixture import edge as make_edge
+    from tests.graph_fixture import node as make_node
+
+    graph_ = spec_graph()
+    second_id = "src/pages/Transfer.tsx#Transfer/jsx:button.secondary"
+    second_handler = "src/pages/Transfer.tsx#handleTransferAgain"
+    graph_.nodes.extend(
+        [
+            make_node(
+                second_id,
+                NodeKind.element,
+                "<button> 再次转账",
+                file="src/pages/Transfer.tsx",
+                attrs={
+                    "tag": "button",
+                    "viewRole": "control",
+                    "viewText": "再次转账",
+                    "events": [
+                        {
+                            "name": "onClick",
+                            "handlerName": "handleTransferAgain",
+                            "targets": [{"id": second_handler}],
+                        }
+                    ],
+                },
+            ),
+            make_node(
+                second_handler,
+                NodeKind.fn,
+                "handleTransferAgain",
+                file="src/pages/Transfer.tsx",
+            ),
+        ]
+    )
+    graph_.edges.extend(
+        [
+            make_edge("src/pages/Transfer.tsx#Transfer", second_id, EdgeKind.contains),
+            make_edge(second_id, second_handler, EdgeKind.calls),
+            make_edge(second_handler, "api:POST:/api/transfer", EdgeKind.requests),
+        ]
+    )
+
+    material = collect_materials(spec_requirement_map(graph_), graph_).pages[0]
+    events, _ = build_events(material)
+
+    transfer_events = [item for item in events if item.httpCalls[0].url == "/api/transfer"]
+    assert len(transfer_events) == 2
+
+
+def test_deterministic_field_mapping_uses_static_request_body_evidence() -> None:
+    """表单字段和 API 请求体包装均有静态证据时生成映射。"""
+    graph_ = spec_graph()
+    select = next(item for item in graph_.nodes if item.id.endswith("jsx:select"))
+    select.attrs["formField"] = {
+        "name": "payeeAccount",
+        "quote": "register(\"payeeAccount\")",
+        "loc": {"line": 12, "col": 3},
+    }
+    api = next(item for item in graph_.nodes if item.id == "api:POST:/api/transfer")
+    api.attrs["requestBody"] = {
+        "wrapper": "user",
+        "source": "payload",
+        "quote": "user: payload",
+        "file": "src/pages/Transfer.tsx",
+        "loc": {"line": 20, "col": 5},
+    }
+
+    materials = collect_materials(spec_requirement_map(graph_), graph_)
+    mappings = deterministic_field_mappings(materials)
+
+    assert len(mappings) == 1
+    assert mappings[0].frontField == "payeeAccount"
+    assert mappings[0].backendParam == "user.payeeAccount"
+    assert mappings[0].api == "POST /api/transfer"
+
+
 def test_page_numbers_follow_match_order() -> None:
     """页面序号按 matches 出现顺序分配，重复页面合并。"""
     graph_ = spec_graph()
@@ -176,6 +298,48 @@ def test_page_numbers_follow_match_order() -> None:
     materials = collect_materials(requirement_map, graph_)
     assert [item.page.pageNo for item in materials.pages] == [1]
     assert materials.pages[0].page.featureIds == ["f1", "f2"]
+
+
+def test_deterministic_field_mapping_matches_direct_payload_fields() -> None:
+    """直接对象请求体按静态字段名映射，不把无关字段笛卡尔匹配。"""
+    graph_ = spec_graph()
+    select = next(item for item in graph_.nodes if item.id.endswith("jsx:select"))
+    select.attrs["formField"] = {
+        "name": "payeeAccount",
+        "quote": 'register("payeeAccount")',
+        "loc": {"line": 12, "col": 3},
+    }
+    api = next(item for item in graph_.nodes if item.id == "api:POST:/api/transfer")
+    api.attrs["requestBody"] = {
+        "wrapper": "",
+        "source": "payload",
+        "quote": "payeeAccount: payeeAccount, amount: amount",
+        "file": "src/pages/Transfer.tsx",
+        "loc": {"line": 20, "col": 5},
+        "fields": [
+            {
+                "name": "payeeAccount",
+                "source": "payeeAccount",
+                "quote": "payeeAccount: payeeAccount",
+                "file": "src/pages/Transfer.tsx",
+                "loc": {"line": 20, "col": 15},
+            },
+            {
+                "name": "amount",
+                "source": "amount",
+                "quote": "amount: amount",
+                "file": "src/pages/Transfer.tsx",
+                "loc": {"line": 20, "col": 40},
+            },
+        ],
+    }
+
+    materials = collect_materials(spec_requirement_map(graph_), graph_)
+    mappings = deterministic_field_mappings(materials)
+
+    assert [(item.frontField, item.backendParam) for item in mappings] == [
+        ("payeeAccount", "payeeAccount")
+    ]
 
 
 def test_no_matches_yields_warning() -> None:

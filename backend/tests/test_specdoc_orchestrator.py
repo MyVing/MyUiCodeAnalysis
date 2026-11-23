@@ -5,6 +5,7 @@ from __future__ import annotations
 import json
 from datetime import UTC, datetime
 
+from app.contracts.specdoc import Action, Step
 from app.core.config import Settings
 from app.schemas import Project, SpecDocTask
 from app.specdoc.orchestrator import SCHEMA_VERSION, SpecDocOrchestrator
@@ -117,6 +118,32 @@ async def test_full_pipeline_numbers_rules_and_echoes_meta() -> None:
     # prompt 里没有页面画像——硬约束：语料只能是代码原文
     system, user = llm.calls[0]
     assert "功能点" in user and "页面语料" in user
+
+
+async def test_steps_render_action_text_without_root_model_repr() -> None:
+    """RootModel actions render as plain text rather than ``root='...'``."""
+    graph_ = spec_graph()
+    orchestrator = SpecDocOrchestrator(Settings(_env_file=None), llm=None)
+    doc = await orchestrator.run(
+        _PROJECT, _task(dry_run=True), spec_requirement_map(graph_), graph_
+    )
+    doc = doc.model_copy(
+        update={
+            "steps": [
+                Step(
+                    id="step.f1",
+                    featureId="f1",
+                    pageId=doc.pages[0].pageId,
+                    actions=[Action("填写注册信息")],
+                )
+            ]
+        }
+    )
+
+    body = render_markdown(doc)
+
+    assert "| 1 | 填写注册信息 |" in body
+    assert "root=" not in body
 
 
 async def test_api_mappings_render_under_their_page() -> None:

@@ -19,6 +19,7 @@ dependencies = [
   # aiomysql 0.3 的 bytes 转义依赖 pymysql.converters.escape_bytes_prefixed，
   # pymysql 1.2 起该符号变成弃用占位字符串（调用即 TypeError），必须钉住 1.1
   "pymysql>=1.1,<1.2",
+  "cryptography>=50.0.2",
 ]
 
 [dependency-groups]

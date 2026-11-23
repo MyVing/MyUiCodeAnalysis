@@ -267,6 +267,47 @@ describe("路由节点的边界（合成项目）", () => {
     expect(routeByPath(result, "/users")).toBeDefined();
   });
 
+  it("lazy 动态导入的 default 页面组件生成 renders 边", () => {
+    const result = analyzeSynthetic({
+      "src/App.tsx": `
+        import { createBrowserRouter } from "react-router-dom";
+        const convert = (module: unknown) => module;
+        export const router = createBrowserRouter([
+          {
+            path: "/app/discussions",
+            lazy: () => import("./pages/Discussions").then(convert),
+          },
+        ]);
+      `,
+      "src/pages/Discussions.tsx": `
+        export default function Discussions() { return <div>Discussions</div>; }
+      `,
+    });
+
+    const route = routeByPath(result, "/app/discussions");
+    expect(route.attrs.pageComponentId).toBe("src/pages/Discussions.tsx#Discussions");
+    expect(result.edges.some(
+      (edge) => edge.from === route.id && edge.to === "src/pages/Discussions.tsx#Discussions" && edge.kind === "renders",
+    )).toBe(true);
+  });
+
+  it("lazy 动态导入无法解析时只保留路由并告警", () => {
+    const result = analyzeSynthetic({
+      "src/App.tsx": `
+        import { createBrowserRouter } from "react-router-dom";
+        export const router = createBrowserRouter([
+          { path: "/missing", lazy: () => import("./pages/Missing") },
+        ]);
+      `,
+    });
+
+    const route = routeByPath(result, "/missing");
+    expect(result.edges.some((edge) => edge.from === route.id)).toBe(false);
+    expect(result.warnings.some(
+      (warning) => warning.code === "route_element_unresolved" && warning.message.includes("/missing"),
+    )).toBe(true);
+  });
+
   it("path 不是字面量时不产节点，并记 route_path_unresolved", () => {
     const result = analyzeSynthetic({
       "src/App.tsx": `

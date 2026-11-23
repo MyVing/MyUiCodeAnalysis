@@ -19,7 +19,7 @@
  * 本模块只回答「这个说明符指向哪里」，不判断它是不是组件——那是 components.ts 的事。
  */
 
-import type { Project, SourceFile } from "ts-morph";
+import { Node as MorphNode, SyntaxKind, ts, type CallExpression, type Project, type SourceFile } from "ts-morph";
 
 import type { Warning } from "@uicodeanalysis/contracts";
 
@@ -179,7 +179,7 @@ export function createResolutionIndex(rootPath: string, project: Project): Resol
   return { index, warnings };
 }
 
-/** 收集一个文件里所有需要解析的模块说明符（import + export from）。 */
+/** 收集一个文件里所有需要解析的模块说明符（import + export from + 动态 import）。 */
 function collectModuleSpecifiers(file: SourceFile): string[] {
   const specifiers = new Set<string>();
   for (const imp of file.getImportDeclarations()) {
@@ -188,6 +188,13 @@ function collectModuleSpecifiers(file: SourceFile): string[] {
   for (const exp of file.getExportDeclarations()) {
     const value = exp.getModuleSpecifierValue();
     if (value) specifiers.add(value);
+  }
+  for (const call of file.getDescendantsOfKind(SyntaxKind.CallExpression)) {
+    if (call.getExpression().getKind() !== SyntaxKind.ImportKeyword) continue;
+    const argument = call.getArguments()[0];
+    if (argument && MorphNode.isStringLiteral(argument)) {
+      specifiers.add(argument.getLiteralValue());
+    }
   }
   return [...specifiers];
 }
@@ -212,7 +219,29 @@ function findTargetSourceFile(
       return exp.getModuleSpecifierSourceFile();
     }
   }
+  for (const call of fromFile.getDescendantsOfKind(SyntaxKind.CallExpression)) {
+    if (call.getExpression().getKind() !== SyntaxKind.ImportKeyword) continue;
+    const argument = call.getArguments()[0];
+    if (argument && MorphNode.isStringLiteral(argument) && argument.getLiteralValue() === moduleSpecifier) {
+      return projectSourceFileForDynamicImport(call);
+    }
+  }
   return undefined;
+}
+
+/** 动态 import 的源文件由 TypeScript 的模块解析结果提供。 */
+function projectSourceFileForDynamicImport(call: CallExpression): SourceFile | undefined {
+  const sourceFile = call.getSourceFile();
+  const argument = call.getArguments()[0];
+  if (!argument || !MorphNode.isStringLiteral(argument)) return undefined;
+  const moduleSpecifier = argument.getLiteralValue();
+  const resolved = ts.resolveModuleName(
+    moduleSpecifier,
+    sourceFile.getFilePath(),
+    sourceFile.getProject().getCompilerOptions(),
+    ts.sys,
+  ).resolvedModule;
+  return resolved ? sourceFile.getProject().getSourceFile(resolved.resolvedFileName) : undefined;
 }
 
 /** 便于测试与调试：把解析结果格式化成一行。 */

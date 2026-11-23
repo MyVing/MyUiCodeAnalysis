@@ -314,7 +314,7 @@ def _unique(items) -> list[str]:
 
 
 def deterministic_field_mappings(materials: Materials) -> list[FieldMapping]:
-    """从 IR 的表单注册事实与请求体包装生成可审计字段映射。"""
+    """从 IR 的表单注册事实与请求体字段生成可审计字段映射。"""
     result: list[FieldMapping] = []
     seen: set[tuple[str, str, str, str | None]] = set()
     for material in materials.pages:
@@ -324,36 +324,69 @@ def deterministic_field_mappings(materials: Materials) -> list[FieldMapping]:
             for step in chain.steps
             if step.role == "api" and material.api_nodes.get(step.node_id) is not None
         ]
-        request_apis = [
-            (name, node) for name, node in request_apis
-            if isinstance(node.attrs.get("requestBody"), dict)
-            and isinstance(node.attrs["requestBody"].get("wrapper"), str)
-        ]
         for source in material.elements:
             field = source.node.attrs.get("formField")
             if not isinstance(field, dict) or not isinstance(field.get("name"), str):
                 continue
+            front_field = field["name"]
             for api_name, api_node in request_apis:
-                body = api_node.attrs["requestBody"]
+                if api_node is None:
+                    continue
+                body = api_node.attrs.get("requestBody")
+                if not isinstance(body, dict):
+                    continue
                 parts = api_name.split(None, 1)
                 method, url = (parts if len(parts) == 2 else ("GET", api_name))
-                backend = f"{body['wrapper']}.{field['name']}"
-                key = (field["name"], backend, f"{method} {url}", material.page.pageId)
-                if key in seen:
+                api = f"{method} {url}"
+                backends = _request_body_backends(body, front_field)
+                if not backends:
                     continue
-                seen.add(key)
                 evidence = _field_mapping_evidence(source.node, field)
                 if evidence is None:
                     continue
-                result.append(FieldMapping(
-                        frontField=field["name"],
-                        backendParam=backend,
-                        api=f"{method} {url}",
-                        pageId=material.page.pageId,
-                        quote=evidence.quote,
-                        evidence=[evidence],
-                    ))
+                for backend in backends:
+                    key = (front_field, backend, api, material.page.pageId)
+                    if key in seen:
+                        continue
+                    seen.add(key)
+                    result.append(
+                        FieldMapping(
+                            frontField=front_field,
+                            backendParam=backend,
+                            api=api,
+                            pageId=material.page.pageId,
+                            quote=evidence.quote,
+                            evidence=[evidence],
+                        )
+                    )
     return result
+
+
+def _request_body_backends(body: dict, front_field: str) -> list[str]:
+    """Return statically supported backend paths for one registered form field.
+
+    The legacy ``wrapper`` shape means the request body is known to be wrapped,
+    while ``fields`` records the exact properties of a direct object payload.
+    A direct payload is only associated when its property or source identifier
+    matches the form registration name.
+    """
+    wrapper = body.get("wrapper")
+    fields = body.get("fields")
+    if isinstance(fields, list):
+        result: list[str] = []
+        for item in fields:
+            if not isinstance(item, dict):
+                continue
+            name = item.get("name")
+            source = item.get("source")
+            if not isinstance(name, str) or not name:
+                continue
+            if name == front_field or source == front_field:
+                result.append(f"{wrapper}.{name}" if isinstance(wrapper, str) and wrapper else name)
+        return list(dict.fromkeys(result))
+    if isinstance(wrapper, str) and wrapper:
+        return [f"{wrapper}.{front_field}"]
+    return []
 
 
 def _field_mapping_evidence(node: IRNode, field: dict) -> VerifiedEvidence | None:

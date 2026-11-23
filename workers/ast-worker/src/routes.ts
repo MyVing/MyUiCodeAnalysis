@@ -14,7 +14,7 @@
  *
  * | 形态 | 依据 |
  * | --- | --- |
- * | React Router | 路由工厂函数的参数（`createBrowserRouter([...])` / `useRoutes([...])`）或 `<Routes>` 内的 `<Route>` |
+ * | React Router | 路由工厂函数的参数（`createBrowserRouter([...])` / `useRoutes([...])`）、`lazy` 动态导入或 `<Routes>` 内的 `<Route>` |
  * | Next.js 文件约定 | `app/**\/page.tsx`、`pages/**\/*.tsx` 的目录结构 |
  *
  * 两条路都只认**框架的语言级约定**，不出现任何业务名判断：`createBrowserRouter`
@@ -175,7 +175,60 @@ function literalString(node: Node | null): string | null {
   return null;
 }
 
-/** 解析简单路径常量和 `paths.users.getHref()` 工厂调用。 */
+/** 解析简单路径常量、嵌套对象属性和 `paths.users.getHref()` 工厂调用。 */
+/**
+ * 沿对象字面量的属性链取出静态值：`paths.app.discussions.path`。
+ *
+ * 这里不能只依赖最终属性的 symbol：当项目配置不完整或跨 tsconfig 时，
+ * ts-morph 可能只给中间属性绑定 symbol，最末端的 `path` 没有 symbol。
+ * 直接沿 AST 的对象声明回溯仍然是确定的语法解析，不是按名称猜值。
+ */
+function staticObjectValue(node: Node, depth = 0): Node | null {
+  if (depth > 8) return null;
+  let current = node;
+  while (
+    MorphNode.isParenthesizedExpression(current) ||
+    MorphNode.isAsExpression(current) ||
+    MorphNode.isSatisfiesExpression(current)
+  ) {
+    current = current.getExpression();
+  }
+
+  if (MorphNode.isObjectLiteralExpression(current)) return current;
+
+  if (MorphNode.isIdentifier(current)) {
+    let symbol = current.getSymbol();
+    if (symbol?.isAlias()) {
+      try {
+        symbol = symbol.getAliasedSymbol();
+      } catch {
+        return null;
+      }
+    }
+    for (const declaration of symbol?.getDeclarations() ?? []) {
+      if (MorphNode.isVariableDeclaration(declaration)) {
+        const initializer = declaration.getInitializer();
+        if (initializer) return staticObjectValue(initializer, depth + 1);
+      }
+      if (MorphNode.isPropertyAssignment(declaration)) {
+        const initializer = declaration.getInitializer();
+        if (initializer) return staticObjectValue(initializer, depth + 1);
+      }
+    }
+    return null;
+  }
+
+  if (MorphNode.isPropertyAccessExpression(current)) {
+    const object = staticObjectValue(current.getExpression(), depth + 1);
+    if (!object || !MorphNode.isObjectLiteralExpression(object)) return null;
+    const property = object.getProperty(current.getName());
+    if (!MorphNode.isPropertyAssignment(property)) return null;
+    return property.getInitializer() ?? null;
+  }
+
+  return null;
+}
+
 function staticPathString(node: Node | null, depth = 0): string | null {
   if (!node || depth > 8) return null;
   let current = node;
@@ -222,6 +275,9 @@ function staticPathString(node: Node | null, depth = 0): string | null {
     return null;
   }
   if (MorphNode.isPropertyAccessExpression(current)) {
+    const value = staticObjectValue(current);
+    if (value) return staticPathString(value, depth + 1);
+
     let symbol = current.getSymbol();
     if (symbol?.isAlias()) {
       try { symbol = symbol.getAliasedSymbol(); } catch { return null; }
@@ -271,8 +327,36 @@ function resolvePageComponent(
 }
 
 /**
- * 判断子树里是否出现 JSX 标签 `Outlet`（含 `X.Outlet` 点号形式）。
+ * 解析 React Router 对象式路由的 `lazy` 属性。
  *
+ * 只接受静态动态导入，并从目标模块的 default export 取页面组件；`.then(convert(...))`
+ * 只是 React Router lazy 模块包装，不影响页面模块本身的归属。
+ */
+function resolveLazyPageComponent(
+  value: Node | null,
+  context: TagResolveContext,
+  componentsByFile: ReadonlyMap<string, readonly DiscoveredComponent[]>,
+): string | null {
+  if (!value) return null;
+  const imports = value.getDescendantsOfKind(SyntaxKind.CallExpression).filter((call) => {
+    return call.getExpression().getKind() === SyntaxKind.ImportKeyword;
+  });
+  for (const call of imports) {
+    const argument = call.getArguments()[0];
+    if (!argument || !MorphNode.isStringLiteral(argument)) continue;
+    const resolved = context.resolution.resolve(value.getSourceFile(), argument.getLiteralValue());
+    if (resolved.status !== "internal") continue;
+    const relativeFile = toProjectRelative(context.rootPath, resolved.filePath);
+    if (!relativeFile) continue;
+    const defaults = (componentsByFile.get(relativeFile) ?? []).filter((component) =>
+      component.exportNames.includes("default"),
+    );
+    if (defaults.length === 1) return defaults[0]?.id ?? null;
+  }
+  return null;
+}
+
+/**
  * 只看标签名——是否真的来自 react-router 由调用方的导入检查兜底。
  */
 function subtreeHasOutletTag(node: Node): boolean {
@@ -618,6 +702,7 @@ function walkRouteObjects(
   parentPath: string,
   context: TagResolveContext,
   collector: RouteCollector,
+  componentsByFile: ReadonlyMap<string, readonly DiscoveredComponent[]>,
 ): void {
   const resolved = resolveRouteArray(array);
   if (!resolved) return;
@@ -635,7 +720,7 @@ function walkRouteObjects(
     if (MorphNode.isSpreadElement(element)) {
       const spreadTarget = resolveRouteArray(element.getExpression());
       if (spreadTarget) {
-        walkRouteObjects(spreadTarget, parentPath, context, collector);
+        walkRouteObjects(spreadTarget, parentPath, context, collector, componentsByFile);
         continue;
       }
       // 展开不到字面量（函数返回、条件表达式）：路由确实存在但看不到，
@@ -657,6 +742,7 @@ function walkRouteObjects(
     const indexProp = element.getProperty("index");
     const elementProp = element.getProperty("element");
     const componentProp = element.getProperty("Component");
+    const lazyProp = element.getProperty("lazy");
     const childrenProp = element.getProperty("children");
 
     const isIndex =
@@ -685,7 +771,7 @@ function walkRouteObjects(
       }
       if (childrenProp !== undefined && MorphNode.isPropertyAssignment(childrenProp)) {
         const childArray = childrenProp.getInitializer();
-        if (childArray) walkRouteObjects(childArray, parentPath, context, collector);
+        if (childArray) walkRouteObjects(childArray, parentPath, context, collector, componentsByFile);
       }
       continue;
     }
@@ -698,10 +784,15 @@ function walkRouteObjects(
       MorphNode.isPropertyAssignment(componentProp)
         ? (componentProp.getInitializer() ?? null)
         : null;
+    const lazyValue =
+      MorphNode.isPropertyAssignment(lazyProp)
+        ? (lazyProp.getInitializer() ?? null)
+        : null;
 
     const pageComponentId =
       resolvePageComponent(elementValue, context) ??
-      resolvePageComponent(componentValue, context);
+      resolvePageComponent(componentValue, context) ??
+      resolveLazyPageComponent(lazyValue, context, componentsByFile);
 
     // layout 判定：<Outlet>（内联或组件声明子树里）优先，其次嵌套路由层级
     const hasChildren = childrenProp !== undefined;
@@ -720,7 +811,7 @@ function walkRouteObjects(
 
     if (childrenProp !== undefined && MorphNode.isPropertyAssignment(childrenProp)) {
       const childArray = childrenProp.getInitializer();
-      if (childArray) walkRouteObjects(childArray, fullPath, context, collector);
+      if (childArray) walkRouteObjects(childArray, fullPath, context, collector, componentsByFile);
     }
   }
 }
@@ -1210,6 +1301,13 @@ const PAGES_SPECIAL = new Set(["_app", "_document", "_error", "middleware"]);
 export function analyzeRoutes(input: RouteAnalysisInput): RouteAnalysisResult {
   const { rootPath, project, components, definitionIndex, resolution, framework } = input;
 
+  const componentsByFile = new Map<string, DiscoveredComponent[]>();
+  for (const component of components) {
+    const list = componentsByFile.get(component.file);
+    if (list) list.push(component);
+    else componentsByFile.set(component.file, [component]);
+  }
+
   const collector = new RouteCollector();
   const context: TagResolveContext = { rootPath, definitionIndex, resolution };
 
@@ -1223,18 +1321,11 @@ export function analyzeRoutes(input: RouteAnalysisInput): RouteAnalysisResult {
       if (!ROUTE_FACTORIES.has(lastTagSegment(callee))) continue;
       const firstArg = call.getArguments()[0];
       if (!firstArg) continue;
-      walkRouteObjects(firstArg, "/", context, collector);
+      walkRouteObjects(firstArg, "/", context, collector, componentsByFile);
     }
 
     // JSX 式路由表
     walkRouteElements(file, relativeFile, context, collector);
-  }
-
-  const componentsByFile = new Map<string, DiscoveredComponent[]>();
-  for (const component of components) {
-    const list = componentsByFile.get(component.file);
-    if (list) list.push(component);
-    else componentsByFile.set(component.file, [component]);
   }
 
   if (framework === "next") {
