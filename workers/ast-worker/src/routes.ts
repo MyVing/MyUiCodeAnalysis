@@ -54,7 +54,13 @@
 import { readdirSync, statSync, type Dirent } from "node:fs";
 import path from "node:path";
 
-import type { ArrayLiteralExpression, Node, Project, SourceFile } from "ts-morph";
+import type {
+  ArrayLiteralExpression,
+  CallExpression,
+  Node,
+  Project,
+  SourceFile,
+} from "ts-morph";
 import { Node as MorphNode, SyntaxKind } from "ts-morph";
 
 import type { Evidence, IREdge, IRNode, Warning } from "@uicodeanalysis/contracts";
@@ -327,6 +333,42 @@ function resolvePageComponent(
 }
 
 /**
+ * 读取路由对象里的页面组件字段。
+ *
+ * react-router 的数据路由用大写 `Component`，老式 CRA 路由表普遍用小写 `component`；
+ * 两种都认。只匹配这两个确定的键名，不做全局大小写不敏感，避免把业务字段当组件。
+ * 简写属性 `{ component }`（ShorthandPropertyAssignment）取同名标识符。
+ */
+function readRouteComponentValue(element: Node): Node | null {
+  if (!MorphNode.isObjectLiteralExpression(element)) return null;
+  // 不用 getProperty：它不覆盖简写属性 `{ component }`，这里按名字遍历两种属性形态
+  const prop = ["Component", "component"]
+    .map((name) =>
+      element
+        .getProperties()
+        .find(
+          (candidate) =>
+            (MorphNode.isPropertyAssignment(candidate) ||
+              MorphNode.isShorthandPropertyAssignment(candidate)) &&
+            candidate.getName() === name,
+        ),
+    )
+    .find((candidate) => candidate !== undefined);
+  if (prop === undefined) return null;
+  if (MorphNode.isPropertyAssignment(prop)) return prop.getInitializer() ?? null;
+  if (MorphNode.isShorthandPropertyAssignment(prop)) {
+    const nameNode = prop.getNameNode();
+    // 简写属性的名字节点拿到的是 property symbol（声明就是简写本身），
+    // 换成同文件同名变量声明的名字节点，才能沿符号找到 `const component = ...`。
+    return (
+      nameNode.getSourceFile().getVariableDeclaration(nameNode.getText())?.getNameNode() ??
+      nameNode
+    );
+  }
+  return null;
+}
+
+/**
  * 解析 React Router 对象式路由的 `lazy` 属性。
  *
  * 只接受静态动态导入，并从目标模块的 default export 取页面组件；`.then(convert(...))`
@@ -342,18 +384,91 @@ function resolveLazyPageComponent(
     return call.getExpression().getKind() === SyntaxKind.ImportKeyword;
   });
   for (const call of imports) {
-    const argument = call.getArguments()[0];
-    if (!argument || !MorphNode.isStringLiteral(argument)) continue;
-    const resolved = context.resolution.resolve(value.getSourceFile(), argument.getLiteralValue());
-    if (resolved.status !== "internal") continue;
-    const relativeFile = toProjectRelative(context.rootPath, resolved.filePath);
-    if (!relativeFile) continue;
-    const defaults = (componentsByFile.get(relativeFile) ?? []).filter((component) =>
-      component.exportNames.includes("default"),
-    );
-    if (defaults.length === 1) return defaults[0]?.id ?? null;
+    const resolved = resolveLazyImportCall(call, context, componentsByFile);
+    if (resolved) return resolved;
   }
   return null;
+}
+
+/**
+ * `component: Home` 且 `Home = lazy(() => import("..."))` 的归属解析。
+ *
+ * 与 `lazy` 属性的区别是这里要**先严格确认包装是 `lazy(...)`**：普通组件函数体里
+ * 也可能出现动态 import 做代码分割，仅凭“看到 import()”就归属会误判。
+ * 标识符只穿透一层声明（`const Home = lazy(...)`），不做多层 HOC 展开。
+ */
+function resolveLazyComponentValue(
+  value: Node | null,
+  context: TagResolveContext,
+  componentsByFile: ReadonlyMap<string, readonly DiscoveredComponent[]>,
+): string | null {
+  const importCall = lazyImportCallOf(value);
+  return importCall ? resolveLazyImportCall(importCall, context, componentsByFile) : null;
+}
+
+/** 取 `lazy(() => import("..."))` 里的那个 import 调用；不是 lazy 形态就返回 null。 */
+function lazyImportCallOf(value: Node | null): CallExpression | null {
+  if (!value) return null;
+  let node: Node = value;
+  while (MorphNode.isParenthesizedExpression(node)) node = node.getExpression();
+
+  if (MorphNode.isIdentifier(node)) {
+    let symbol = node.getSymbol();
+    if (symbol?.isAlias()) {
+      try {
+        symbol = symbol.getAliasedSymbol();
+      } catch {
+        return null;
+      }
+    }
+    for (const decl of symbol?.getDeclarations() ?? []) {
+      if (!MorphNode.isVariableDeclaration(decl)) continue;
+      const initializer = decl.getInitializer();
+      if (!initializer) continue;
+      const lazyCall = asLazyCall(initializer);
+      const importCall = lazyCall ? findImportCall(lazyCall) : null;
+      if (importCall) return importCall;
+    }
+    return null;
+  }
+
+  const lazyCall = asLazyCall(node);
+  return lazyCall ? findImportCall(lazyCall) : null;
+}
+
+function asLazyCall(node: Node): CallExpression | null {
+  let current: Node = node;
+  while (MorphNode.isParenthesizedExpression(current)) current = current.getExpression();
+  if (!MorphNode.isCallExpression(current)) return null;
+  return lastTagSegment(current.getExpression().getText()) === "lazy" ? current : null;
+}
+
+function findImportCall(lazyCall: CallExpression): CallExpression | null {
+  const factory = lazyCall.getArguments()[0];
+  if (!factory) return null;
+  for (const call of factory.getDescendantsOfKind(SyntaxKind.CallExpression)) {
+    if (call.getExpression().getKind() === SyntaxKind.ImportKeyword) return call;
+  }
+  return null;
+}
+
+/** 动态导入 → 目标模块唯一的 default export 组件；解析失败返回 null，不猜。 */
+function resolveLazyImportCall(
+  call: CallExpression,
+  context: TagResolveContext,
+  componentsByFile: ReadonlyMap<string, readonly DiscoveredComponent[]>,
+): string | null {
+  const argument = call.getArguments()[0];
+  if (!argument || !MorphNode.isStringLiteral(argument)) return null;
+  // 基准文件必须是 import 调用自身所在的文件：穿透标识符后它可能不在路由表文件里
+  const resolved = context.resolution.resolve(call.getSourceFile(), argument.getLiteralValue());
+  if (resolved.status !== "internal") return null;
+  const relativeFile = toProjectRelative(context.rootPath, resolved.filePath);
+  if (!relativeFile) return null;
+  const defaults = (componentsByFile.get(relativeFile) ?? []).filter((component) =>
+    component.exportNames.includes("default"),
+  );
+  return defaults.length === 1 ? defaults[0]?.id ?? null : null;
 }
 
 /**
@@ -750,7 +865,6 @@ function walkRouteObjects(
     const pathProp = element.getProperty("path");
     const indexProp = element.getProperty("index");
     const elementProp = element.getProperty("element");
-    const componentProp = element.getProperty("Component");
     const lazyProp = element.getProperty("lazy");
     const childrenProp = element.getProperty("children");
 
@@ -789,10 +903,7 @@ function walkRouteObjects(
 
     const elementValue =
       MorphNode.isPropertyAssignment(elementProp) ? (elementProp.getInitializer() ?? null) : null;
-    const componentValue =
-      MorphNode.isPropertyAssignment(componentProp)
-        ? (componentProp.getInitializer() ?? null)
-        : null;
+    const componentValue = readRouteComponentValue(element);
     const lazyValue =
       MorphNode.isPropertyAssignment(lazyProp)
         ? (lazyProp.getInitializer() ?? null)
@@ -801,6 +912,8 @@ function walkRouteObjects(
     const pageComponentId =
       resolvePageComponent(elementValue, context) ??
       resolvePageComponent(componentValue, context) ??
+      // 小写 component 常见指向 lazy 局部变量，与 react-router 的 lazy 键同等对待
+      resolveLazyComponentValue(componentValue, context, componentsByFile) ??
       resolveLazyPageComponent(lazyValue, context, componentsByFile);
 
     // layout 判定：<Outlet>（内联或组件声明子树里）优先，其次嵌套路由层级

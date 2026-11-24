@@ -1004,3 +1004,107 @@ describe("Routes 子树内的自定义递归渲染（通道三）", () => {
   });
 });
 
+describe("对象式路由的 component 键与 lazy 局部变量", () => {
+  const appShell = `
+    import { Routes, Route } from "react-router-dom";
+    import { routes } from "./routes";
+    function generateRouter(items: any[]) {
+      return items.map((item) => <Route key={item.path} path={item.path} element={item.element} />);
+    }
+    export function App() {
+      return <Routes>{generateRouter(routes)}</Routes>;
+    }
+  `;
+
+  it("小写 component 指向直接导入的组件时能连上", () => {
+    const result = analyzeSynthetic({
+      "src/Pages/HomePage.tsx": "export default function HomePage() { return <div />; }",
+      "src/routes.tsx": `
+        import HomePage from "./Pages/HomePage";
+        export const routes = [{ path: "/home", component: HomePage }];
+      `,
+      "src/App.tsx": appShell,
+    });
+
+    const route = routeByPath(result, "/home");
+    expect(String(route.attrs.pageComponentId)).toContain("HomePage");
+    expect(result.warnings.some((warning) => warning.code === "route_element_unresolved")).toBe(false);
+  });
+
+  it("大写 Component 的既有行为不回归", () => {
+    const result = analyzeSynthetic({
+      "src/Pages/HomePage.tsx": "export default function HomePage() { return <div />; }",
+      "src/routes.tsx": `
+        import HomePage from "./Pages/HomePage";
+        export const routes = [{ path: "/upper", Component: HomePage }];
+      `,
+      "src/App.tsx": appShell,
+    });
+
+    expect(String(routeByPath(result, "/upper").attrs.pageComponentId)).toContain("HomePage");
+  });
+
+  it("component 指向 lazy 局部变量时解析到目标模块的 default export", () => {
+    const result = analyzeSynthetic({
+      "src/Pages/LazyHome.tsx": "export default function LazyHome() { return <div />; }",
+      "src/routes.tsx": `
+        import { lazy } from "react";
+        const Home = lazy(() => import("./Pages/LazyHome"));
+        export const routes = [{ path: "/lazy", component: Home }];
+      `,
+      "src/App.tsx": appShell,
+    });
+
+    const route = routeByPath(result, "/lazy");
+    expect(String(route.attrs.pageComponentId)).toContain("LazyHome");
+    expect(result.warnings.some((warning) => warning.code === "route_element_unresolved")).toBe(false);
+  });
+
+  it("简写属性 { component } 也能穿透 lazy 局部变量", () => {
+    const result = analyzeSynthetic({
+      "src/Pages/LazyHome.tsx": "export default function LazyHome() { return <div />; }",
+      "src/routes.tsx": `
+        import { lazy } from "react";
+        const component = lazy(() => import("./Pages/LazyHome"));
+        export const routes = [{ path: "/short", component }];
+      `,
+      "src/App.tsx": appShell,
+    });
+
+    expect(String(routeByPath(result, "/short").attrs.pageComponentId)).toContain("LazyHome");
+  });
+
+  it("lazy 目标没有 default export 时保留节点并维持告警", () => {
+    const result = analyzeSynthetic({
+      "src/Pages/NamedOnly.tsx": "export function NamedOnly() { return <div />; }",
+      "src/routes.tsx": `
+        import { lazy } from "react";
+        const Home = lazy(() => import("./Pages/NamedOnly"));
+        export const routes = [{ path: "/named", component: Home }];
+      `,
+      "src/App.tsx": appShell,
+    });
+
+    const route = routeByPath(result, "/named");
+    expect(route.attrs.pageComponentId).toBeUndefined();
+    expect(result.warnings.some((warning) => warning.code === "route_element_unresolved")).toBe(true);
+  });
+
+  it("普通本地函数体内的动态 import 不会被当成 lazy 页面来源", () => {
+    const result = analyzeSynthetic({
+      "src/routes.tsx": `
+        function Login() {
+          import("./chunk");
+          return <div />;
+        }
+        export const routes = [{ path: "/login", component: Login }];
+      `,
+      "src/App.tsx": appShell,
+    });
+
+    const route = routeByPath(result, "/login");
+    expect(route.attrs.pageComponentId).toBeUndefined();
+    expect(result.warnings.some((warning) => warning.code === "route_element_unresolved")).toBe(true);
+  });
+});
+
