@@ -35,6 +35,7 @@ import { Node as MorphNode, SyntaxKind } from "ts-morph";
 import type { Evidence, IREdge, IRNode, Warning } from "@uicodeanalysis/contracts";
 
 import { findNearestOwner } from "./ownership.js";
+import { findImportSource } from "./jsx-refs.js";
 import { isProjectSource, toPosix, toProjectRelative } from "./paths.js";
 import { positionKey } from "./positions.js";
 
@@ -45,6 +46,27 @@ import { positionKey } from "./positions.js";
  * `ajax` 之类）。业务封装由"请求封装器"机制识别，用不着列举。
  */
 const HTTP_CLIENTS = new Set(["fetch", "axios", "ky", "got"]);
+
+/** HTTP 动词：外部服务对象识别只认这些方法名。 */
+const HTTP_VERB_NAMES = new Set([
+  "GET",
+  "POST",
+  "PUT",
+  "PATCH",
+  "DELETE",
+  "HEAD",
+  "OPTIONS",
+  "REQUEST",
+]);
+
+/** 外部服务对象的根名特征。名单之外只按「服务/客户端语义」放行，不做业务名硬编码。 */
+const SERVICE_RECEIVER_PATTERN = /(service|client|http|api|request)/i;
+
+/** callee 别名（`const postHttp = Client.post`）穿透层数上限。 */
+const MAX_CALLEE_ALIAS_DEPTH = 3;
+
+/** URL 常量拼接求值穿透层数上限。 */
+const MAX_URL_EXPRESSION_DEPTH = 3;
 
 /** 从实参对象里提取 URL 的候选属性名（按优先级）。 */
 const URL_PROPERTY_NAMES = ["url", "uri", "endpoint", "path"];
@@ -230,6 +252,59 @@ function readUrl(node: Node): UrlReadResult {
   }
 
   return { text: null, unresolvedPrefix: false, raw: node.getText() };
+}
+
+/** `readUrlExpression` 的结果：求出来的 URL、真正决定 URL 的节点、是否经变量/常量转手。 */
+interface UrlExpressionRead {
+  read: UrlReadResult;
+  node: Node;
+  indirect: boolean;
+}
+
+/**
+ * URL 实参求值：字面量/模板之外，再支持「标识符 → 初始化器」与静态 `+` 拼接。
+ *
+ * 只用于请求点的 URL 实参；不改 `readUrl` 本体，避免影响封装器的参数流转与
+ * 模板前缀告警。求不出来时保持 `text: null`（调用方按原语义跳过），不猜。
+ */
+function readUrlExpression(node: Node, depth = 0): UrlExpressionRead {
+  let current = node;
+  while (MorphNode.isParenthesizedExpression(current)) current = current.getExpression();
+
+  const direct = readUrl(current);
+  if (direct.text !== null) return { read: direct, node: current, indirect: false };
+  if (depth >= MAX_URL_EXPRESSION_DEPTH) return { read: direct, node: current, indirect: false };
+
+  if (MorphNode.isIdentifier(current)) {
+    for (const decl of current.getSymbol()?.getDeclarations() ?? []) {
+      if (!MorphNode.isVariableDeclaration(decl)) continue;
+      const initializer = decl.getInitializer();
+      if (!initializer) continue;
+      const inner = readUrlExpression(initializer, depth + 1);
+      if (inner.read.text !== null) return { read: inner.read, node: inner.node, indirect: true };
+    }
+    return { read: direct, node: current, indirect: false };
+  }
+
+  if (
+    MorphNode.isBinaryExpression(current) &&
+    current.getOperatorToken().getKind() === SyntaxKind.PlusToken
+  ) {
+    const evaluated = tryEvaluatePrefixExpression(current);
+    if (evaluated !== null) {
+      return {
+        read: {
+          text: normalizeUrlText(evaluated),
+          unresolvedPrefix: false,
+          raw: current.getText(),
+        },
+        node: current,
+        indirect: true,
+      };
+    }
+  }
+
+  return { read: direct, node: current, indirect: false };
 }
 
 /**
@@ -481,36 +556,133 @@ function findPropertyInitializer(
  * 两道条件同时满足才算：名字在受控名单里，且符号声明在项目外。
  * 只看名字会把项目内自定义的 `fetch` 包装误判；只看位置又会把任何第三方
  * 函数（如 lodash 的 `get`）都当成客户端。
+ *
+ * 名单之外再识别一类「外部服务对象」：`CvmService.post(...)` 这种由外部包导出的
+ * 服务客户端，方法名是 HTTP 动词、receiver 来自项目外、URL 实参可静态求值。
+ * 不硬编码业务类名，避免换个导入名就失效。
  */
 function isHttpClientCall(call: CallExpression, rootPath: string): boolean {
-  const expr = call.getExpression();
+  const expr = resolveCalleeExpression(call);
 
   // `axios.get(...)` 取方法名；`fetch(...)` 取标识符
-  if (!MorphNode.isIdentifier(expr) && !MorphNode.isPropertyAccessExpression(expr)) return false;
+  if (MorphNode.isIdentifier(expr)) {
+    const symbol = expr.getSymbol();
+    const decls: Node[] = symbol?.getDeclarations() ?? [];
+    if (decls.length === 0) return false;
+    // 不能用 toProjectRelative 判空：node_modules 就在 rootPath 之下，
+    // 相对路径非空但它显然不是项目源码。isProjectSource 同时排除依赖与 .d.ts。
+    const allExternal = decls.every(
+      (decl) => !isProjectSource(rootPath, decl.getSourceFile().getFilePath()),
+    );
+    if (!allExternal) return false;
+    return HTTP_CLIENTS.has(expr.getText());
+  }
 
-  const name = MorphNode.isIdentifier(expr) ? expr.getText() : expr.getName();
+  if (!MorphNode.isPropertyAccessExpression(expr)) return false;
 
+  // 已知客户端：保留「方法符号在项目外」的既有门槛
   const symbol = expr.getSymbol();
   const decls: Node[] = symbol?.getDeclarations() ?? [];
-  if (decls.length === 0) return false;
+  const allExternal =
+    decls.length > 0 &&
+    decls.every((decl) => !isProjectSource(rootPath, decl.getSourceFile().getFilePath()));
 
-  // 不能用 toProjectRelative 判空：node_modules 就在 rootPath 之下，
-  // 相对路径非空但它显然不是项目源码。isProjectSource 同时排除依赖与 .d.ts。
-  const allExternal = decls.every(
-    (decl) => !isProjectSource(rootPath, decl.getSourceFile().getFilePath()),
-  );
-  if (!allExternal) return false;
-
-  // `axios.get` 的根标识符是 axios；`fetch` 本身就是客户端
-  if (MorphNode.isPropertyAccessExpression(expr)) {
+  if (allExternal) {
     const receiver = expr.getExpression();
-    const rootName = receiver.getText().split(".")[0] ?? "";
-    if (HTTP_CLIENTS.has(rootName)) return true;
-    // 根名不在名单里时查类型：DI 注入的客户端（`this.http` / `axios.create()`
-    // 的实例）名字与初始化器都不含客户端痕迹，但类型系统知道它是谁
-    return resolveReceiverClient(receiver, rootPath);
+    const rootName = rootIdentifierOf(receiver)?.getText() ?? "";
+    // `axios.get` 的根标识符是 axios；根名不在名单里时查类型：DI 注入的客户端
+    // （`this.http` / `axios.create()` 的实例）名字与初始化器都不含客户端痕迹，
+    // 但类型系统知道它是谁
+    if (HTTP_CLIENTS.has(rootName) || resolveReceiverClient(receiver, rootPath)) return true;
   }
-  return HTTP_CLIENTS.has(name);
+
+  return isExternalServiceCall(expr, call, rootPath);
+}
+
+/**
+ * `CvmService.post(...)` 这类「外部服务对象」的识别。
+ *
+ * 四个条件同时成立才认：方法名是 HTTP 动词、根标识符有服务语义或来自裸包名、
+ * 根声明在项目外（符号解析不到时退回裸包名 import）、首个实参是可静态求值的 URL。
+ * 项目内定义的 `api/client` 对象会被外部性条件挡掉；`lodash.get(obj, "a.b")`
+ * 会被 URL 形态挡掉。
+ */
+function isExternalServiceCall(
+  expr: PropertyAccessExpression,
+  call: CallExpression,
+  rootPath: string,
+): boolean {
+  if (!HTTP_VERB_NAMES.has(expr.getName().toUpperCase())) return false;
+
+  const root = rootIdentifierOf(expr.getExpression());
+  if (!root) return false;
+
+  const importSource = findImportSource(root.getSourceFile(), root.getText());
+  const bareImport = importSource !== null && isBarePackageSpecifier(importSource);
+  if (!SERVICE_RECEIVER_PATTERN.test(root.getText()) && !bareImport) return false;
+
+  const decls = root.getSymbol()?.getDeclarations() ?? [];
+  const allExternal =
+    decls.length > 0 &&
+    decls.every((decl) => !isProjectSource(rootPath, decl.getSourceFile().getFilePath()));
+  if (!allExternal && !bareImport) return false;
+
+  return isUrlLikeArgument(call.getArguments()[0]);
+}
+
+/**
+ * callee 归一：`const postHttp = Client.post; postHttp(...)` 归到属性访问。
+ *
+ * import/export 别名交给符号解析；变量别名只穿透初始化器，最多三层。只接受
+ * 归一后仍是属性访问的结果——返回标识符不会改变既有判定。
+ */
+function resolveCalleeExpression(call: CallExpression): Node {
+  return unwrapCalleeAlias(call.getExpression(), 0);
+}
+
+function unwrapCalleeAlias(expr: Node, depth: number): Node {
+  let node = expr;
+  while (MorphNode.isParenthesizedExpression(node)) node = node.getExpression();
+  if (!MorphNode.isIdentifier(node) || depth >= MAX_CALLEE_ALIAS_DEPTH) return node;
+
+  let symbol = node.getSymbol();
+  if (symbol?.isAlias()) {
+    try {
+      symbol = symbol.getAliasedSymbol();
+    } catch {
+      return node;
+    }
+  }
+  for (const decl of symbol?.getDeclarations() ?? []) {
+    if (!MorphNode.isVariableDeclaration(decl)) continue;
+    const initializer = decl.getInitializer();
+    if (!initializer) continue;
+    const unwrapped = unwrapCalleeAlias(initializer, depth + 1);
+    if (MorphNode.isPropertyAccessExpression(unwrapped)) return unwrapped;
+  }
+  return node;
+}
+
+/** receiver 链的根标识符：`a.b.c` → `a`；不是标识符开头（如调用结果）返回 null。 */
+function rootIdentifierOf(node: Node): Node | null {
+  let current = node;
+  while (MorphNode.isPropertyAccessExpression(current)) current = current.getExpression();
+  return MorphNode.isIdentifier(current) ? current : null;
+}
+
+/**
+ * 裸包名 import：`@scope/pkg`、`pkg`。相对路径与 `@/`、`~/` 这类项目别名不算。
+ *
+ * 依赖未安装时属性符号可能为空，此时靠 import 说明符判断「不是项目内代码」。
+ */
+function isBarePackageSpecifier(specifier: string): boolean {
+  if (specifier.startsWith(".") || specifier.startsWith("/")) return false;
+  return !specifier.startsWith("@/") && !specifier.startsWith("~/");
+}
+
+/** 首个实参能否静态求值成 URL。 */
+function isUrlLikeArgument(node: Node | undefined): boolean {
+  return node !== undefined && readUrlExpression(node).read.text !== null;
 }
 
 /**
@@ -1628,14 +1800,13 @@ function buildDirectRequestSite(
   urlArg: Node,
   rootPath: string,
 ): RequestSite | null {
-  const resolved = resolveIdentifier(urlArg);
-  const urlNode = resolved?.node ?? urlArg;
-  const read = readUrl(urlNode);
+  const urlRead = readUrlExpression(urlArg);
+  const read = urlRead.read;
   if (!read.text) return null;
 
-  const urlFile = toProjectRelative(rootPath, urlNode.getSourceFile().getFilePath());
+  const urlFile = toProjectRelative(rootPath, urlRead.node.getSourceFile().getFilePath());
   if (urlFile === null) return null;
-  const pos = urlNode.getSourceFile().getLineAndColumnAtPos(urlNode.getStart());
+  const pos = urlRead.node.getSourceFile().getLineAndColumnAtPos(urlRead.node.getStart());
 
   const method = getMethodFromOptions(call) ?? inferMethodFromCallee(call) ?? DEFAULT_METHOD;
   const requestBody = requestBodyOf(call, rootPath);
@@ -1649,7 +1820,7 @@ function buildDirectRequestSite(
     evidence: [
       {
         source: "static",
-        confidence: resolved ? LOCAL_VAR_CONFIDENCE : DIRECT_CONFIDENCE,
+        confidence: urlRead.indirect ? LOCAL_VAR_CONFIDENCE : DIRECT_CONFIDENCE,
         file: urlFile,
         loc: { line: pos.line, col: pos.column },
       },
@@ -1659,9 +1830,9 @@ function buildDirectRequestSite(
   };
 }
 
-/** `axios.post(...)` 这类调用从方法名推断 HTTP 方法。 */
+/** `axios.post(...)` 这类调用从方法名推断 HTTP 方法；别名先归一到目标属性访问。 */
 function inferMethodFromCallee(call: CallExpression): string | null {
-  const expr = call.getExpression();
+  const expr = resolveCalleeExpression(call);
   if (!MorphNode.isPropertyAccessExpression(expr)) return null;
   const name = expr.getName().toUpperCase();
   return ["GET", "POST", "PUT", "DELETE", "PATCH", "HEAD", "OPTIONS"].includes(name) ? name : null;

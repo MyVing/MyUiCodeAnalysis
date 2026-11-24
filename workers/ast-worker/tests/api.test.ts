@@ -76,6 +76,100 @@ function apiIds(result: ApiAnalysisResult): string[] {
   return result.apiNodes.map((n) => n.id).sort();
 }
 
+describe("外部服务对象与 URL 常量拼接", () => {
+  const cvmModule = `
+    import { CvmService } from "@lu14/cvm2-web-react";
+
+    export const postHttp = CvmService.post;
+
+    export function mockLogin(data: any) {
+      return CvmService.post(\`/cmvcweb/v1/localSin\`, data, { mask: true });
+    }
+
+    export function save(data: any) {
+      return postHttp("/svc/b", data);
+    }
+
+    const BAS_CFG_SVC = "/bas";
+    const V1 = "/v1";
+    const getMenuConfigUrl = BAS_CFG_SVC + V1 + "/front/getMenuConfig";
+
+    export function getMenuConfig() {
+      return CvmService.post(getMenuConfigUrl, {});
+    }
+
+    const PREFIX = "/cmvcweb" + V1;
+
+    export function localSin() {
+      return CvmService.get(\`\${PREFIX}/localSin\`);
+    }
+  `;
+
+  it("外部服务对象的直调（模板 URL）能产出接口", () => {
+    const result = analyzeSynthetic({ "src/services/cvm.ts": cvmModule });
+    expect(apiIds(result)).toContain("api:POST:/cmvcweb/v1/localsin");
+  });
+
+  it("别名导出的客户端调用能识别，且方法是 POST 而不是 GET", () => {
+    const result = analyzeSynthetic({ "src/services/cvm.ts": cvmModule });
+    const node = result.apiNodes.find((candidate) => candidate.id === "api:POST:/svc/b");
+    expect(node).toBeDefined();
+    expect(node?.attrs).toMatchObject({ method: "POST", url: "/svc/b" });
+  });
+
+  it("常量 + 拼接的 URL 能求值", () => {
+    const result = analyzeSynthetic({ "src/services/cvm.ts": cvmModule });
+    expect(apiIds(result)).toContain("api:POST:/bas/v1/front/getmenuconfig");
+  });
+
+  it("模板前缀由常量拼接时仍能求值", () => {
+    const result = analyzeSynthetic({ "src/services/cvm.ts": cvmModule });
+    expect(apiIds(result)).toContain("api:GET:/cmvcweb/v1/localsin");
+  });
+
+  it("外部通用库的 get(obj, path) 不会被误判成客户端", () => {
+    const result = analyzeSynthetic({
+      "src/utils/pick.ts": `
+        import _ from "lodash";
+        export function pick(source: any) {
+          return _.get(source, "a.b");
+        }
+      `,
+    });
+    expect(result.apiNodes).toHaveLength(0);
+  });
+
+  it("项目内定义的 router.get 不会被误判成客户端", () => {
+    const result = analyzeSynthetic({
+      "src/nav.ts": `
+        const router = { get: (path: string) => path };
+        export function nav() {
+          return router.get("/users");
+        }
+      `,
+    });
+    expect(result.apiNodes).toHaveLength(0);
+  });
+
+  it("既有封装器链路不回归", () => {
+    const result = analyzeSynthetic({
+      "src/services/http.ts": `
+        export async function request(url: string, init?: any) {
+          return fetch(url, init);
+        }
+      `,
+      "src/pages/User.tsx": `
+        import { request } from "../services/http";
+        export function User() {
+          const load = () => request("/api/user");
+          return <button onClick={load}>load</button>;
+        }
+      `,
+    });
+    expect(apiIds(result)).toContain("api:GET:/api/user");
+  });
+});
+
 describe("API 链路（真实样本仓）", () => {
   let result: ApiAnalysisResult;
 
