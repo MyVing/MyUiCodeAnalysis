@@ -703,9 +703,18 @@ function walkRouteObjects(
   context: TagResolveContext,
   collector: RouteCollector,
   componentsByFile: ReadonlyMap<string, readonly DiscoveredComponent[]>,
+  visited?: Set<string>,
 ): void {
   const resolved = resolveRouteArray(array);
   if (!resolved) return;
+
+  // 同一条数组只展开一次：工厂通道与 Routes 渲染通道可能指向同一份数据。
+  // key 用「文件 + 起始偏移」而不是路径字符串——同一文件里两个同名数组是不同数组。
+  if (visited) {
+    const key = `${resolved.getSourceFile().getFilePath()}:${resolved.getStart()}`;
+    if (visited.has(key)) return;
+    visited.add(key);
+  }
 
   const relativeFile = toProjectRelative(
     context.rootPath,
@@ -720,7 +729,7 @@ function walkRouteObjects(
     if (MorphNode.isSpreadElement(element)) {
       const spreadTarget = resolveRouteArray(element.getExpression());
       if (spreadTarget) {
-        walkRouteObjects(spreadTarget, parentPath, context, collector, componentsByFile);
+        walkRouteObjects(spreadTarget, parentPath, context, collector, componentsByFile, visited);
         continue;
       }
       // 展开不到字面量（函数返回、条件表达式）：路由确实存在但看不到，
@@ -771,7 +780,7 @@ function walkRouteObjects(
       }
       if (childrenProp !== undefined && MorphNode.isPropertyAssignment(childrenProp)) {
         const childArray = childrenProp.getInitializer();
-        if (childArray) walkRouteObjects(childArray, parentPath, context, collector, componentsByFile);
+        if (childArray) walkRouteObjects(childArray, parentPath, context, collector, componentsByFile, visited);
       }
       continue;
     }
@@ -811,7 +820,7 @@ function walkRouteObjects(
 
     if (childrenProp !== undefined && MorphNode.isPropertyAssignment(childrenProp)) {
       const childArray = childrenProp.getInitializer();
-      if (childArray) walkRouteObjects(childArray, fullPath, context, collector, componentsByFile);
+      if (childArray) walkRouteObjects(childArray, fullPath, context, collector, componentsByFile, visited);
     }
   }
 }
@@ -971,6 +980,146 @@ function walkRouteElements(
       isLayout,
       title: titleAttr ? literalString(attributeValueNode(titleAttr)) : null,
     });
+  }
+}
+
+/* ------------------------------------------------------------------ *
+ * React Router：`<Routes>` 子树内的自定义递归渲染
+ *
+ * 有些项目不把路由数组交给路由工厂，而是在 `<Routes>` 里调用自己的递归函数，
+ * 由它 `routes.map(item => <Route ... />)`。这类路由的 `<Route>` 写在独立函数
+ * 作用域里，祖先链不含 `<Routes>`，JSX 通道看不到；数组也没传给工厂，对象通道
+ * 也看不到。这里只补「消费点」这一段：**必须从 `<Routes>` 子树内的调用进入**，
+ * 再把实参（或函数体内 `.map` 的数据源）交回 `walkRouteObjects`，路径规则与
+ * 页面组件解析完全复用，不另写一套。
+ * ------------------------------------------------------------------ */
+
+/** 从调用点到函数体的最大穿透层数（`useCallback(fn)` / `const a = fn`）。 */
+const MAX_ROUTE_RENDERER_HOPS = 3;
+
+/** 表达式 → 函数节点：解开括号、标识符声明与 `useCallback` / `useMemo` 包装。 */
+function resolveRendererFunction(node: Node, hops = 0): Node | null {
+  if (hops > MAX_ROUTE_RENDERER_HOPS) return null;
+  if (
+    MorphNode.isArrowFunction(node) ||
+    MorphNode.isFunctionExpression(node) ||
+    MorphNode.isFunctionDeclaration(node)
+  ) {
+    return node;
+  }
+  if (MorphNode.isParenthesizedExpression(node)) {
+    return resolveRendererFunction(node.getExpression(), hops);
+  }
+  if (MorphNode.isIdentifier(node)) {
+    // 沿符号声明回溯，不按名字猜——同名函数在不同文件里是不同实现
+    let symbol = node.getSymbol();
+    if (symbol?.isAlias()) {
+      try {
+        symbol = symbol.getAliasedSymbol();
+      } catch {
+        return null;
+      }
+    }
+    for (const decl of symbol?.getDeclarations() ?? []) {
+      if (MorphNode.isFunctionDeclaration(decl)) return decl;
+      if (!MorphNode.isVariableDeclaration(decl)) continue;
+      const init = decl.getInitializer();
+      if (init) return resolveRendererFunction(init, hops + 1);
+    }
+    return null;
+  }
+  if (MorphNode.isCallExpression(node)) {
+    const callee = lastTagSegment(node.getExpression().getText());
+    if (callee === "useCallback" || callee === "useMemo") {
+      const first = node.getArguments()[0];
+      return first ? resolveRendererFunction(first, hops + 1) : null;
+    }
+  }
+  return null;
+}
+
+/** 函数体内是否直接产出 `<Route>` 的 JSX（这是「递归渲染函数」的判据）。 */
+function rendersRouteJsx(fn: Node): boolean {
+  for (const element of fn.getDescendantsOfKind(SyntaxKind.JsxElement)) {
+    const tag = elementTagName(element);
+    if (tag !== null && lastTagSegment(tag) === "Route") return true;
+  }
+  for (const element of fn.getDescendantsOfKind(SyntaxKind.JsxSelfClosingElement)) {
+    const tag = elementTagName(element);
+    if (tag !== null && lastTagSegment(tag) === "Route") return true;
+  }
+  return false;
+}
+
+/**
+ * 递归函数内部 `.map(...)` 的数据源中，能静态求值成数组字面量的那些。
+ *
+ * 覆盖 `generateRouter()` 不接参数、直接读模块级 `routes` 的写法。
+ */
+function routeArraySourcesIn(fn: Node): Node[] {
+  const sources: Node[] = [];
+  for (const call of fn.getDescendantsOfKind(SyntaxKind.CallExpression)) {
+    const callee = call.getExpression();
+    if (!MorphNode.isPropertyAccessExpression(callee)) continue;
+    if (callee.getName() !== "map") continue;
+    const receiver = callee.getExpression();
+    if (resolveRouteArray(receiver)) sources.push(receiver);
+  }
+  return sources;
+}
+
+/**
+ * 通道三：`<Routes>` 子树 → 自定义递归渲染函数 → 路由数组。
+ *
+ * 只从 `<Routes>` 子树内的调用进入，因此普通数据数组（菜单、面包屑、Tabs）
+ * 不会被误收；找不到可求值的数据源时记 `route_renderer_unresolved`，不静默丢弃。
+ */
+function walkRoutesViaRenderers(
+  file: SourceFile,
+  relativeFile: string,
+  context: TagResolveContext,
+  collector: RouteCollector,
+  componentsByFile: ReadonlyMap<string, readonly DiscoveredComponent[]>,
+  visited: Set<string>,
+): void {
+  const routesElements = [
+    ...file.getDescendantsOfKind(SyntaxKind.JsxElement),
+    ...file.getDescendantsOfKind(SyntaxKind.JsxSelfClosingElement),
+  ].filter((node) => {
+    const tag = elementTagName(node);
+    return tag !== null && lastTagSegment(tag) === "Routes";
+  });
+
+  for (const routesElement of routesElements) {
+    for (const call of routesElement.getDescendantsOfKind(SyntaxKind.CallExpression)) {
+      const fn = resolveRendererFunction(call.getExpression());
+      // 只处理「确实在产出 <Route>」的函数，其它调用（hooks、条件表达式）不碰
+      if (!fn || !rendersRouteJsx(fn)) continue;
+
+      let found = false;
+      const firstArg = call.getArguments()[0];
+      if (firstArg && resolveRouteArray(firstArg)) {
+        walkRouteObjects(firstArg, "/", context, collector, componentsByFile, visited);
+        found = true;
+      }
+      if (!found) {
+        for (const source of routeArraySourcesIn(fn)) {
+          walkRouteObjects(source, "/", context, collector, componentsByFile, visited);
+          found = true;
+        }
+      }
+
+      if (!found) {
+        collector.warnings.push({
+          code: "route_renderer_unresolved",
+          severity: "info",
+          stage: "static",
+          file: relativeFile,
+          loc: locOf(call),
+          message: `Routes 内的渲染函数 \`${call.getExpression().getText()}\` 找不到可静态求值的路由数组，其下路由未计入图谱`,
+        });
+      }
+    }
   }
 }
 
@@ -1310,6 +1459,8 @@ export function analyzeRoutes(input: RouteAnalysisInput): RouteAnalysisResult {
 
   const collector = new RouteCollector();
   const context: TagResolveContext = { rootPath, definitionIndex, resolution };
+  // 同一条路由数组可能同时被工厂通道与 Routes 渲染通道消费，展开一次即可
+  const visitedArrays = new Set<string>();
 
   for (const file of project.getSourceFiles()) {
     const relativeFile = toProjectRelative(rootPath, file.getFilePath());
@@ -1321,11 +1472,14 @@ export function analyzeRoutes(input: RouteAnalysisInput): RouteAnalysisResult {
       if (!ROUTE_FACTORIES.has(lastTagSegment(callee))) continue;
       const firstArg = call.getArguments()[0];
       if (!firstArg) continue;
-      walkRouteObjects(firstArg, "/", context, collector, componentsByFile);
+      walkRouteObjects(firstArg, "/", context, collector, componentsByFile, visitedArrays);
     }
 
     // JSX 式路由表
     walkRouteElements(file, relativeFile, context, collector);
+
+    // `<Routes>` 内自定义递归渲染函数消费的数据路由数组
+    walkRoutesViaRenderers(file, relativeFile, context, collector, componentsByFile, visitedArrays);
   }
 
   if (framework === "next") {

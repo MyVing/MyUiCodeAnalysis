@@ -834,3 +834,173 @@ describe("Docusaurus 文件路由", () => {
     ).toBe(true);
   });
 });
+
+describe("Routes 子树内的自定义递归渲染（通道三）", () => {
+  it("数据数组经 useCallback 递归渲染后被识别为 route 节点", () => {
+    const result = analyzeSynthetic({
+      "src/routes.tsx": `
+        import { Home, UserList } from "./Pages";
+        export const routes = [
+          { path: "/", element: <Home /> },
+          { path: "/users", element: <UserList /> },
+        ];
+      `,
+      "src/App.tsx": `
+        import { useCallback } from "react";
+        import { Routes, Route, Navigate } from "react-router-dom";
+        import { routes } from "./routes";
+        export function App() {
+          const generateRouter = useCallback((items: any[]) => {
+            return items.map((item) => (
+              <Route key={item.path} path={item.path} element={item.element} />
+            ));
+          }, []);
+          return (
+            <Routes>
+              <Route path="login" element={<Navigate to="/404" replace />} />
+              {generateRouter(routes)}
+            </Routes>
+          );
+        }
+      `,
+    });
+
+    // 这两个节点只能来自数据数组；直接写在 <Routes> 下的 route 只有 /login
+    expect(routeByPath(result, "/").id).toContain("#/");
+    expect(routeByPath(result, "/users")).toBeDefined();
+    expect(result.warnings.some((warning) => warning.code === "route_renderer_unresolved")).toBe(false);
+  });
+
+  it("多层 children 递归拼接完整路径", () => {
+    const result = analyzeSynthetic({
+      "src/routes.tsx": `
+        import { Home, UserList, UserDetail, Layout } from "./Pages";
+        export const routes = [
+          {
+            path: "/projects",
+            element: <Layout />,
+            children: [
+              {
+                path: ":id",
+                element: <UserDetail />,
+                children: [{ path: "settings", element: <Home /> }],
+              },
+            ],
+          },
+        ];
+      `,
+      "src/App.tsx": `
+        import { Routes, Route } from "react-router-dom";
+        import { routes } from "./routes";
+        function generateRouter(items: any[], parentPath?: string) {
+          return items.map((item) => (
+            <Route key={item.path} path={item.path} element={item.element} />
+          ));
+        }
+        export function App() {
+          return <Routes>{generateRouter(routes)}</Routes>;
+        }
+      `,
+    });
+
+    expect(routeByPath(result, "/projects").attrs.index).toBe(undefined);
+    expect(routeByPath(result, "/projects/:id")).toBeDefined();
+    expect(routeByPath(result, "/projects/:id/settings")).toBeDefined();
+  });
+
+  it("普通数据数组没有被 Routes 子树消费时不产 route 节点", () => {
+    const result = analyzeSynthetic({
+      "src/menu.tsx": `
+        import { Home } from "./Pages";
+        export const menu = [{ path: "/menu", element: <Home /> }];
+      `,
+      "src/App.tsx": `
+        import { Routes, Route, Navigate } from "react-router-dom";
+        import { menu } from "./menu";
+        function renderMenu(items: any[]) {
+          return items.map((item) => <Route key={item.path} path={item.path} element={item.element} />);
+        }
+        export function App() {
+          return (
+            <div>
+              <nav>{renderMenu(menu)}</nav>
+              <Routes>
+                <Route path="login" element={<Navigate to="/404" replace />} />
+              </Routes>
+            </div>
+          );
+        }
+      `,
+    });
+
+    expect(result.routeNodes.some((node) => node.name === "/menu")).toBe(false);
+    // 不在 Routes 里的调用不算「识别失败」，不该产生告警
+    expect(result.warnings.some((warning) => warning.code === "route_renderer_unresolved")).toBe(false);
+  });
+
+  it("循环引用的数组不会无限展开", () => {
+    const result = analyzeSynthetic({
+      "src/routes.tsx": `
+        import { Home, UserList } from "./Pages";
+        export const a: any[] = [{ path: "/a", element: <Home /> }, ...b];
+        export const b: any[] = [{ path: "/b", element: <UserList /> }, ...a];
+      `,
+      "src/App.tsx": `
+        import { Routes } from "react-router-dom";
+        import { a } from "./routes";
+        function generateRouter(items: any[]) {
+          return items.map((item) => <Route key={item.path} path={item.path} element={item.element} />);
+        }
+        export function App() {
+          return <Routes>{generateRouter(a)}</Routes>;
+        }
+      `,
+    });
+
+    expect(result.routeNodes.filter((node) => node.name === "/a")).toHaveLength(1);
+    expect(result.routeNodes.filter((node) => node.name === "/b")).toHaveLength(1);
+  });
+
+  it("渲染函数不接参数、直接读模块级数组时也能识别", () => {
+    const result = analyzeSynthetic({
+      "src/routes.tsx": `
+        import { Home } from "./Pages";
+        export const routes = [{ path: "/home", element: <Home /> }];
+      `,
+      "src/App.tsx": `
+        import { Routes, Route } from "react-router-dom";
+        import { routes } from "./routes";
+        function generateRouter() {
+          return routes.map((item) => (
+            <Route key={item.path} path={item.path} element={item.element} />
+          ));
+        }
+        export function App() {
+          return <Routes>{generateRouter()}</Routes>;
+        }
+      `,
+    });
+
+    expect(routeByPath(result, "/home")).toBeDefined();
+  });
+
+  it("渲染函数的数据源无法静态求值时记 route_renderer_unresolved", () => {
+    const result = analyzeSynthetic({
+      "src/App.tsx": `
+        import { Routes, Route } from "react-router-dom";
+        function generateRouter(items: any[]) {
+          return items.map((item) => (
+            <Route key={item.path} path={item.path} element={item.element} />
+          ));
+        }
+        export function App(props: { items: any[] }) {
+          return <Routes>{generateRouter(props.items)}</Routes>;
+        }
+      `,
+    });
+
+    expect(result.routeNodes).toHaveLength(0);
+    expect(result.warnings.some((warning) => warning.code === "route_renderer_unresolved")).toBe(true);
+  });
+});
+

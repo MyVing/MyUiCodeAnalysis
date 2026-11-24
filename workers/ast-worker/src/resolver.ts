@@ -94,7 +94,11 @@ export function createResolutionIndex(rootPath: string, project: Project): Resol
   const cache = new Map<SourceFile, Map<string, Resolution>>();
 
   function resolveOne(fromFile: SourceFile, moduleSpecifier: string): Resolution {
-    const target = findTargetSourceFile(fromFile, moduleSpecifier);
+    // ts-morph 的 getModuleSpecifierSourceFile() 在 allowJs 打开后仍会对纯 .js 目标返回
+    // undefined；用项目自身的 compilerOptions 走 TypeScript 原生解析兜底，两边结果同源。
+    const target =
+      findTargetSourceFile(fromFile, moduleSpecifier) ??
+      findTargetSourceFileViaCompiler(fromFile, moduleSpecifier);
     const isLocal = isLocalSpecifier(moduleSpecifier, aliasPrefixes);
 
     if (target) {
@@ -231,17 +235,34 @@ function findTargetSourceFile(
 
 /** 动态 import 的源文件由 TypeScript 的模块解析结果提供。 */
 function projectSourceFileForDynamicImport(call: CallExpression): SourceFile | undefined {
-  const sourceFile = call.getSourceFile();
   const argument = call.getArguments()[0];
   if (!argument || !MorphNode.isStringLiteral(argument)) return undefined;
-  const moduleSpecifier = argument.getLiteralValue();
-  const resolved = ts.resolveModuleName(
+  return findTargetSourceFileViaCompiler(call.getSourceFile(), argument.getLiteralValue());
+}
+
+/**
+ * 用 **项目当前的 compilerOptions**（含 moduleResolution / paths / baseUrl / allowJs）
+ * 走 TypeScript 原生模块解析，再映射回 Project 里已加载的 SourceFile。
+ *
+ * 这是静态与动态 import 共用的兜底：不允许另造一套默认选项，否则会与 tsconfig 分叉。
+ */
+function findTargetSourceFileViaCompiler(
+  fromFile: SourceFile,
+  moduleSpecifier: string,
+): SourceFile | undefined {
+  const resolvedFileName = resolveModulePath(fromFile, moduleSpecifier);
+  if (!resolvedFileName) return undefined;
+  return fromFile.getProject().getSourceFile(resolvedFileName);
+}
+
+/** 只做路径解析，返回 TypeScript 给出的绝对文件名（可能不在 Project 内）。 */
+function resolveModulePath(fromFile: SourceFile, moduleSpecifier: string): string | undefined {
+  return ts.resolveModuleName(
     moduleSpecifier,
-    sourceFile.getFilePath(),
-    sourceFile.getProject().getCompilerOptions(),
+    fromFile.getFilePath(),
+    fromFile.getProject().getCompilerOptions(),
     ts.sys,
-  ).resolvedModule;
-  return resolved ? sourceFile.getProject().getSourceFile(resolved.resolvedFileName) : undefined;
+  ).resolvedModule?.resolvedFileName;
 }
 
 /** 便于测试与调试：把解析结果格式化成一行。 */

@@ -5,10 +5,12 @@
  */
 
 import path from "node:path";
+import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
+import os from "node:os";
 import { fileURLToPath } from "node:url";
 
 import { Project } from "ts-morph";
-import { beforeAll, describe, expect, it } from "vitest";
+import { afterAll, beforeAll, describe, expect, it } from "vitest";
 
 import { assertUniqueIds, discoverComponents, type DiscoveredComponent } from "../src/components.js";
 import { createResolutionIndex, formatResolution } from "../src/resolver.js";
@@ -200,5 +202,93 @@ describe("组件发现", () => {
       "UserDetail",
       "UserList",
     ]);
+  });
+});
+
+describe("allowJs 下静态 import 的解析兜底", () => {
+  let root: string;
+  let synthetic: Project;
+  let result: ReturnType<typeof createResolutionIndex>;
+
+  beforeAll(() => {
+    // 用磁盘临时目录而不是内存文件系统：ts.resolveModuleName 走的是 ts.sys
+    root = mkdtempSync(path.join(os.tmpdir(), "ast-resolver-allowjs-"));
+    mkdirSync(path.join(root, "src"), { recursive: true });
+    writeFileSync(
+      path.join(root, "tsconfig.json"),
+      JSON.stringify({
+        compilerOptions: {
+          target: "ES2020",
+          module: "ESNext",
+          moduleResolution: "node",
+          allowJs: true,
+          jsx: "react-jsx",
+          baseUrl: ".",
+          paths: { "@/*": ["src/*"] },
+          strict: false,
+        },
+        include: ["src"],
+      }),
+      "utf8",
+    );
+    writeFileSync(
+      path.join(root, "src/public-path.js"),
+      "export const publicPath = '/base/';\n",
+      "utf8",
+    );
+    writeFileSync(
+      path.join(root, "src/Widget.jsx"),
+      "export default function Widget() { return null; }\n",
+      "utf8",
+    );
+    writeFileSync(
+      path.join(root, "src/main.ts"),
+      [
+        'import { publicPath } from "@/public-path";',
+        'import Widget from "./Widget";',
+        'import "./missing";',
+        "export const base = publicPath;",
+        "export const view = Widget;",
+      ].join("\n"),
+      "utf8",
+    );
+
+    synthetic = new Project({ tsConfigFilePath: path.join(root, "tsconfig.json") });
+    result = createResolutionIndex(root, synthetic);
+  }, 30_000);
+
+  afterAll(() => {
+    rmSync(root, { recursive: true, force: true });
+  });
+
+  function mainFile() {
+    const file = synthetic.getSourceFile(path.join(root, "src/main.ts"));
+    if (!file) throw new Error("synthetic main.ts 未加载");
+    return file;
+  }
+
+  it("别名指向纯 .js 文件时归类为 internal", () => {
+    const resolved = result.index.resolve(mainFile(), "@/public-path");
+    expect(resolved.status).toBe("internal");
+    if (resolved.status !== "internal") return;
+    expect(formatResolution(resolved, root)).toBe("internal:src/public-path.js");
+  });
+
+  it("相对路径指向 .jsx 文件时归类为 internal", () => {
+    const resolved = result.index.resolve(mainFile(), "./Widget");
+    expect(resolved.status).toBe("internal");
+    if (resolved.status !== "internal") return;
+    expect(formatResolution(resolved, root)).toBe("internal:src/Widget.jsx");
+  });
+
+  it("确实不存在的本地模块仍报 unresolved_import error", () => {
+    const resolved = result.index.resolve(mainFile(), "./missing");
+    expect(resolved.status).toBe("unresolved");
+
+    const errors = result.warnings.filter((w) => w.code === "unresolved_import");
+    expect(errors.some((w) => w.message.includes('"./missing"'))).toBe(true);
+    // .js / .jsx 两个目标不应再产生任何 unresolved_import
+    expect(errors.some((w) => w.message.includes("public-path"))).toBe(false);
+    expect(errors.some((w) => w.message.includes("Widget"))).toBe(false);
   });
 });
