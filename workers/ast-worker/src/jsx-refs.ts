@@ -13,7 +13,7 @@
  */
 
 import type { Node, SourceFile } from "ts-morph";
-import { Node as MorphNode } from "ts-morph";
+import { Node as MorphNode, SyntaxKind } from "ts-morph";
 
 import type { DiscoveredComponent } from "./components.js";
 import { getPackageName, toProjectRelative } from "./paths.js";
@@ -37,7 +37,7 @@ export function isHostElement(tagName: string): boolean {
 export type TagTarget =
   | { kind: "component"; id: string }
   | { kind: "external"; nodeId: string; packageName: string; tagName: string }
-  | { kind: "unresolved" };
+  | { kind: "unresolved"; localComponent?: boolean };
 
 /**
  * 多分支标签（`const Comp = cond ? Slot : "button"`）的展开深度上限。
@@ -83,17 +83,40 @@ function resolveSymbolTarget(tagNameNode: Node, context: TagResolveContext): Tag
     if (hit) return { kind: "component", id: hit };
   }
 
+  // 只有标识符 / 命名空间属性可能对应 import；表达式候选（如 memo(helper)）不能按文本猜包来源。
+  if (!MorphNode.isIdentifier(tagNameNode) && !MorphNode.isPropertyAccessExpression(tagNameNode)) {
+    return { kind: "unresolved" };
+  }
+
   // 未命中：用 resolver 的既有结论判断来源，不在这里重新实现一遍判断规则
   const sourceFile = tagNameNode.getSourceFile();
+  const localDeclarations = symbol?.getDeclarations() ?? [];
+  const localComponent = localDeclarations.some((decl) =>
+    decl.getSourceFile() === sourceFile && isJsxFunctionDeclaration(decl),
+  );
+  const localBinding = localDeclarations.some((decl) => decl.getSourceFile() === sourceFile);
+  // 本地声明优先于同名命名空间 import；非 JSX 本地值不是外部组件。
+  if (localBinding && !localComponent) return { kind: "unresolved" };
   const importSource = findImportSource(sourceFile, tagName);
-  if (!importSource) return { kind: "unresolved" };
+  if (!importSource) {
+    return localComponent ? { kind: "unresolved", localComponent: true } : { kind: "unresolved" };
+  }
 
   const target = context.resolution.resolve(sourceFile, importSource);
 
   if (target.status === "internal") {
-    // 来源解析到了项目内文件，但标签没落到任何已发现组件上：
-    // 常见于未导出的局部组件。属于真实缺口，交给调用方记告警。
-    return { kind: "unresolved" };
+    const importedName = importedNameOf(sourceFile, tagName) ?? tagName;
+    const exported = target.sourceFile.getExportedDeclarations().get(importedName) ?? [];
+    for (const decl of exported) {
+      const component = componentIdentityOf(decl, rootPath);
+      if (component) return { kind: "component", id: component };
+    }
+
+    const localComponent = (symbol?.getDeclarations() ?? []).some((decl) =>
+      decl.getSourceFile() === sourceFile && isJsxFunctionDeclaration(decl),
+    );
+    // 本地未导出组件属于建模边界；不创建目标节点或 renders 边。
+    return localComponent ? { kind: "unresolved", localComponent: true } : { kind: "unresolved" };
   }
 
   // external（已安装）、builtin（Node 内置）与 unresolved 且非本地（未安装的裸包名）
@@ -148,6 +171,86 @@ export function tagNameOfJsxElement(node: Node): Node | null {
   if (MorphNode.isJsxSelfClosingElement(node)) return node.getTagNameNode();
   if (MorphNode.isJsxElement(node)) return node.getOpeningElement().getTagNameNode();
   return null;
+}
+
+function importedNameOf(sourceFile: SourceFile, localName: string): string | null {
+  const rootName = localName.split(".")[0] ?? localName;
+  for (const imp of sourceFile.getImportDeclarations()) {
+    if (imp.getDefaultImport()?.getText() === rootName) return "default";
+    for (const named of imp.getNamedImports()) {
+      if (named.getAliasNode()?.getText() === rootName) return named.getName();
+      if (named.getName() === rootName) return named.getName();
+    }
+  }
+  return null;
+}
+
+const MAX_COMPONENT_UNWRAP_DEPTH = 8;
+
+function resolveJsxFunction(
+  node: Node,
+  visited: Set<Node> = new Set(),
+  depth = 0,
+): Node | null {
+  if (depth > MAX_COMPONENT_UNWRAP_DEPTH || visited.has(node)) return null;
+  visited.add(node);
+
+  if (
+    MorphNode.isFunctionDeclaration(node) ||
+    MorphNode.isFunctionExpression(node) ||
+    MorphNode.isArrowFunction(node)
+  ) {
+    return node.getDescendants().some((descendant) =>
+      descendant.getKind() === SyntaxKind.JsxElement ||
+      descendant.getKind() === SyntaxKind.JsxSelfClosingElement ||
+      descendant.getKind() === SyntaxKind.JsxFragment,
+    ) ? node : null;
+  }
+
+  if (MorphNode.isIdentifier(node)) {
+    let symbol = node.getSymbol();
+    if (symbol?.isAlias()) {
+      try {
+        symbol = symbol.getAliasedSymbol();
+      } catch {
+        return null;
+      }
+    }
+    for (const decl of symbol?.getDeclarations() ?? []) {
+      if (!MorphNode.isVariableDeclaration(decl) && !MorphNode.isFunctionDeclaration(decl)) continue;
+      const initializer = MorphNode.isVariableDeclaration(decl) ? decl.getInitializer() : decl;
+      if (initializer) return resolveJsxFunction(initializer, visited, depth + 1);
+    }
+    return null;
+  }
+
+  if (!MorphNode.isCallExpression(node)) return null;
+  if (!/(?:^|\\.)(?:memo|forwardRef)$/.test(node.getExpression().getText())) return null;
+  const wrapped = node.getArguments()[0];
+  return wrapped ? resolveJsxFunction(wrapped, visited, depth + 1) : null;
+}
+
+function isJsxFunctionDeclaration(decl: Node): boolean {
+  let candidate: Node = decl;
+  if (MorphNode.isVariableDeclaration(decl)) {
+    const init = decl.getInitializer();
+    if (!init) return false;
+    candidate = init;
+  }
+  return resolveJsxFunction(candidate) !== null;
+}
+
+function componentIdentityOf(decl: Node, rootPath: string): string | null {
+  if (!isJsxFunctionDeclaration(decl)) return null;
+  const sourceFile = decl.getSourceFile();
+  const relativeFile = toProjectRelative(rootPath, sourceFile.getFilePath());
+  if (!relativeFile) return null;
+  let name: string | undefined;
+  if (MorphNode.isVariableDeclaration(decl) || MorphNode.isFunctionDeclaration(decl) || MorphNode.isClassDeclaration(decl)) {
+    name = decl.getName() ?? undefined;
+  }
+  if (!name && MorphNode.isFunctionDeclaration(decl)) name = decl.getName() ?? undefined;
+  return name ? `${relativeFile}#${name}` : null;
 }
 
 /** 在文件里查找某个本地名的 import 来源说明符。 */

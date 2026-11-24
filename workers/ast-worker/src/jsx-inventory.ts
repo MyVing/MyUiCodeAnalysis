@@ -114,7 +114,13 @@ function elementSuffix(
   key: string,
   counters: Map<string, number>,
 ): string {
-  if (handlerNames.length === 1) return `jsx:${tag}/${handlerNames[0]}`;
+  if (handlerNames.length === 1) {
+    const handler = handlerNames[0]!;
+    const handlerKey = `${key}/${handler}`;
+    const next = (counters.get(handlerKey) ?? 0) + 1;
+    counters.set(handlerKey, next);
+    return `jsx:${tag}/${handler}${next === 1 ? "" : `#${next}`}`;
+  }
   const next = (counters.get(key) ?? 0) + 1;
   counters.set(key, next);
   return next === 1 ? `jsx:${tag}` : `jsx:${tag}#${next}`;

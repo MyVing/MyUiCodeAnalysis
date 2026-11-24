@@ -133,6 +133,47 @@ function getNodeName(node: Node): string | undefined {
 /**
  * 从一个声明节点构造组件；不是组件返回 null。
  */
+/** 最多追踪几层变量 / memo / forwardRef 初始化器，避免异常别名链。 */
+const MAX_COMPONENT_UNWRAP_DEPTH = 8;
+
+/** 将函数节点或受支持包装器中的静态函数引用解析到底层函数。 */
+function resolveFunctionComponentNode(
+  node: Node,
+  visited: Set<Node> = new Set(),
+  depth = 0,
+): Node | null {
+  if (depth > MAX_COMPONENT_UNWRAP_DEPTH || visited.has(node)) return null;
+  visited.add(node);
+
+  if (MorphNode.isArrowFunction(node) || MorphNode.isFunctionExpression(node) || MorphNode.isFunctionDeclaration(node)) {
+    return node;
+  }
+
+  if (MorphNode.isIdentifier(node)) {
+    let symbol = node.getSymbol();
+    if (symbol?.isAlias()) {
+      try {
+        symbol = symbol.getAliasedSymbol();
+      } catch {
+        return null;
+      }
+    }
+    for (const declaration of symbol?.getDeclarations() ?? []) {
+      if (!MorphNode.isVariableDeclaration(declaration) && !MorphNode.isFunctionDeclaration(declaration)) continue;
+      const initializer = MorphNode.isVariableDeclaration(declaration) ? declaration.getInitializer() : declaration;
+      if (!initializer) continue;
+      return resolveFunctionComponentNode(initializer, visited, depth + 1);
+    }
+    return null;
+  }
+
+  if (!MorphNode.isCallExpression(node)) return null;
+  const callee = node.getExpression().getText();
+  if (!/(?:^|\.)(?:memo|forwardRef)$/.test(callee)) return null;
+  const wrapped = node.getArguments()[0];
+  return wrapped ? resolveFunctionComponentNode(wrapped, visited, depth + 1) : null;
+}
+
 function toComponent(decl: Node, sourceFile: SourceFile, relativeFile: string): DiscoveredComponent | null {
   let componentNode: Node = decl;
   let form: DiscoveredComponent["form"] = "function";
@@ -140,15 +181,10 @@ function toComponent(decl: Node, sourceFile: SourceFile, relativeFile: string): 
   if (MorphNode.isVariableDeclaration(decl)) {
     const init = decl.getInitializer();
     if (!init) return null;
-    if (MorphNode.isArrowFunction(init)) {
-      componentNode = init;
-      form = "arrow";
-    } else if (MorphNode.isFunctionExpression(init)) {
-      componentNode = init;
-      form = "function";
-    } else {
-      return null;
-    }
+    const resolved = resolveFunctionComponentNode(init);
+    if (!resolved) return null;
+    componentNode = resolved;
+    form = MorphNode.isArrowFunction(resolved) ? "arrow" : "function";
   } else if (MorphNode.isFunctionDeclaration(decl) || MorphNode.isFunctionExpression(decl) || MorphNode.isArrowFunction(decl)) {
     form = MorphNode.isArrowFunction(decl) ? "arrow" : "function";
   } else if (MorphNode.isClassDeclaration(decl)) {
@@ -221,6 +257,9 @@ function collectComponentExportCandidates(file: SourceFile, relativeFile: string
       const initializer = declaration.getInitializer();
       if (initializer && (MorphNode.isArrowFunction(initializer) || MorphNode.isFunctionExpression(initializer))) {
         localDeclarations.set(declaration.getName(), initializer);
+      } else if (initializer) {
+        const resolved = resolveFunctionComponentNode(initializer);
+        if (resolved) localDeclarations.set(declaration.getName(), resolved);
       }
     }
   }

@@ -313,14 +313,41 @@ describe("事件分析的边界（合成项目）", () => {
     expect(ids).toEqual(["src/Dup.tsx#Dup/jsx:button", "src/Dup.tsx#Dup/jsx:button#2"]);
   });
 
-  it("模块顶层 JSX 不归任何组件，不产元素节点", () => {
+  it("同 tag 同具名 handler 的元素 id 唯一，且事件各自保留", () => {
     const result = analyzeSynthetic({
-      "src/Top.tsx": `
-        export const metadata = <div onClick={() => {}} />;
+      "src/DupHandler.tsx": `
+        function handleCancel() {}
+        export function DupHandler() {
+          return <><button onClick={handleCancel}>a</button><button onClick={handleCancel}>b</button></>;
+        }
       `,
     });
 
-    expect(result.elementNodes).toEqual([]);
+    const ids = result.elementNodes.map((node) => node.id).sort();
+    expect(ids).toEqual([
+      "src/DupHandler.tsx#DupHandler/jsx:button/handleCancel",
+      "src/DupHandler.tsx#DupHandler/jsx:button/handleCancel#2",
+    ]);
+    expect(result.warnings.some((warning) => warning.code === "duplicate_element_id")).toBe(false);
+    for (const id of ids) expect(elementOf(result, id).attrs.events).toBeDefined();
+  });
+
+  it("同 tag 不同具名 handler 的元素保持各自稳定 id", () => {
+    const result = analyzeSynthetic({
+      "src/Handlers.tsx": `
+        function first() {}
+        function second() {}
+        export function Handlers() {
+          return <><button onClick={first} /><button onClick={second} /></>;
+        }
+      `,
+    });
+
+    const ids = result.elementNodes.map((node) => node.id).sort();
+    expect(ids).toEqual([
+      "src/Handlers.tsx#Handlers/jsx:button/first",
+      "src/Handlers.tsx#Handlers/jsx:button/second",
+    ]);
   });
 
   it("元素 id 不随上方插入注释而漂移", () => {

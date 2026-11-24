@@ -229,14 +229,97 @@ describe("renders 边的边界（合成项目）", () => {
       `,
     });
 
-    // Internal 未导出，因此不在组件列表里；它确实被渲染了，属于分析能力缺口
+    // Internal 未导出，因此不在组件列表里；按建模边界降为 info，不造边
     expect(result.componentIds).toEqual(["src/Page.tsx#Page"]);
     expect(result.edges).toEqual([]);
 
-    const warning = result.warnings.find((w) => w.code === "unresolved_jsx_target");
-    expect(warning?.severity).toBe("warning");
+    const warning = result.warnings.find((w) => w.code === "local_component_not_modeled");
+    expect(warning?.severity).toBe("info");
     expect(warning?.file).toBe("src/Page.tsx");
     expect(warning?.message).toContain("Internal");
+  });
+
+  it("memo 与 forwardRef 包装的导出组件正常发现并连边", () => {
+    const result = analyzeSynthetic({
+      "src/Parts.tsx": `
+        import * as React from "react";
+        export const MemoPart = React.memo(() => <span />);
+        export const RefPart = React.forwardRef((props, ref) => <div ref={ref} />);
+      `,
+      "src/Page.tsx": `
+        import { MemoPart, RefPart } from "./Parts";
+        export function Page() { return <><MemoPart /><RefPart /></>; }
+      `,
+    });
+
+    getEdge(result, "src/Page.tsx#Page", "src/Parts.tsx#MemoPart");
+    getEdge(result, "src/Page.tsx#Page", "src/Parts.tsx#RefPart");
+    expect(result.warnings.filter((warning) => warning.code === "unresolved_jsx_target")).toEqual([]);
+  });
+
+  it("memo / forwardRef 包装器支持本地函数标识符", () => {
+    const result = analyzeSynthetic({
+      "src/Parts.tsx": `
+        import * as React from "react";
+        const Inner = () => <span />;
+        function RefInner(props: unknown, ref: unknown) { return <div ref={ref} />; }
+        export const MemoPart = React.memo(Inner);
+        export const RefPart = React.forwardRef(RefInner);
+      `,
+      "src/Page.tsx": `
+        import { MemoPart, RefPart } from "./Parts";
+        export function Page() { return <><MemoPart /><RefPart /></>; }
+      `,
+    });
+
+    expect(result.componentIds).toContain("src/Parts.tsx#MemoPart");
+    expect(result.componentIds).toContain("src/Parts.tsx#RefPart");
+    getEdge(result, "src/Page.tsx#Page", "src/Parts.tsx#MemoPart");
+    getEdge(result, "src/Page.tsx#Page", "src/Parts.tsx#RefPart");
+    expect(result.warnings.filter((warning) => warning.code === "unresolved_jsx_target")).toEqual([]);
+  });
+
+  it("包装器从跨模块导入 JSX 函数时沿 barrel 连到包装组件身份", () => {
+    const result = analyzeSynthetic({
+      "src/Inner.tsx": `export function Inner() { return <span />; }`,
+      "src/index.ts": `export { Inner } from "./Inner";`,
+      "src/Parts.tsx": `import * as React from "react"; import { Inner as Base } from "./index"; export const MemoPart = React.memo(Base);`,
+      "src/Page.tsx": `import { MemoPart } from "./Parts"; export function Page() { return <MemoPart />; }`,
+    });
+
+    expect(result.componentIds).toContain("src/Parts.tsx#MemoPart");
+    getEdge(result, "src/Page.tsx#Page", "src/Parts.tsx#MemoPart");
+    expect(result.warnings.filter((warning) => warning.code === "unresolved_jsx_target")).toEqual([]);
+  });
+
+  it("包装器最终指向非 JSX 函数时不误判为组件", () => {
+    const result = analyzeSynthetic({
+      "src/Parts.tsx": `import * as React from "react"; function helper() { return 1; } export const Wrapped = React.memo(helper);`,
+      "src/Page.tsx": `import { Wrapped } from "./Parts"; export function Page() { return <Wrapped />; }`,
+    });
+
+    expect(result.componentIds).toEqual(["src/Page.tsx#Page"]);
+    expect(result.edges).toEqual([]);
+    expect(result.warnings.some((warning) => warning.code === "unresolved_jsx_target")).toBe(true);
+  });
+
+  it("同名内部导出通过 barrel 仍可解析，非 JSX 导出不误判", () => {
+    const result = analyzeSynthetic({
+      "src/Leaf.tsx": `export function Leaf() { return <span />; } export const useValue = () => 1;`,
+      "src/index.ts": `export { Leaf, useValue } from "./Leaf";`,
+      "src/Page.tsx": `import { Leaf, useValue } from "./index"; export function Page() { return <Leaf />; }`,
+    });
+
+    getEdge(result, "src/Page.tsx#Page", "src/Leaf.tsx#Leaf");
+    expect(result.componentIds).not.toContain("src/Leaf.tsx#useValue");
+  });
+
+  it("动态组件标签仍报告 unresolved", () => {
+    const result = analyzeSynthetic({
+      "src/Page.tsx": `export function Page({ as: Component }: { as: unknown }) { return <Component />; }`,
+    });
+
+    expect(result.warnings.some((warning) => warning.code === "unresolved_jsx_target" && warning.severity === "warning")).toBe(true);
   });
 
   it("已安装但与渲染无关的模块不会被误连成边", () => {
