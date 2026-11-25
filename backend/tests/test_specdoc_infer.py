@@ -78,6 +78,87 @@ def _llm_with(steps=_VALID_STEPS, rules=_VALID_RULES, mappings=_VALID_MAPPINGS) 
     )
 
 
+async def test_steps_reject_unknown_chain_without_page_level_fallback() -> None:
+    steps = {
+        "steps": [
+            {
+                "featureId": "f1",
+                "chainId": "fake-chain",
+                "nodeId": "src/pages/Transfer.tsx#Transfer/jsx:button",
+                "actions": ["点击转账"],
+                "quote": "转账",
+            }
+        ]
+    }
+    requirement_map = spec_requirement_map(spec_graph())
+    outcome = await infer_sections(
+        requirement_map.requirement, requirement_map, _materials(),
+        _llm_with(steps=steps), max_calls=1,
+    )
+
+    assert outcome.steps == []
+    dropped = next(item for item in outcome.dropped if item.featureId == "f1")
+    assert dropped.reason == Reason.chain_not_in_candidates
+    assert dropped.chainId == "fake-chain"
+    assert dropped.nodeId == "src/pages/Transfer.tsx#Transfer/jsx:button"
+
+
+async def test_rules_reject_unknown_chain_without_page_level_fallback() -> None:
+    rules = {
+        "rules": [
+            {
+                "featureId": "f1",
+                "chainId": "fake-chain",
+                "elementId": "src/pages/Transfer.tsx#Transfer/jsx:button",
+                "category": "validation",
+                "condition": "x",
+                "result": "y",
+                "quote": "转账",
+            }
+        ]
+    }
+    requirement_map = spec_requirement_map(spec_graph())
+    outcome = await infer_sections(
+        requirement_map.requirement, requirement_map, _materials(),
+        _llm_with(rules=rules), max_calls=1,
+    )
+
+    assert outcome.rules == []
+    dropped = next(item for item in outcome.dropped if item.featureId == "f1")
+    assert dropped.reason == Reason.chain_not_in_candidates
+    assert dropped.chainId == "fake-chain"
+    assert not any(w.code == "evidence_ref_missing" for w in outcome.warnings)
+
+
+async def test_rule_node_outside_chain_is_rejected_as_invalid_anchor() -> None:
+    rules = {
+        "rules": [
+            {
+                "featureId": "f1",
+                "chainId": next(
+                    chain.id for chain in _materials().pages[0].chains
+                    if chain.element.node_id.endswith("jsx:button")
+                ),
+                "nodeId": "not-in-chain",
+                "category": "validation",
+                "condition": "x",
+                "result": "y",
+                "quote": "转账",
+            }
+        ]
+    }
+    requirement_map = spec_requirement_map(spec_graph())
+    outcome = await infer_sections(
+        requirement_map.requirement, requirement_map, _materials(),
+        _llm_with(rules=rules), max_calls=1,
+    )
+
+    assert outcome.rules == []
+    dropped = next(item for item in outcome.dropped if item.featureId == "f1")
+    assert dropped.reason == Reason.node_not_in_candidates
+    assert dropped.nodeId == "not-in-chain"
+
+
 async def test_valid_outputs_are_capped_and_bound_to_pages() -> None:
     """引文命中：AI 证据封顶 0.6（0.9 自报也不透传）；步骤/规则挂到定位页面。"""
     requirement_map = spec_requirement_map(spec_graph())

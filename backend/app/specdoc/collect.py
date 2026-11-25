@@ -55,6 +55,8 @@ class PageMaterial:
     api_nodes: dict[str, IRNode] = field(default_factory=dict)
     # 被需求定位命中的链路 id
     matched_chain_ids: frozenset[str] = frozenset()
+    # 图上 route 节点的真实路径；缺失时不以 routeId 冒充路径
+    route_path: str | None = None
 
 
 @dataclass(frozen=True)
@@ -136,6 +138,12 @@ def collect_materials(requirement_map: RequirementMap, graph: IRGraph) -> Materi
             and match.chainId is not None
             and match.chainId in chain_index.by_id
         }
+        route_node = nodes.get(page.routeId) if page.routeId else None
+        route_path = None
+        if route_node is not None:
+            candidate_path = route_node.attrs.get("path")
+            if isinstance(candidate_path, str) and candidate_path.strip():
+                route_path = candidate_path
 
         element_sources = [
             ElementSource(
@@ -165,6 +173,7 @@ def collect_materials(requirement_map: RequirementMap, graph: IRGraph) -> Materi
                 corpus=corpus,
                 api_nodes=api_nodes,
                 matched_chain_ids=frozenset(matched_chain_ids),
+                route_path=route_path,
             )
         )
     for material in materials.pages:

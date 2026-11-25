@@ -62,8 +62,12 @@ class SpecDocOrchestrator:
         events, api_mappings, elements = self._deterministic_sections(
             materials, warnings
         )
+        events_by_page: dict[str, list[Event]] = defaultdict(list)
+        for event in events:
+            events_by_page[event.pageId].append(event)
         infer_outcome = await self._infer_sections(
-            task, requirement_map.requirement, requirement_map, materials
+            task, requirement_map.requirement, requirement_map, materials,
+            events_by_page,
         )
         warnings.extend(_convert_warnings(infer_outcome.warnings or []))
         deterministic_mappings = [] if task.dry_run else deterministic_field_mappings(materials)
@@ -123,6 +127,7 @@ class SpecDocOrchestrator:
         requirement: str,
         requirement_map: RequirementMap,
         materials: Materials,
+        events_by_page: dict[str, list[Event]],
     ) -> InferOutcome | _SkippedOutcome:
         """三个推断章节。dry-run / 无模型时留空 + 显式告警，不静默。"""
         if task.dry_run:
@@ -148,6 +153,7 @@ class SpecDocOrchestrator:
             materials,
             self._llm,
             max_calls=self._settings.llm_max_calls_per_request,
+            events_by_page=events_by_page,
         )
 
     def _number_steps(self, steps: list[Step]) -> list[Step]:

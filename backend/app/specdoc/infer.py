@@ -24,6 +24,7 @@ from app.contracts.requirement import (
     Severity,
 )
 from app.contracts.specdoc import (
+    Event,
     FieldMapping,
     Location,
     Rule,
@@ -130,10 +131,12 @@ async def infer_sections(
     materials: Materials,
     llm: LLMClient,
     max_calls: int,
+    *,
+    events_by_page: dict[str, list[Event]] | None = None,
 ) -> InferOutcome:
     """跑三个推断章节。模型彻底不可用时不抛错：章节留空 + llm_unavailable 告警。"""
     contexts = _page_contexts(materials)
-    evidence_pack = build_evidence_pack(materials)
+    evidence_pack = build_evidence_pack(materials, events_by_page)
     evidence_json, exposed_texts = evidence_pack.prompt_view()
     for context in contexts:
         context.texts_by_node = exposed_texts.get(
@@ -240,6 +243,21 @@ def _page_contexts(materials: Materials) -> list[_PageContext]:
                 evidence_by_text.setdefault(
                     view_text, _evidence_from_step(source.node.id, view_text, None)
                 )
+            field_info = source.node.attrs.get("formField")
+            if isinstance(field_info, dict):
+                quote = field_info.get("quote")
+                if isinstance(quote, str) and quote.strip():
+                    evidence_by_text.setdefault(
+                        quote, _evidence_from_step(source.node.id, quote, None)
+                    )
+            columns = source.node.attrs.get("columns")
+            if isinstance(columns, list):
+                for column in columns:
+                    title = column.get("title") if isinstance(column, dict) else None
+                    if isinstance(title, str) and title.strip():
+                        evidence_by_text.setdefault(
+                            title, _evidence_from_step(source.node.id, title, None)
+                        )
             events = source.node.attrs.get("events")
             if not isinstance(events, list):
                 continue
@@ -454,10 +472,36 @@ async def _infer_steps(
         quote = entry.get("quote")
         chain_id = _str_or_none(entry.get("chainId"))
         node_id = _str_or_none(entry.get("nodeId"))
+        valid_chains = context.feature_chains.get(feature_id, frozenset())
+        if chain_id is not None and chain_id not in valid_chains:
+            dropped.append(
+                Dropped(
+                    reason=Reason.chain_not_in_candidates,
+                    featureId=feature_id,
+                    chainId=chain_id,
+                    nodeId=node_id,
+                    quote=_str_or_none(quote),
+                )
+            )
+            continue
+        if (
+            chain_id is not None
+            and node_id is not None
+            and node_id not in context.chain_nodes.get(chain_id, frozenset())
+        ):
+            dropped.append(
+                Dropped(
+                    reason=Reason.node_not_in_candidates,
+                    featureId=feature_id,
+                    chainId=chain_id,
+                    nodeId=node_id,
+                    quote=_str_or_none(quote),
+                )
+            )
+            continue
         evidence = (
             _verified(quote, context, node_id=node_id, chain_id=chain_id)
             if isinstance(quote, str) and chain_id is not None and node_id is not None
-            and chain_id in context.feature_chains.get(feature_id, frozenset())
             else None
         )
         if evidence is None:
@@ -547,9 +591,36 @@ async def _infer_rules(
             chain_id = _str_or_none(entry.get("chainId"))
             element_id = _str_or_none(entry.get("elementId"))
             node_id = _str_or_none(entry.get("nodeId"))
-            if isinstance(quote, str) and chain_id and chain_id in context.feature_chains.get(
-                feature_id, frozenset()
+            valid_chains = context.feature_chains.get(feature_id, frozenset())
+            if chain_id is not None and chain_id not in valid_chains:
+                dropped.append(
+                    Dropped(
+                        reason=Reason.chain_not_in_candidates,
+                        featureId=feature_id,
+                        chainId=chain_id,
+                        nodeId=node_id,
+                        quote=_str_or_none(quote),
+                    )
+                )
+                continue
+            if node_id is not None and (
+                node_id not in context.texts_by_node
+                or (
+                    chain_id is not None
+                    and node_id not in context.chain_nodes.get(chain_id, frozenset())
+                )
             ):
+                dropped.append(
+                    Dropped(
+                        reason=Reason.node_not_in_candidates,
+                        featureId=feature_id,
+                        chainId=chain_id,
+                        nodeId=node_id,
+                        quote=_str_or_none(quote),
+                    )
+                )
+                continue
+            if isinstance(quote, str) and chain_id is not None:
                 evidence = _verified(
                     quote, context, chain_id=chain_id, element_id=element_id,
                     node_id=node_id,
@@ -562,7 +633,7 @@ async def _infer_rules(
                     RequirementWarning(
                         code="evidence_ref_missing",
                         severity=Severity.warning,
-                        message="功能点规则缺少有效引用锚点，已使用页面级逐字校验。",
+                        message="功能点规则缺少引用锚点，已使用页面级逐字校验。",
                     )
                 )
             page_id = page_id or context.material.page.pageId

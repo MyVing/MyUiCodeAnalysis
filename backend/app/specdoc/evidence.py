@@ -6,6 +6,7 @@ import json
 from dataclasses import dataclass, field
 from typing import Any
 
+from app.contracts.specdoc import Event
 from app.specdoc.collect import Materials
 
 MAX_ELEMENTS_PER_PAGE = 80
@@ -70,6 +71,13 @@ class EvidencePack:
                 add(page_id, text)
             for element in page.get("elements", []):
                 add(element.get("nodeId"), element.get("viewText"))
+                for column in element.get("columns", []):
+                    if isinstance(column, dict):
+                        add(element.get("nodeId"), column.get("title"))
+            for form in page.get("forms", []):
+                field_info = form.get("frontField")
+                if isinstance(field_info, dict):
+                    add(form.get("nodeId"), field_info.get("quote"))
             for event in page.get("events", []):
                 targets = event.get("targets")
                 target_id = next(
@@ -100,7 +108,10 @@ class EvidencePack:
         return self.prompt_view()[0]
 
 
-def build_evidence_pack(materials: Materials) -> EvidencePack:
+def build_evidence_pack(
+    materials: Materials,
+    events_by_page: dict[str, list[Event]] | None = None,
+) -> EvidencePack:
     """Project existing IR-derived materials into a stable, bounded JSON payload."""
     page_values: list[dict[str, Any]] = []
     texts_by_page_node: dict[str, dict[str, tuple[str, ...]]] = {}
@@ -137,6 +148,11 @@ def build_evidence_pack(materials: Materials) -> EvidencePack:
 
         for source in elements:
             attrs = source.node.attrs
+            columns = attrs.get("columns")
+            exposed_columns = (
+                [column for column in columns if isinstance(column, dict)]
+                if isinstance(columns, list) else []
+            )
             element_values.append(
                 {
                     "nodeId": source.node.id,
@@ -144,40 +160,78 @@ def build_evidence_pack(materials: Materials) -> EvidencePack:
                     "viewText": attrs.get("viewText"),
                     "viewRole": attrs.get("viewRole"),
                     "formField": attrs.get("formField"),
+                    "columns": exposed_columns,
                 }
             )
             add_text(texts, source.node.id, attrs.get("viewText"))
+            for column in exposed_columns:
+                add_text(texts, source.node.id, column.get("title"))
             field_info = attrs.get("formField")
             if isinstance(field_info, dict):
                 forms.append({"nodeId": source.node.id, "frontField": field_info})
-            bindings = attrs.get("events")
-            if isinstance(bindings, list):
-                for index, binding in enumerate(bindings):
+                add_text(texts, source.node.id, field_info.get("quote"))
+            if events_by_page is None:
+                bindings = attrs.get("events")
+                if isinstance(bindings, list):
+                    for index, binding in enumerate(bindings):
+                        if not isinstance(binding, dict):
+                            continue
+                        handler = binding.get("handler")
+                        events.append(
+                            {
+                                "eventId": f"{source.node.id}::evt:{index + 1}",
+                                "elementId": source.node.id,
+                                "eventType": binding.get("name"),
+                                "handlerName": binding.get("handlerName"),
+                                "handler": handler,
+                                "targets": binding.get("targets"),
+                            }
+                        )
+                        target_node = next(
+                            (target.get("id") for target in binding.get("targets", []) or []
+                             if isinstance(target, dict) and isinstance(target.get("id"), str)),
+                            source.node.id,
+                        )
+                        add_text(texts, target_node, handler)
+
+        if events_by_page is not None:
+            for event in events_by_page.get(page.pageId, []):
+                source = next((item for item in elements if item.node.id == event.elementId), None)
+                bindings = source.node.attrs.get("events", []) if source else []
+                if not isinstance(bindings, list):
+                    continue
+                for binding in bindings:
                     if not isinstance(binding, dict):
                         continue
-                    handler = binding.get("handler")
-                    events.append(
-                        {
-                            "eventId": f"{source.node.id}::evt:{index + 1}",
-                            "elementId": source.node.id,
-                            "eventType": binding.get("name"),
-                            "handlerName": binding.get("handlerName"),
-                            "handler": handler,
-                            "targets": binding.get("targets"),
-                        }
-                    )
+                    handler_text = binding.get("handler")
+                    if not isinstance(handler_text, str):
+                        continue
                     targets = binding.get("targets")
                     target_node = next(
-                        (
-                            target.get("id")
-                            for target in targets or []
-                            if isinstance(target, dict)
-                            and isinstance(target.get("id"), str)
-                        ),
-                        source.node.id,
+                        (target.get("id") for target in targets or []
+                         if isinstance(target, dict) and isinstance(target.get("id"), str)),
+                        event.elementId,
                     )
-                    if isinstance(handler, str):
-                        add_text(texts, target_node, handler)
+                    add_text(texts, target_node, handler_text)
+            for event in events_by_page.get(page.pageId, []):
+                events.append(
+                    {
+                        "eventId": event.id,
+                        "chainId": event.chainId,
+                        "elementId": event.elementId,
+                        "eventType": event.eventType,
+                        "handler": event.handler.name,
+                        "handlerFile": event.handler.file,
+                        "handlerLoc": (
+                            {"line": event.handler.loc.line, "col": event.handler.loc.col}
+                            if event.handler.loc is not None else None
+                        ),
+                        "httpCalls": [
+                            {"method": call.method, "url": call.url}
+                            for call in event.httpCalls
+                        ],
+                    }
+                )
 
         chain_values: list[dict[str, Any]] = []
         for chain in chains:
@@ -218,7 +272,7 @@ def build_evidence_pack(materials: Materials) -> EvidencePack:
             "pageId": page.pageId,
             "name": page.name,
             "file": page.file,
-            "route": page.routeId,
+            "route": material.route_path,
             "uiText": page_texts,
             "featureIds": sorted(page.featureIds or []),
             "elements": element_values,
