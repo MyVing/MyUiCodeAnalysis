@@ -1252,7 +1252,7 @@ export function analyzeApi(input: ApiAnalysisInput): ApiAnalysisResult {
       name,
       file: relativeFile,
       loc: { line: pos.line, col: pos.column },
-      attrs: { role: "请求链路上的函数" },
+      attrs: { role: "请求链路上的函数", endLine: fnNode.getEndLineNumber() },
       evidence: [
         {
           source: "static",

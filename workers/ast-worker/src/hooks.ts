@@ -383,6 +383,8 @@ export function analyzeHooks(input: HooksAnalysisInput): HooksAnalysisResult {
         loc: { line: pos.line, col: pos.column },
         attrs: {
           hookName,
+          // 回调体会超出 hook 调用起始行；endLine 取调用表达式结束行
+          endLine: call.getEndLineNumber(),
           custom: !classification.builtin,
           deps: extractDeps(call),
           // 绑定变量名与 hook 名不同时两个都要能看到

@@ -92,6 +92,10 @@ describe("组件发现的导出形态", () => {
     expect(byId.get("src/Widgets.tsx#NamedCard")?.form).toBe("function");
     expect(byId.get("src/Widgets.tsx#NamedArrow")?.form).toBe("arrow");
     expect(byId.get("src/Widgets.tsx#DefaultCard")?.exportNames).toContain("default");
+    // 行窗口：endLine 取声明结束行，供按组件体取代码窗口
+    expect(byId.get("src/Widgets.tsx#NamedCard")?.endLine).toBe(3);
+    expect(byId.get("src/Widgets.tsx#NamedArrow")?.endLine).toBe(4);
+    expect(byId.get("src/Widgets.tsx#DefaultCard")?.endLine).toBe(7);
     expect(discovery.warnings).toEqual([]);
   });
 

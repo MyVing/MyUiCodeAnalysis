@@ -91,6 +91,8 @@ export interface FunctionIdentity {
   name: string;
   file: string;
   loc: { line: number; col: number };
+  /** 函数声明结束行（1-based，含） */
+  endLine: number;
   /** 函数体节点；补产 IR 节点后仍需它对声明位置建索引 */
   fn: Node;
   sourceFile: SourceFile;
@@ -116,6 +118,7 @@ export function functionIdentity(fn: Node, rootPath: string): FunctionIdentity |
     name,
     file: relativeFile,
     loc: { line: pos.line, col: pos.column },
+    endLine: fn.getEndLineNumber(),
     fn,
     sourceFile,
   };

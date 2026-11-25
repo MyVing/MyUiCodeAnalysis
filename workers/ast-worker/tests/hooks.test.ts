@@ -116,6 +116,8 @@ describe("hooks / state（真实样本仓）", () => {
     expect(effect).toBeDefined();
     expect(effect?.attrs).toMatchObject({ hookName: "useEffect", custom: false, deps: [] });
     expect(effect?.loc).toEqual({ line: 31, col: 3 });
+    // 回调体跨多行：endLine 必须落在调用表达式结束行，而不是起始行
+    expect(effect?.attrs.endLine).toBe(36);
   });
 
   it("useCallback 以绑定变量名命名，并记录依赖", () => {
@@ -127,6 +129,7 @@ describe("hooks / state（真实样本仓）", () => {
       binding: "handleSelect",
       deps: ["onSelect"],
     });
+    expect(callback?.attrs.endLine).toBe(43);
   });
 
   it("自定义 useXxx 标记为 custom", () => {

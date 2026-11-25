@@ -461,6 +461,8 @@ describe("跨文件处理函数（符号解析）", () => {
     expect(node?.kind).toBe("fn");
     expect(node?.file).toBe("src/services/form.ts");
     expect(node?.attrs.role).toBe("事件处理函数");
+    // 事件处理函数节点也要有结束行，供按函数体截取代码窗口
+    expect(node?.attrs.endLine).toBeGreaterThan(node?.loc?.line ?? 0);
 
     // 边指向的节点必须在 fnNodes 里存在，否则前端点开目标会找不到
     const element = elementOf(result, "src/Save.tsx#Save/jsx:button/validateForm");

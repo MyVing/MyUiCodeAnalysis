@@ -215,6 +215,8 @@ describe("API 链路（真实样本仓）", () => {
     expect(fn?.kind).toBe("fn");
     expect(fn?.file).toBe("src/pages/UserList.tsx");
     expect(fn?.loc).toEqual({ line: 19, col: 1 });
+    // fn 节点带函数体结束行，specdoc 侧才能截取代码窗口
+    expect(fn?.attrs.endLine).toBeGreaterThan(fn?.loc?.line ?? 0);
     expect(fn?.evidence[0]).toMatchObject({ source: "static", confidence: 1 });
   });
 

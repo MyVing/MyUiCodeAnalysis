@@ -520,7 +520,7 @@ export function analyzeEvents(input: EventsAnalysisInput): EventsAnalysisResult 
       file: identity.file,
       loc: identity.loc,
       // role 说明它为什么进图：不是在请求链路上，而是被事件直接引用
-      attrs: { role: "事件处理函数" },
+      attrs: { role: "事件处理函数", endLine: identity.endLine },
       evidence: [
         {
           source: "static",

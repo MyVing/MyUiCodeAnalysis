@@ -216,6 +216,20 @@ describe("ast-worker IR 输出符合契约", () => {
     }
   });
 
+  it("component / fn / hook 节点带函数体结束行，且不早于起始行", () => {
+    const kinds = new Set(["component", "fn", "hook"]);
+    const nodes = graph.nodes.filter(
+      (node) => kinds.has(node.kind) && node.attrs.external !== true,
+    );
+    expect(nodes.length).toBeGreaterThan(0);
+
+    for (const node of nodes) {
+      expect(typeof node.attrs.endLine).toBe("number");
+      expect(Number(node.attrs.endLine)).toBeGreaterThanOrEqual(node.loc?.line ?? 0);
+    }
+  });
+
+
   it("依赖未安装记为 info 级告警，而不是让分析失败或静默丢节点", () => {
     const antd = graph.warnings?.find((w) => w.code === "dependency_not_installed");
     expect(antd?.severity).toBe("info");

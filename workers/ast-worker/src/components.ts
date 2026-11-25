@@ -38,6 +38,8 @@ export interface DiscoveredComponent {
   file: string;
   /** 定义起始位置（1-based） */
   loc: { line: number; col: number };
+  /** 定义结束行（1-based，含），供按函数体取代码窗口；不以 attrs 之外的契约表达 */
+  endLine: number;
   /** props 类型名（如 `UserListProps`）；内联类型或未标注时为 null */
   propsTypeName: string | null;
   /** 组件形态，写进 attrs 便于前端区分 */
@@ -207,6 +209,8 @@ function toComponent(decl: Node, sourceFile: SourceFile, relativeFile: string): 
     name,
     file: relativeFile,
     loc: { line: pos.line, col: pos.column },
+    // 与 loc 取同一节点（声明起点），endLine 也取声明的结束行，避免起止错位
+    endLine: decl.getEndLineNumber(),
     propsTypeName: form === "class" ? null : extractPropsTypeName(componentNode),
     form,
     exportNames: [],

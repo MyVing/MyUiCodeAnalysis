@@ -127,7 +127,7 @@ class IRNode(BaseModel):
     attrs: Annotated[
         dict[str, Any],
         Field(
-            description='由插件自由扩展的属性集合；不得用于存放 file / loc 等通用字段'
+            description='由插件自由扩展的属性集合；不得重复存放 file / loc 等通用字段。分析产物元数据（如组件/函数体的 endLine 行窗口）可随 attrs 下发，避免改动 Location 契约'
         ),
     ]
     evidence: Annotated[list[Evidence], Field(min_length=1)]

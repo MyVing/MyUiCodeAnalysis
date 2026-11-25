@@ -47,6 +47,9 @@ function componentToNode(
     // attrs 只放插件私有扩展；file / loc 已是一等字段，不再重复
     attrs: {
       form: component.form,
+      // 只有起始行时无法按函数体取代码窗口；endLine 是分析产物元数据，
+      // 不改变 Location 契约，随 attrs 扩展下发
+      endLine: component.endLine,
       ...(component.propsTypeName ? { propsTypeName: component.propsTypeName } : {}),
       exportNames: component.exportNames,
       // props 字段完整展开，前端属性面板直接消费，不必二次请求
