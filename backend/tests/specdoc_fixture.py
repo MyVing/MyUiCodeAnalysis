@@ -213,6 +213,10 @@ def spec_requirement_map(graph_: IRGraph, requirement_id: str = "req_spec") -> R
             Match(
                 featureId="f2",
                 pageNodeId="src/pages/Transfer.tsx#Transfer",
+                chainId=next(
+                    chain.id for chain in index.for_page("src/pages/Transfer.tsx#Transfer")
+                    if chain.element.node_id.endswith("jsx:select")
+                ),
                 routeId="src/router.tsx#/transfer",
                 confidence=0.6,
                 quote="付款账户",

@@ -33,7 +33,7 @@ def build_api_mappings(material: PageMaterial, events: list[Event]) -> list[ApiM
     mappings: list[ApiMapping] = []
     seen: set[tuple[str, str, str]] = set()  # (elementId, method, url)
     for event in events:
-        for call in event.httpCalls:
+        for call in event.httpCalls or []:
             key = (event.elementId, call.method, call.url)
             if key in seen:
                 continue
@@ -58,7 +58,7 @@ def build_api_mappings(material: PageMaterial, events: list[Event]) -> list[ApiM
     return mappings
 
 
-def _tag_of(tag_value) -> str | None:
+def _tag_of(tag_value: object) -> str | None:
     return tag_value if isinstance(tag_value, str) and tag_value.strip() else None
 
 

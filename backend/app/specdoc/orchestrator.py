@@ -15,6 +15,7 @@ from collections import defaultdict
 from datetime import UTC, datetime
 
 from app.contracts import IRGraph, RequirementMap
+from app.contracts.requirement import Dropped as RequirementDropped
 from app.contracts.requirement import RequirementWarning, Severity
 from app.contracts.specdoc import (
     ApiMapping,
@@ -28,9 +29,7 @@ from app.contracts.specdoc import (
 from app.contracts.specdoc import (
     Dropped as DocDropped,
 )
-from app.contracts.specdoc import (
-    RequirementWarning as DocWarning,
-)
+from app.contracts.specdoc import RequirementWarning as DocWarning
 from app.core.config import Settings
 from app.requirement.llm import LLMClient
 from app.schemas import Project, SpecDocTask
@@ -38,7 +37,7 @@ from app.specdoc.apimap import build_api_mappings
 from app.specdoc.collect import Materials, collect_materials, deterministic_field_mappings
 from app.specdoc.elements import build_elements
 from app.specdoc.events import build_events
-from app.specdoc.infer import infer_sections
+from app.specdoc.infer import InferOutcome, infer_sections
 
 SCHEMA_VERSION = "1.0"
 
@@ -57,7 +56,8 @@ class SpecDocOrchestrator:
     ) -> SpecDocMap:
         """跑一次装配。素材解析失败（无命中页面）时返回只带告警的空产物。"""
         materials = collect_materials(requirement_map, graph)
-        warnings: list[DocWarning] = _convert_warnings(materials.warnings)
+        requirement_warnings: list[RequirementWarning] = materials.warnings
+        warnings: list[DocWarning] = _convert_warnings(requirement_warnings)
 
         events, api_mappings, elements = self._deterministic_sections(
             materials, warnings
@@ -65,7 +65,7 @@ class SpecDocOrchestrator:
         infer_outcome = await self._infer_sections(
             task, requirement_map.requirement, requirement_map, materials
         )
-        warnings.extend(_convert_warnings(infer_outcome.warnings))
+        warnings.extend(_convert_warnings(infer_outcome.warnings or []))
         deterministic_mappings = [] if task.dry_run else deterministic_field_mappings(materials)
         field_mappings = _merge_field_mappings(deterministic_mappings, infer_outcome.field_mappings)
 
@@ -89,7 +89,7 @@ class SpecDocOrchestrator:
             fieldMappings=field_mappings,
             apiMappings=api_mappings,
             dropped=_convert_dropped(infer_outcome.dropped),
-            warnings=_convert_warnings(warnings),
+            warnings=warnings,
         )
 
     def _deterministic_sections(
@@ -123,7 +123,7 @@ class SpecDocOrchestrator:
         requirement: str,
         requirement_map: RequirementMap,
         materials: Materials,
-    ):
+    ) -> InferOutcome | _SkippedOutcome:
         """三个推断章节。dry-run / 无模型时留空 + 显式告警，不静默。"""
         if task.dry_run:
             return _SkippedOutcome(
@@ -184,7 +184,7 @@ class _SkippedOutcome:
         self.steps: list[Step] = []
         self.rules: list[Rule] = []
         self.field_mappings: list[FieldMapping] = []
-        self.dropped: list = []
+        self.dropped: list[RequirementDropped] = []
         self.warnings: list[RequirementWarning] = warnings or []
 
 
@@ -199,11 +199,11 @@ def _skipped_warning(code: str, message: str) -> list[RequirementWarning]:
     ]
 
 
-def _convert_warnings(warnings) -> list[DocWarning]:
+def _convert_warnings(warnings: list[RequirementWarning] | None) -> list[DocWarning]:
     """requirement 契约的 Warning → specdoc 契约的 Warning（字段同形）。"""
     return [DocWarning(**item.model_dump()) for item in warnings or []]
 
 
-def _convert_dropped(dropped) -> list[DocDropped]:
+def _convert_dropped(dropped: list[RequirementDropped] | None) -> list[DocDropped]:
     """requirement 契约的 Dropped → specdoc 契约的 Dropped（字段同形）。"""
     return [DocDropped(**item.model_dump()) for item in dropped or []]

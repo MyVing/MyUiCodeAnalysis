@@ -11,12 +11,12 @@
 
 from __future__ import annotations
 
+from collections.abc import Iterable
 from dataclasses import dataclass, field
 
 from app.contracts import IRGraph, IRNode, NodeKind
 from app.contracts.requirement import RequirementMap, RequirementWarning, Severity
-from app.contracts.specdoc import Location, Page, VerifiedEvidence
-from app.contracts.specdoc import FieldMapping
+from app.contracts.specdoc import FieldMapping, Location, Page, VerifiedEvidence
 from app.contracts.specdoc import Source as DocSource
 from app.requirement.chains import ActionChain, derive_chains
 
@@ -309,7 +309,7 @@ def _page_corpus(
     return tuple(_unique(texts))
 
 
-def _unique(items) -> list[str]:
+def _unique(items: Iterable[str]) -> list[str]:
     return list(dict.fromkeys(item for item in items if item and item.strip()))
 
 
@@ -406,8 +406,8 @@ def _field_mapping_evidence(node: IRNode, field: dict) -> VerifiedEvidence | Non
             else None
         )
     else:
-        loc = best.loc
-        loc = Location(line=loc.line, col=loc.col) if loc else None
+        ir_loc = best.loc
+        loc = Location(line=ir_loc.line, col=ir_loc.col) if ir_loc else None
     return VerifiedEvidence(
         nodeId=node.id,
         quote=quote,

@@ -10,6 +10,7 @@
 
 from __future__ import annotations
 
+from app.contracts import IRNode
 from app.contracts.specdoc import Event, Handler, HttpCall, Location, Source
 from app.requirement.chains import ActionChain
 from app.specdoc.collect import PageMaterial
@@ -60,7 +61,7 @@ def _http_calls(chain: ActionChain) -> list[HttpCall]:
     return calls
 
 
-def _element_node(material: PageMaterial, node_id: str):
+def _element_node(material: PageMaterial, node_id: str) -> IRNode | None:
     """链路起点元素对应的 IRNode（ChainStep 不带 attrs，元素事实从素材里取）。"""
     for source in material.elements:
         if source.node.id == node_id:
@@ -143,7 +144,9 @@ def build_events(material: PageMaterial) -> tuple[list[Event], list]:
     for candidate in candidates:
         key = _dedupe_key(candidate[0], candidate[1], candidate[2], candidate[3])
         current = grouped.get(key)
-        if current is None or _event_preference(material, candidate[0]) < _event_preference(material, current[0]):
+        if current is None or _event_preference(
+            material, candidate[0]
+        ) < _event_preference(material, current[0]):
             grouped[key] = candidate
 
     events: list[Event] = []
@@ -173,6 +176,7 @@ def _dedupe_key(
     event_type: str | None,
 ) -> tuple:
     """Return a conservative identity for parent/child duplicate submissions."""
+    handler_key: tuple[object, ...]
     if handler is None:
         handler_key = ("element", chain.element.node_id)
     elif handler.file and handler.loc is not None:
