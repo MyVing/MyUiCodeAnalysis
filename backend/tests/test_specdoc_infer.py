@@ -4,11 +4,14 @@ from __future__ import annotations
 
 import json
 
-from app.contracts.requirement import Reason
+from app.contracts import EdgeKind, NodeKind
+from app.contracts.requirement import Match, Reason
+from app.requirement.chains import derive_chains
 from app.requirement.llm import LLMCallError
 from app.specdoc.collect import collect_materials
 from app.specdoc.infer import infer_sections
 from tests.fakes import FakeLLMClient
+from tests.graph_fixture import edge, node, page
 from tests.specdoc_fixture import spec_graph, spec_requirement_map
 
 PAGE_ID = "src/pages/Transfer.tsx#Transfer"
@@ -78,7 +81,168 @@ def _llm_with(steps=_VALID_STEPS, rules=_VALID_RULES, mappings=_VALID_MAPPINGS) 
     )
 
 
-async def test_steps_reject_unknown_chain_without_page_level_fallback() -> None:
+def _multi_page_inputs():
+    graph_ = spec_graph()
+    second_id = "src/pages/TransferReview.tsx#TransferReview"
+    second_page = page(second_id, "TransferReview", texts=["复核页面专属文案"])
+    second_element = node(
+        f"{second_id}/jsx:button",
+        NodeKind.element,
+        "<button> 复核转账",
+        file="src/pages/TransferReview.tsx",
+        attrs={"tag": "button", "viewRole": "control", "viewText": "复核转账"},
+    )
+    second_handler = node(
+        "src/pages/TransferReview.tsx#submitReview",
+        NodeKind.fn,
+        "submitReview",
+        file="src/pages/TransferReview.tsx",
+    )
+    second_api = node(
+        "api:POST:/api/transfer/review",
+        NodeKind.api,
+        "POST /api/transfer/review",
+        attrs={"method": "POST", "url": "/api/transfer/review"},
+    )
+    second_route = node(
+        "src/router.tsx#/transfer-review",
+        NodeKind.route,
+        "/transfer-review",
+        file="src/router.tsx",
+        attrs={"path": "/transfer-review"},
+    )
+    graph_.nodes.extend([second_page, second_element, second_handler, second_api, second_route])
+    graph_.edges.extend([
+        edge(second_route.id, second_page.id, EdgeKind.renders),
+        edge(second_page.id, second_element.id, EdgeKind.contains),
+        edge(second_element.id, second_handler.id, EdgeKind.calls),
+        edge(second_handler.id, second_api.id, EdgeKind.requests),
+    ])
+    requirement_map = spec_requirement_map(graph_)
+    requirement_map.matches.append(
+        Match(
+            featureId="f1",
+            pageNodeId=second_id,
+            chainId=next(
+                chain.id for chain in derive_chains(graph_).for_page(second_id)
+                if chain.element.node_id == second_element.id
+            ),
+            routeId=second_route.id,
+            confidence=0.8,
+            quote="复核转账",
+            subgraph=requirement_map.matches[0].subgraph,
+            source=requirement_map.matches[0].source,
+        )
+    )
+    materials = collect_materials(requirement_map, graph_)
+    return (
+        requirement_map, materials, second_id,
+        requirement_map.matches[-1].chainId, second_element.id,
+    )
+
+
+async def test_steps_use_chain_page_for_multi_page_feature() -> None:
+    requirement_map, materials, second_id, chain_id, element_id = _multi_page_inputs()
+    steps = {"steps": [{
+        "featureId": "f1", "chainId": chain_id, "nodeId": element_id,
+        "actions": ["点击复核"], "quote": "复核转账",
+    }]}
+    outcome = await infer_sections(
+        requirement_map.requirement, requirement_map, materials,
+        _llm_with(steps=steps), max_calls=1,
+    )
+    assert len(outcome.steps) == 1
+    assert outcome.steps[0].pageId == second_id
+    assert outcome.steps[0].evidence[0].nodeId == element_id
+
+
+async def test_step_rejects_page_not_matched_by_feature() -> None:
+    requirement_map, materials, _, _, _ = _multi_page_inputs()
+    steps = {"steps": [{
+        "featureId": "f1", "pageId": "not-a-page", "chainId": "fake-chain",
+        "nodeId": "fake-node", "actions": ["执行"], "quote": "转账",
+    }]}
+    outcome = await infer_sections(
+        requirement_map.requirement, requirement_map, materials,
+        _llm_with(steps=steps), max_calls=1,
+    )
+    assert outcome.steps == []
+    assert outcome.dropped[0].reason == Reason.node_not_in_candidates
+
+
+async def test_rule_page_id_selects_display_ui_text_and_rejects_element_text() -> None:
+    requirement_map, materials, second_id, _, _ = _multi_page_inputs()
+    rules = {"rules": [{
+        "featureId": "f1", "pageId": second_id, "category": "display",
+        "condition": "复核页面打开时", "result": "显示复核提示",
+        "quote": "复核页面专属文案",
+    }]}
+    outcome = await infer_sections(
+        requirement_map.requirement, requirement_map, materials,
+        _llm_with(rules=rules), max_calls=1,
+    )
+    assert len(outcome.rules) == 1
+    assert outcome.rules[0].pageId == second_id
+    assert outcome.rules[0].evidence[0].nodeId == second_id
+
+    rules["rules"][0]["quote"] = "复核转账"
+    rejected = await infer_sections(
+        requirement_map.requirement, requirement_map, materials,
+        _llm_with(rules=rules), max_calls=1,
+    )
+    assert rejected.rules == []
+    assert rejected.dropped[0].reason == Reason.quote_not_found
+
+
+async def test_rule_rejects_chain_page_conflict() -> None:
+    requirement_map, materials, second_id, _, _ = _multi_page_inputs()
+    first_chain = next(
+        chain.id for chain in materials.pages[0].chains
+        if chain.element.node_id.endswith("jsx:button")
+    )
+    rules = {"rules": [{
+        "featureId": "f1", "pageId": second_id, "chainId": first_chain,
+        "elementId": "src/pages/Transfer.tsx#Transfer/jsx:button",
+        "category": "validation", "condition": "x", "result": "y", "quote": "转账",
+    }]}
+    outcome = await infer_sections(
+        requirement_map.requirement, requirement_map, materials,
+        _llm_with(rules=rules), max_calls=1,
+    )
+    assert outcome.rules == []
+    assert outcome.dropped[0].reason == Reason.chain_not_in_candidates
+
+
+async def test_non_display_rule_does_not_accept_page_ui_text_without_chain() -> None:
+    requirement_map, materials, second_id, _, _ = _multi_page_inputs()
+    rules = {"rules": [{
+        "featureId": "f1", "pageId": second_id, "category": "validation",
+        "condition": "页面打开时", "result": "显示信息",
+        "quote": "复核页面专属文案但不可被非display类型引用",
+    }]}
+    outcome = await infer_sections(
+        requirement_map.requirement, requirement_map, materials,
+        _llm_with(rules=rules), max_calls=1,
+    )
+    assert outcome.rules == []
+    assert outcome.dropped[0].reason == Reason.quote_not_found
+
+
+async def test_display_rule_rejects_explicit_element_anchor_without_chain() -> None:
+    requirement_map, materials, second_id, _, element_id = _multi_page_inputs()
+    rules = {"rules": [{
+        "featureId": "f1", "pageId": second_id, "elementId": element_id,
+        "category": "display", "condition": "页面打开时", "result": "展示提示",
+        "quote": "复核转账",
+    }]}
+    outcome = await infer_sections(
+        requirement_map.requirement, requirement_map, materials,
+        _llm_with(rules=rules), max_calls=1,
+    )
+    assert outcome.rules == []
+    assert outcome.dropped[0].reason == Reason.node_not_in_candidates
+
+
     steps = {
         "steps": [
             {

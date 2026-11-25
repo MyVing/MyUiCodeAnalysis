@@ -45,12 +45,13 @@ _STEPS_SYSTEM = """\
 为每个功能点产出「业务操作步骤」。
 
 只输出 JSON，形状：
-{"steps": [{"featureId": "f1", "chainId": "链路id", "nodeId": "节点id",
+{"steps": [{"featureId": "f1", "pageId": "页面id（可选）", "chainId": "链路id", "nodeId": "节点id",
   "precondition": ["前置条件"], "actions": ["操作1"], "quote": "逐字引文", "confidence": 0.8}]}
 
 要求：
 1. 每个功能点最多一组步骤；featureId 必须使用给定 id，不得编造。
-2. 必须返回 evidence pack 中真实的 chainId 和该链路内的 nodeId；步骤只能来自链路节点事实。
+2. 必须返回 evidence pack 中真实的 chainId 和该链路内的 nodeId；可提供 pageId 指明目标页面，
+   必须与链路归属一致。步骤只能来自链路节点事实。
 3. actions 是有序的用户操作，每条一句话，写到「系统给出什么反馈」为止。
 4. quote 必须从对应 node 的文本字段逐字复制，禁止改写或拼凑。
 5. 禁止编造；无匹配链路或证据不足时省略该功能点。
@@ -62,13 +63,15 @@ _RULES_SYSTEM = """\
 / linkage（联动规则）/ session（会话状态）/ permission（权限规则）。
 
 只输出 JSON，形状：
-{"rules": [{"featureId": "f1", "chainId": "链路id", "elementId": "元素id",
-  "category": "validation", "target": "作用对象", "condition": "条件",
+{"rules": [{"featureId": "f1", "pageId": "页面id（可选）", "chainId": "链路id",
+  "elementId": "元素id", "category": "validation", "target": "作用对象", "condition": "条件",
   "result": "结果", "quote": "逐字引文", "confidence": 0.8}]}
 
 要求：
-1. category 必须是五类之一；功能点规则必须用给定 featureId，页面级规则可省略。
-2. 必须返回真实 elementId 或 chainId；引用标识必须属于目标页面。
+1. category 必须是五类之一；功能点规则必须用给定 featureId，页面级规则可省略。可选 pageId 只可指向
+   该功能点命中的页面。
+2. 必须返回真实 elementId 或 chainId；display 规则若引用页面级 uiText，可不提供 chainId，
+   改提供目标 pageId（可附该页面 nodeId）。所有引用标识必须属于目标页面。
 3. 仅当证据出现校验文案、disabled、条件渲染、权限分支、分页/空态参数或联动行为时输出；
    静态文案不是业务规则。
 4. quote 必须从对应节点文本逐字复制，禁止改写或拼凑。
@@ -104,6 +107,7 @@ class _PageContext:
     texts_by_node: dict[str, tuple[str, ...]] = field(default_factory=dict)
     chain_nodes: dict[str, frozenset[str]] = field(default_factory=dict)
     feature_chains: dict[str, frozenset[str]] = field(default_factory=dict)
+    ui_text: tuple[str, ...] = ()
 
     @property
     def corpus(self) -> tuple[str, ...]:
@@ -142,6 +146,16 @@ async def infer_sections(
         context.texts_by_node = exposed_texts.get(
             context.material.page.pageId, {}
         )
+        ui_attrs = context.material.node.attrs.get("uiText")
+        ui_values = {
+            entry.get("text")
+            for entry in (ui_attrs.get("texts", []) if isinstance(ui_attrs, dict) else [])
+            if isinstance(entry, dict) and isinstance(entry.get("text"), str)
+        }
+        context.ui_text = tuple(
+            text for text in context.texts_by_node.get(context.material.page.pageId, ())
+            if text in ui_values
+        )
         context.chain_nodes = {
             chain.id: frozenset(chain.node_ids)
             for chain in context.material.chains
@@ -160,7 +174,10 @@ async def infer_sections(
                 and match.chainId is not None
                 and match.chainId in context.chain_nodes
             )
-            for feature_id in (context.material.page.featureIds or [])
+            for feature_id in {
+                match.featureId for match in (requirement_map.matches or [])
+                if match.pageNodeId == context.material.page.pageId
+            }
         }
     feature_pages = _feature_pages(requirement_map, contexts)
     features = list(requirement_map.features)
@@ -324,16 +341,47 @@ def _evidence_from_step(
 
 def _feature_pages(
     requirement_map: RequirementMap, contexts: list[_PageContext]
-) -> dict[str, str]:
-    """featureId → 定位页面 id（首个命中页）。"""
-    context_by_page = {ctx.material.page.pageId: ctx for ctx in contexts}
-    result: dict[str, str] = {}
+) -> dict[str, tuple[str, ...]]:
+    """featureId → 全部有效命中页面，按 contexts 顺序保留兼容默认项。"""
+    available = {ctx.material.page.pageId for ctx in contexts}
+    result: dict[str, list[str]] = {}
     for match in requirement_map.matches:
-        if match.featureId in result:
-            continue
-        if match.pageNodeId in context_by_page:
-            result[match.featureId] = match.pageNodeId
-    return result
+        if match.pageNodeId in available:
+            pages = result.setdefault(match.featureId, [])
+            if match.pageNodeId not in pages:
+                pages.append(match.pageNodeId)
+    return {feature_id: tuple(pages) for feature_id, pages in result.items()}
+
+
+def _select_feature_context(
+    feature_id: str,
+    page_id: str | None,
+    chain_id: str | None,
+    feature_pages: dict[str, tuple[str, ...]],
+    context_by_page: dict[str, _PageContext],
+) -> tuple[_PageContext | None, Reason | None]:
+    """选择 feature 页面；显式引用冲突或无效时拒绝而不回退。"""
+    pages = feature_pages.get(feature_id, ())
+    if page_id is not None and page_id not in pages:
+        return None, Reason.node_not_in_candidates
+
+    chain_pages = tuple(
+        candidate for candidate in pages
+        if chain_id is not None
+        and chain_id in context_by_page[candidate].feature_chains.get(feature_id, frozenset())
+    )
+    if chain_id is not None:
+        if len(chain_pages) != 1:
+            return None, Reason.chain_not_in_candidates
+        chain_page = chain_pages[0]
+        if page_id is not None and page_id != chain_page:
+            return None, Reason.chain_not_in_candidates
+        return context_by_page[chain_page], None
+
+    selected_page = page_id or (pages[0] if pages else None)
+    if selected_page is None:
+        return None, Reason.node_not_in_candidates
+    return context_by_page[selected_page], None
 
 
 def _user_prompt(
@@ -356,6 +404,7 @@ def _user_prompt(
 def _verified(
     quote: str, context: _PageContext, *, node_id: str | None = None,
     chain_id: str | None = None, element_id: str | None = None,
+    ui_text_only: bool = False,
 ) -> VerifiedEvidence | None:
     """逐字校验引文，并在提供引用锚点时限制到对应节点/链路。"""
     if node_id is not None and node_id not in context.texts_by_node:
@@ -380,8 +429,10 @@ def _verified(
             return None
         allowed_nodes = {node_id}
 
-    corpus = context.prompt_corpus
+    corpus = context.ui_text if ui_text_only else context.prompt_corpus
     evidence_index = context.evidence_by_text
+    if ui_text_only:
+        allowed_nodes = {context.material.page.pageId}
     if allowed_nodes is not None:
         corpus = tuple(
             text for current in sorted(allowed_nodes)
@@ -417,7 +468,7 @@ def _verified(
 async def _infer_steps(
     requirement: str,
     features: list[Feature],
-    feature_pages: dict[str, str],
+    feature_pages: dict[str, tuple[str, ...]],
     contexts: list[_PageContext],
     llm: LLMClient,
     max_calls: int,
@@ -458,7 +509,23 @@ async def _infer_steps(
                 )
             )
             continue
-        context = context_by_page.get(feature_pages.get(feature_id, ""))
+        page_id = _str_or_none(entry.get("pageId"))
+        chain_id = _str_or_none(entry.get("chainId"))
+        node_id = _str_or_none(entry.get("nodeId"))
+        context, selection_error = _select_feature_context(
+            feature_id, page_id, chain_id, feature_pages, context_by_page
+        )
+        if selection_error is not None:
+            dropped.append(
+                Dropped(
+                    reason=selection_error,
+                    featureId=feature_id,
+                    chainId=chain_id,
+                    nodeId=node_id,
+                    quote=_str_or_none(entry.get("quote")),
+                )
+            )
+            continue
         actions = _str_list(entry.get("actions"))
         if context is None or not actions:
             dropped.append(
@@ -470,8 +537,6 @@ async def _infer_steps(
             )
             continue
         quote = entry.get("quote")
-        chain_id = _str_or_none(entry.get("chainId"))
-        node_id = _str_or_none(entry.get("nodeId"))
         valid_chains = context.feature_chains.get(feature_id, frozenset())
         if chain_id is not None and chain_id not in valid_chains:
             dropped.append(
@@ -530,7 +595,7 @@ async def _infer_steps(
 async def _infer_rules(
     requirement: str,
     features: list[Feature],
-    feature_pages: dict[str, str],
+    feature_pages: dict[str, tuple[str, ...]],
     contexts: list[_PageContext],
     llm: LLMClient,
     max_calls: int,
@@ -587,10 +652,28 @@ async def _infer_rules(
                     )
                 )
                 continue
-            context = context_by_page[feature_pages[feature_id]]
+            page_id_hint = _str_or_none(entry.get("pageId"))
             chain_id = _str_or_none(entry.get("chainId"))
             element_id = _str_or_none(entry.get("elementId"))
             node_id = _str_or_none(entry.get("nodeId"))
+            context, selection_error = _select_feature_context(
+                feature_id, page_id_hint, chain_id, feature_pages, context_by_page
+            )
+            if selection_error is not None:
+                dropped.append(
+                    Dropped(
+                        reason=selection_error,
+                        featureId=feature_id,
+                        chainId=chain_id,
+                        nodeId=node_id,
+                        quote=_str_or_none(quote),
+                    )
+                )
+                continue
+            if context is None:
+                dropped.append(Dropped(reason=Reason.node_not_in_candidates,
+                                       featureId=feature_id, quote=_str_or_none(quote)))
+                continue
             valid_chains = context.feature_chains.get(feature_id, frozenset())
             if chain_id is not None and chain_id not in valid_chains:
                 dropped.append(
@@ -621,6 +704,20 @@ async def _infer_rules(
                 )
                 continue
             if isinstance(quote, str) and chain_id is not None:
+                if element_id is not None and (
+                    element_id not in {source.node.id for source in context.material.elements}
+                    and element_id not in context.chain_nodes.get(chain_id, frozenset())
+                ):
+                    dropped.append(
+                        Dropped(
+                            reason=Reason.node_not_in_candidates,
+                            featureId=feature_id,
+                            chainId=chain_id,
+                            nodeId=element_id,
+                            quote=_str_or_none(quote),
+                        )
+                    )
+                    continue
                 evidence = _verified(
                     quote, context, chain_id=chain_id, element_id=element_id,
                     node_id=node_id,
@@ -628,12 +725,32 @@ async def _infer_rules(
                 if evidence is not None:
                     page_id = context.material.page.pageId
             elif isinstance(quote, str):
-                evidence = _verified(quote, context)
+                display_without_chain = category == RuleCategory.display.value
+                if display_without_chain and (
+                    node_id not in (None, context.material.page.pageId)
+                    or element_id is not None
+                ):
+                    dropped.append(
+                        Dropped(
+                            reason=Reason.node_not_in_candidates,
+                            featureId=feature_id,
+                            nodeId=node_id,
+                            quote=_str_or_none(quote),
+                        )
+                    )
+                    continue
+                evidence = _verified(
+                    quote,
+                    context,
+                    node_id=node_id,
+                    element_id=element_id,
+                    ui_text_only=display_without_chain,
+                )
                 warnings.append(
                     RequirementWarning(
                         code="evidence_ref_missing",
                         severity=Severity.warning,
-                        message="功能点规则缺少引用锚点，已使用页面级逐字校验。",
+                        message="功能点规则缺少链路锚点，已使用页面级逐字校验。",
                     )
                 )
             page_id = page_id or context.material.page.pageId
