@@ -32,32 +32,27 @@ from app.contracts.specdoc import (
     Step,
     VerifiedEvidence,
 )
+from app.requirement.chains import ChainStep
 from app.requirement.judge import capped_confidence, match_quote, parse_json
 from app.requirement.llm import LLMCallError, LLMClient
 from app.specdoc.apimap import all_api_steps
 from app.specdoc.collect import Materials, PageMaterial
-
-# 每页语料送入 prompt 的行数上限：语料过长会把输出预算挤占掉，模型开始
-# 省略引文。超出部分不送——确定性章节覆盖要素事实，LLM 章节允许按主要
-# 交互推断，漏掉的由告警说明。
-_MAX_CORPUS_LINES = 120
+from app.specdoc.evidence import build_evidence_pack
 
 _STEPS_SYSTEM = """\
 你是资深前端规格分析师。根据给定的需求、功能点与页面语料（均为代码原文），\
 为每个功能点产出「业务操作步骤」。
 
 只输出 JSON，形状：
-{"steps": [{"featureId": "f1", "precondition": ["前置条件"],
-  "actions": ["操作1", "操作2"], "quote": "引文", "confidence": 0.8}]}
+{"steps": [{"featureId": "f1", "chainId": "链路id", "nodeId": "节点id",
+  "precondition": ["前置条件"], "actions": ["操作1"], "quote": "逐字引文", "confidence": 0.8}]}
 
 要求：
-1. 每个功能点恰好一组步骤；featureId 必须使用给定的 id，不得编造。
-2. actions 是有序的用户操作，每条一句话，写到「系统给出什么反馈」为止
-   （例：选择付款账户，系统展示该账户可用余额）。
-3. quote 必须从对应页面的语料里逐字复制，作为该组步骤的判断依据；
-   禁止改写、拼凑或使用语料里没有的文本。
-4. 禁止编造页面、按钮、接口。语料不足以支撑某个功能点的步骤时，
-   省略该功能点，不要编。
+1. 每个功能点最多一组步骤；featureId 必须使用给定 id，不得编造。
+2. 必须返回 evidence pack 中真实的 chainId 和该链路内的 nodeId；步骤只能来自链路节点事实。
+3. actions 是有序的用户操作，每条一句话，写到「系统给出什么反馈」为止。
+4. quote 必须从对应 node 的文本字段逐字复制，禁止改写或拼凑。
+5. 禁止编造；无匹配链路或证据不足时省略该功能点。
 """
 
 _RULES_SYSTEM = """\
@@ -66,14 +61,17 @@ _RULES_SYSTEM = """\
 / linkage（联动规则）/ session（会话状态）/ permission（权限规则）。
 
 只输出 JSON，形状：
-{"rules": [{"featureId": "f1", "category": "validation", "target": "作用对象",
-  "condition": "条件", "result": "结果", "quote": "引文", "confidence": 0.8}]}
+{"rules": [{"featureId": "f1", "chainId": "链路id", "elementId": "元素id",
+  "category": "validation", "target": "作用对象", "condition": "条件",
+  "result": "结果", "quote": "逐字引文", "confidence": 0.8}]}
 
 要求：
-1. category 必须是五类之一；featureId 用给定 id，页面级规则可省略。
-2. condition 写「什么情况下」，result 写「页面/系统做什么」。
-3. quote 必须从对应页面的语料里逐字复制，禁止改写或拼凑。
-4. 禁止编造规则。语料里没有依据的规则不要输出。
+1. category 必须是五类之一；功能点规则必须用给定 featureId，页面级规则可省略。
+2. 必须返回真实 elementId 或 chainId；引用标识必须属于目标页面。
+3. 仅当证据出现校验文案、disabled、条件渲染、权限分支、分页/空态参数或联动行为时输出；
+   静态文案不是业务规则。
+4. quote 必须从对应节点文本逐字复制，禁止改写或拼凑。
+5. 无明确证据时省略，不得编造规则。
 """
 
 _MAPPING_SYSTEM = """\
@@ -82,23 +80,17 @@ _MAPPING_SYSTEM = """\
 
 只输出 JSON，形状：
 {"fieldMappings": [{"frontField": "前端字段名", "backendParam": "后端参数名",
-  "api": "接口", "quote": "引文", "confidence": 0.8}]}
+  "api": "POST /api/path", "elementId": "元素id", "quote": "逐字引文", "confidence": 0.8}]}
 
 要求：
-1. 只归纳语料里有依据的映射（请求体字段名、接口 url、参数名）。
-2. api 用「METHOD url」或 url。
-3. quote 必须是语料里**一段连续原文**，逐字复制，禁止改写或拼凑。
-   错误示例：把 `- Your Name
-- useRegister
-- /api/users` 这样的关键词罗列当 quote——它不是语料原文，校验必然失败。
-   正确示例：语料里有一行是 `<input {...register("username")} placeholder="Your Name" />`，
-   quote 就原样复制这一行。
-4. 每条映射各自带自己的 quote，不要多条共用一段引文。
-5. 语料没有依据的映射不要输出。
+1. 映射必须有 elementId，且仅从该页 forms 与 API requestBody 事实归纳；api 必须命中该页 apiFacts。
+2. api 用「METHOD url」或 url；不得将其他页面的字段、请求或接口拼接。
+3. quote 必须是 evidence pack 中连续原文，逐字复制；禁止改写或拼凑。
+4. 缺少证据的映射不要输出。
 """
 
 
-@dataclass(frozen=True)
+@dataclass
 class _PageContext:
     """送入 prompt 与引文校验的页面级上下文。"""
 
@@ -107,10 +99,18 @@ class _PageContext:
     evidence_by_text: dict[str, VerifiedEvidence] = field(default_factory=dict)
     # 该页面的接口集合（method, url），字段映射按 api 反查页面用
     api_urls: tuple[tuple[str, str], ...] = ()
+    # 页面内可用节点文本与节点所属链路，用于锚点范围校验
+    texts_by_node: dict[str, tuple[str, ...]] = field(default_factory=dict)
+    chain_nodes: dict[str, frozenset[str]] = field(default_factory=dict)
+    feature_chains: dict[str, frozenset[str]] = field(default_factory=dict)
 
     @property
     def corpus(self) -> tuple[str, ...]:
         return self.material.corpus
+
+    @property
+    def prompt_corpus(self) -> tuple[str, ...]:
+        return tuple(text for values in self.texts_by_node.values() for text in values)
 
 
 @dataclass
@@ -133,26 +133,62 @@ async def infer_sections(
 ) -> InferOutcome:
     """跑三个推断章节。模型彻底不可用时不抛错：章节留空 + llm_unavailable 告警。"""
     contexts = _page_contexts(materials)
+    evidence_pack = build_evidence_pack(materials)
+    evidence_json, exposed_texts = evidence_pack.prompt_view()
+    for context in contexts:
+        context.texts_by_node = exposed_texts.get(
+            context.material.page.pageId, {}
+        )
+        context.chain_nodes = {
+            chain.id: frozenset(chain.node_ids)
+            for chain in context.material.chains
+            if chain.id in {
+                item.get("chainId")
+                for page in evidence_pack.pages
+                if page.get("pageId") == context.material.page.pageId
+                for item in page.get("chains", [])
+            }
+        }
+        context.feature_chains = {
+            feature_id: frozenset(
+                match.chainId for match in (requirement_map.matches or [])
+                if match.featureId == feature_id
+                and match.pageNodeId == context.material.page.pageId
+                and match.chainId is not None
+                and match.chainId in context.chain_nodes
+            )
+            for feature_id in (context.material.page.featureIds or [])
+        }
     feature_pages = _feature_pages(requirement_map, contexts)
     features = list(requirement_map.features)
 
-    outcome = InferOutcome()
-    steps, dropped, warnings = await _infer_steps(
-        requirement, features, feature_pages, contexts, llm, max_calls
+    outcome = InferOutcome(
+        warnings=[
+            RequirementWarning(
+                code=warning,
+                severity=Severity.warning,
+                message="结构化证据包超过预算，已按确定性顺序裁剪。",
+            )
+            for warning in evidence_pack.warnings
+        ]
     )
-    outcome.steps, outcome.dropped, outcome.warnings = steps, dropped, warnings
+    steps, dropped, warnings = await _infer_steps(
+        requirement, features, feature_pages, contexts, llm, max_calls, evidence_json
+    )
+    outcome.steps, outcome.dropped = steps, dropped
+    outcome.warnings.extend(warnings or [])
     rules, dropped, warnings = await _infer_rules(
-        requirement, features, feature_pages, contexts, llm, max_calls
+        requirement, features, feature_pages, contexts, llm, max_calls, evidence_json
     )
     outcome.rules.extend(rules)
     outcome.dropped.extend(dropped)
-    outcome.warnings.extend(warnings)
+    outcome.warnings.extend(warnings or [])
     mappings, dropped, warnings = await _infer_mappings(
-        requirement, contexts, llm, max_calls
+        requirement, contexts, llm, max_calls, evidence_json
     )
     outcome.field_mappings.extend(mappings)
     outcome.dropped.extend(dropped)
-    outcome.warnings.extend(warnings)
+    outcome.warnings.extend(warnings or [])
     return outcome
 
 
@@ -204,6 +240,41 @@ def _page_contexts(materials: Materials) -> list[_PageContext]:
                 evidence_by_text.setdefault(
                     view_text, _evidence_from_step(source.node.id, view_text, None)
                 )
+            events = source.node.attrs.get("events")
+            if not isinstance(events, list):
+                continue
+            steps_by_id = {
+                step.node_id: step
+                for chain in source.chains
+                for step in chain.steps
+            }
+            for binding in events:
+                if not isinstance(binding, dict):
+                    continue
+                handler_source = binding.get("handler")
+                if not isinstance(handler_source, str) or not handler_source.strip():
+                    continue
+                targets = binding.get("targets")
+                handler_step = None
+                if isinstance(targets, list):
+                    handler_step = next(
+                        (
+                            steps_by_id[target["id"]]
+                            for target in targets
+                            if isinstance(target, dict)
+                            and isinstance(target.get("id"), str)
+                            and target["id"] in steps_by_id
+                        ),
+                        None,
+                    )
+                evidence_by_text.setdefault(
+                    handler_source,
+                    _evidence_from_step(
+                        handler_step.node_id if handler_step is not None else source.node.id,
+                        handler_source,
+                        handler_step,
+                    ),
+                )
         contexts.append(
             _PageContext(
                 material=material,
@@ -214,7 +285,9 @@ def _page_contexts(materials: Materials) -> list[_PageContext]:
     return contexts
 
 
-def _evidence_from_step(node_id: str, text: str, step) -> VerifiedEvidence:
+def _evidence_from_step(
+    node_id: str, text: str, step: ChainStep | None
+) -> VerifiedEvidence:
     """AI 证据：source=ai，置信度在引文校验后按封顶规则填。"""
     return VerifiedEvidence(
         nodeId=node_id,
@@ -251,26 +324,72 @@ def _user_prompt(
     contexts: list[_PageContext],
     *,
     with_features: bool,
+    evidence_json: str,
 ) -> str:
     lines: list[str] = [f"需求：{requirement}"]
     if with_features:
         lines.append("功能点：")
         lines.extend(f"- {item.id}: {item.text}" for item in features)
-    lines.append("页面语料（引文只能从这里逐字复制）：")
-    for context in contexts:
-        page = context.material.page
-        lines.append(f"## 页面 {page.pageNo}：{page.name}（{page.file or '未知文件'}）")
-        corpus = context.corpus[:_MAX_CORPUS_LINES]
-        lines.extend(f"- {text}" for text in corpus)
+    lines.append("结构化证据包（唯一事实来源；引文只能从其中的文本字段逐字复制）：")
+    lines.append(evidence_json)
     return "\n".join(lines)
 
 
-def _verified(quote: str, context: _PageContext) -> VerifiedEvidence | None:
-    """引文校验 + 证据解析。命中后按 AI 封顶规则重设置信度。"""
-    match = match_quote(quote, context.corpus)
+def _verified(
+    quote: str, context: _PageContext, *, node_id: str | None = None,
+    chain_id: str | None = None, element_id: str | None = None,
+) -> VerifiedEvidence | None:
+    """逐字校验引文，并在提供引用锚点时限制到对应节点/链路。"""
+    if node_id is not None and node_id not in context.texts_by_node:
+        return None
+    allowed_nodes: set[str] | None = None
+    if chain_id is not None:
+        chain_nodes = context.chain_nodes.get(chain_id)
+        if chain_nodes is None:
+            return None
+        allowed_nodes = set(chain_nodes)
+    if element_id is not None:
+        if (
+            element_id not in {source.node.id for source in context.material.elements}
+            and (allowed_nodes is None or element_id not in allowed_nodes)
+        ):
+            return None
+        if allowed_nodes is not None and element_id not in allowed_nodes:
+            return None
+        allowed_nodes = {element_id} if allowed_nodes is None else allowed_nodes
+    if node_id is not None:
+        if allowed_nodes is not None and node_id not in allowed_nodes:
+            return None
+        allowed_nodes = {node_id}
+
+    corpus = context.prompt_corpus
+    evidence_index = context.evidence_by_text
+    if allowed_nodes is not None:
+        corpus = tuple(
+            text for current in sorted(allowed_nodes)
+            for text in context.texts_by_node.get(current, ())
+        )
+        evidence_index = {
+            text: context.evidence_by_text[text]
+            for text in corpus if text in context.evidence_by_text
+        }
+    match = match_quote(quote, corpus)
     if match is None:
         return None
-    evidence = context.evidence_by_text.get(match.corpus_text)
+    evidence = evidence_index.get(match.corpus_text)
+    if allowed_nodes is not None:
+        for current in sorted(allowed_nodes):
+            if match.corpus_text not in context.texts_by_node.get(current, ()):
+                continue
+            step = next(
+                (
+                    step for chain in context.material.chains
+                    for step in chain.steps if step.node_id == current
+                ),
+                None,
+            )
+            evidence = _evidence_from_step(current, match.corpus_text, step)
+            break
     if evidence is None:
         return None
     confidence = capped_confidence(1.0, quote_ambiguous=match.partial)
@@ -284,13 +403,17 @@ async def _infer_steps(
     contexts: list[_PageContext],
     llm: LLMClient,
     max_calls: int,
+    evidence_json: str,
 ) -> tuple[list[Step], list[Dropped], list[RequirementWarning] | None]:
     if not features:
         return [], [], []
     parsed = await _call_json(
         llm,
         _STEPS_SYSTEM,
-        _user_prompt(requirement, features, contexts, with_features=True),
+        _user_prompt(
+            requirement, features, contexts, with_features=True,
+            evidence_json=evidence_json,
+        ),
         max_calls,
     )
     if parsed is None:
@@ -329,7 +452,14 @@ async def _infer_steps(
             )
             continue
         quote = entry.get("quote")
-        evidence = _verified(quote, context) if isinstance(quote, str) else None
+        chain_id = _str_or_none(entry.get("chainId"))
+        node_id = _str_or_none(entry.get("nodeId"))
+        evidence = (
+            _verified(quote, context, node_id=node_id, chain_id=chain_id)
+            if isinstance(quote, str) and chain_id is not None and node_id is not None
+            and chain_id in context.feature_chains.get(feature_id, frozenset())
+            else None
+        )
         if evidence is None:
             dropped.append(
                 Dropped(
@@ -360,11 +490,15 @@ async def _infer_rules(
     contexts: list[_PageContext],
     llm: LLMClient,
     max_calls: int,
+    evidence_json: str,
 ) -> tuple[list[Rule], list[Dropped], list[RequirementWarning] | None]:
     parsed = await _call_json(
         llm,
         _RULES_SYSTEM,
-        _user_prompt(requirement, features, contexts, with_features=True),
+        _user_prompt(
+            requirement, features, contexts, with_features=True,
+            evidence_json=evidence_json,
+        ),
         max_calls,
     )
     if parsed is None:
@@ -373,6 +507,7 @@ async def _infer_rules(
     valid_categories = {item.value for item in RuleCategory}
     rules: list[Rule] = []
     dropped: list[Dropped] = []
+    warnings: list[RequirementWarning] = []
     entries = parsed.get("rules")
     if not isinstance(entries, list):
         return [], [], [_shape_warning("rules")]
@@ -409,13 +544,45 @@ async def _infer_rules(
                 )
                 continue
             context = context_by_page[feature_pages[feature_id]]
-            if isinstance(quote, str):
+            chain_id = _str_or_none(entry.get("chainId"))
+            element_id = _str_or_none(entry.get("elementId"))
+            node_id = _str_or_none(entry.get("nodeId"))
+            if isinstance(quote, str) and chain_id and chain_id in context.feature_chains.get(
+                feature_id, frozenset()
+            ):
+                evidence = _verified(
+                    quote, context, chain_id=chain_id, element_id=element_id,
+                    node_id=node_id,
+                )
+                if evidence is not None:
+                    page_id = context.material.page.pageId
+            elif isinstance(quote, str):
                 evidence = _verified(quote, context)
-            page_id = context.material.page.pageId
+                warnings.append(
+                    RequirementWarning(
+                        code="evidence_ref_missing",
+                        severity=Severity.warning,
+                        message="功能点规则缺少有效引用锚点，已使用页面级逐字校验。",
+                    )
+                )
+            page_id = page_id or context.material.page.pageId
         else:
-            # 页面级规则：引文在全部页面里唯一命中才收，避免「暂无数据」式
-            # 共享文案把规则挂到错误页面上
-            evidence, page_id = _locate_by_quote(quote, contexts)
+            # 页面级规则仍要求跨页面唯一命中；若给出锚点，还必须在锚定范围内命中。
+            chain_id = _str_or_none(entry.get("chainId"))
+            element_id = _str_or_none(entry.get("elementId"))
+            node_id = _str_or_none(entry.get("nodeId"))
+            if chain_id or element_id or node_id:
+                hits = [
+                    (evidence, context.material.page.pageId)
+                    for context in contexts
+                    if (evidence := _verified(
+                        quote, context, chain_id=chain_id,
+                        element_id=element_id, node_id=node_id,
+                    )) is not None
+                ] if isinstance(quote, str) else []
+                evidence, page_id = hits[0] if len(hits) == 1 else (None, None)
+            else:
+                evidence, page_id = _locate_by_quote(quote, contexts)
         if evidence is None or page_id is None:
             dropped.append(
                 Dropped(
@@ -438,7 +605,7 @@ async def _infer_rules(
                 evidence=[evidence],
             )
         )
-    return rules, dropped, []
+    return rules, dropped, warnings
 
 
 async def _infer_mappings(
@@ -446,17 +613,19 @@ async def _infer_mappings(
     contexts: list[_PageContext],
     llm: LLMClient,
     max_calls: int,
+    evidence_json: str,
 ) -> tuple[list[FieldMapping], list[Dropped], list[RequirementWarning] | None]:
     parsed = await _call_json(
         llm,
         _MAPPING_SYSTEM,
-        _user_prompt(requirement, [], contexts, with_features=False),
+        _user_prompt(requirement, [], contexts, with_features=False, evidence_json=evidence_json),
         max_calls,
     )
     if parsed is None:
         return [], [], [_unavailable_warning("字段映射推断")]
     mappings: list[FieldMapping] = []
     dropped: list[Dropped] = []
+    warnings: list[RequirementWarning] = []
     entries = parsed.get("fieldMappings")
     if not isinstance(entries, list):
         return [], [], [_shape_warning("fieldMappings")]
@@ -470,7 +639,20 @@ async def _infer_mappings(
         if front is None or backend is None or api is None:
             dropped.append(Dropped(reason=Reason.invalid_shape, quote=quote))
             continue
-        evidence, page_id = _locate_mapping_quote_tolerant(api, quote, contexts)
+        element_id = _str_or_none(entry.get("elementId"))
+        if element_id is None:
+            warnings.append(
+                RequirementWarning(
+                    code="evidence_ref_missing",
+                    severity=Severity.warning,
+                    message="字段映射缺少 elementId，已拒绝该条映射。",
+                )
+            )
+            evidence, page_id = None, None
+        else:
+            evidence, page_id = _locate_mapping_quote_tolerant(
+                api, quote, contexts, element_id=element_id
+            )
         if evidence is None:
             dropped.append(Dropped(reason=Reason.quote_not_found, quote=quote))
             continue
@@ -484,7 +666,7 @@ async def _infer_mappings(
                 evidence=[evidence],
             )
         )
-    return mappings, dropped, []
+    return mappings, dropped, warnings
 
 
 def _mapping_quote_candidates(quote: str | None) -> list[str]:
@@ -507,18 +689,20 @@ def _mapping_quote_candidates(quote: str | None) -> list[str]:
 
 
 def _locate_mapping_quote_tolerant(
-    api: str, quote: str | None, contexts: list[_PageContext]
+    api: str, quote: str | None, contexts: list[_PageContext], *, element_id: str | None
 ) -> tuple[VerifiedEvidence | None, str | None]:
-    """逐个候选引文尝试定位，第一个校验通过的生效。"""
+    """逐个候选引文尝试定位，且限制到模型声明的表单元素。"""
+    if element_id is None:
+        return None, None
     for candidate in _mapping_quote_candidates(quote):
-        evidence, page_id = _locate_mapping_quote(api, candidate, contexts)
+        evidence, page_id = _locate_mapping_quote(api, candidate, contexts, element_id=element_id)
         if evidence is not None:
             return evidence, page_id
     return None, None
 
 
 def _locate_mapping_quote(
-    api: str, quote: str | None, contexts: list[_PageContext]
+    api: str, quote: str | None, contexts: list[_PageContext], *, element_id: str
 ) -> tuple[VerifiedEvidence | None, str | None]:
     """按 api 反查页面，再在该页语料里校验引文。
 
@@ -526,14 +710,25 @@ def _locate_mapping_quote(
     仍按 url 归页（模型可能省略 method）。反查不到页面时退化为全页唯一
     命中策略。
     """
+    if not isinstance(quote, str):
+        return None, None
     url = api.split(None, 1)[1] if " " in api else api
     for context in contexts:
         if any(candidate == url or candidate[1] == url for candidate in context.api_urls):
-            evidence = _verified(quote, context) if quote is not None else None
-            if evidence is not None:
-                return evidence, context.material.page.pageId
+            if any(source.node.id == element_id for source in context.material.elements):
+                api_node_id = next(
+                    (
+                        node_id for node_id, api_node in context.material.api_nodes.items()
+                        if api_node.attrs.get("url") == url
+                    ),
+                    None,
+                )
+                if api_node_id is not None:
+                    evidence = _verified(quote, context, node_id=api_node_id)
+                    if evidence is not None:
+                        return evidence, context.material.page.pageId
             return None, None
-    return _locate_by_quote(quote, contexts)
+    return None, None
 
 
 def _locate_by_quote(
@@ -552,7 +747,7 @@ def _locate_by_quote(
     return None, None
 
 
-def _str_list(value) -> list[str] | None:
+def _str_list(value: object) -> list[str] | None:
     if not isinstance(value, list):
         return None
     items = [_unwrap_quoted(item) for item in value if isinstance(item, str) and item.strip()]
@@ -566,7 +761,7 @@ def _unwrap_quoted(text: str) -> str:
     return match.group(2).strip() if match else text.strip()
 
 
-def _str_or_none(value) -> str | None:
+def _str_or_none(value: object) -> str | None:
     return value if isinstance(value, str) and value.strip() else None
 
 

@@ -192,7 +192,11 @@ async def build_chat_doc(
     fallback_text: str | None = None,
 ) -> ChatDocOutcome:
     """定位 + 装配 + 渲染。路由直达优先，旧流程支持原文回退。"""
-    best = locate_route_feature(graph, route_path) if route_path else locate_feature(graph, feature_text)
+    best = (
+        locate_route_feature(graph, route_path)
+        if route_path
+        else locate_feature(graph, feature_text)
+    )
     if best is None and fallback_text and not route_path:
         best = locate_feature(graph, fallback_text)
     if best is None:

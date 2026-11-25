@@ -13,13 +13,24 @@ from tests.specdoc_fixture import spec_graph, spec_requirement_map
 
 PAGE_ID = "src/pages/Transfer.tsx#Transfer"
 
+
+def _materials():
+    graph_ = spec_graph()
+    return collect_materials(spec_requirement_map(graph_), graph_)
+
+
 _VALID_STEPS = {
     "steps": [
         {
             "featureId": "f1",
+            "chainId": next(
+                chain.id for chain in _materials().pages[0].chains
+                if chain.element.node_id.endswith("jsx:button")
+            ),
+                "nodeId": "src/pages/Transfer.tsx#Transfer/jsx:button",
             "precondition": ["已登录"],
             "actions": ["选择付款账户，系统展示该账户可用余额", "点击转账按钮，系统提示转账成功"],
-            "quote": "请选择付款账户",
+            "quote": "转账",
             "confidence": 0.9,
         }
     ]
@@ -28,11 +39,16 @@ _VALID_RULES = {
     "rules": [
         {
             "featureId": "f1",
+            "chainId": next(
+                chain.id for chain in _materials().pages[0].chains
+                if chain.element.node_id.endswith("jsx:button")
+            ),
+            "elementId": "src/pages/Transfer.tsx#Transfer/jsx:button",
             "category": "validation",
             "target": "付款账户",
             "condition": "未选择付款账户",
             "result": "转账按钮置灰，不可提交",
-            "quote": "请选择付款账户",
+            "quote": "转账",
             "confidence": 0.8,
         }
     ]
@@ -42,6 +58,7 @@ _VALID_MAPPINGS = {
         {
             "frontField": "payeeAccount",
             "backendParam": "payee_account",
+            "elementId": "src/pages/Transfer.tsx#Transfer/jsx:select",
             "api": "POST /api/transfer",
             "quote": "POST /api/transfer",
             "confidence": 0.7,
@@ -78,8 +95,8 @@ async def test_valid_outputs_are_capped_and_bound_to_pages() -> None:
     evidence = step.evidence[0]
     assert evidence.source.value == "ai"
     assert evidence.confidence == 0.6
-    assert evidence.quote == "请选择付款账户"
-    assert evidence.nodeId == PAGE_ID  # 页面级文案指回页面节点
+    assert evidence.nodeId == "src/pages/Transfer.tsx#Transfer/jsx:button"
+    assert evidence.quote == "转账"
 
     assert len(outcome.rules) == 1
     rule = outcome.rules[0]
@@ -103,6 +120,7 @@ async def test_list_style_mapping_quote_falls_back_to_lines() -> None:
             {
                 "frontField": "payeeAccount",
                 "backendParam": "payee_account",
+                "elementId": "src/pages/Transfer.tsx#Transfer/jsx:button",
                 "api": "POST /api/transfer",
                 "quote": "- payeeAccount\n- payee_account\n- POST /api/transfer",
                 "confidence": 0.7,
@@ -121,6 +139,86 @@ async def test_list_style_mapping_quote_falls_back_to_lines() -> None:
     mapping = outcome.field_mappings[0]
     assert mapping.pageId == PAGE_ID
     assert mapping.quote == "POST /api/transfer"
+    assert outcome.dropped == []
+
+
+async def test_handler_source_quote_resolves_to_handler_evidence() -> None:
+    """事件 handler 源码可被规则引用，并解析到 handler 的真实节点与位置。"""
+    rules = {
+        "rules": [
+            {
+                "featureId": "f2",
+                "chainId": next(
+                    chain.id for chain in _materials().pages[0].chains
+                    if chain.element.node_id.endswith("jsx:select")
+                ),
+                "nodeId": "src/pages/Transfer.tsx#handleAcctChange",
+                "category": "linkage",
+                "elementId": "src/pages/Transfer.tsx#Transfer/jsx:select",
+                "target": "付款账户",
+                "condition": "账户变更时",
+                "result": "查询对应账户余额",
+                "quote": "function handleAcctChange(value) { queryBalance(value); }",
+                "confidence": 0.8,
+            }
+        ]
+    }
+    requirement_map = spec_requirement_map(spec_graph())
+    outcome = await infer_sections(
+        requirement_map.requirement,
+        requirement_map,
+        _materials(),
+        _llm_with(rules=rules),
+        max_calls=1,
+    )
+
+    assert len(outcome.rules) == 1
+    evidence = outcome.rules[0].evidence[0]
+    assert evidence.nodeId == "src/pages/Transfer.tsx#handleAcctChange"
+    assert evidence.file == "src/pages/Transfer.tsx"
+    assert evidence.loc is not None and evidence.loc.line == 1
+    assert outcome.dropped == []
+
+
+async def test_rule_quote_in_structured_pack_is_accepted_past_legacy_line_limit() -> None:
+    """Structured evidence replaces the old flat 120-line prompt cutoff."""
+    graph_ = spec_graph()
+    page_node = next(node for node in graph_.nodes if node.id == PAGE_ID)
+    page_node.attrs["uiText"]["texts"] = [
+        {"text": f"页面文本 {index}", "kind": "text"} for index in range(130)
+    ]
+    requirement_map = spec_requirement_map(graph_)
+    rules = {
+        "rules": [
+            {
+                "featureId": "f2",
+                "chainId": next(
+                    chain.id for chain in _materials().pages[0].chains
+                    if chain.element.node_id.endswith("jsx:select")
+                ),
+                "nodeId": "src/pages/Transfer.tsx#handleAcctChange",
+                "category": "linkage",
+                "elementId": "src/pages/Transfer.tsx#Transfer/jsx:select",
+                "target": "付款账户",
+                "condition": "账户变更时",
+                "result": "查询对应账户余额",
+                "quote": "function handleAcctChange(value) { queryBalance(value); }",
+                "confidence": 0.8,
+            }
+        ]
+    }
+    outcome = await infer_sections(
+        requirement_map.requirement,
+        requirement_map,
+        collect_materials(requirement_map, graph_),
+        _llm_with(rules=rules),
+        max_calls=1,
+    )
+
+    assert len(outcome.rules) == 1
+    assert outcome.rules[0].evidence[0].quote == (
+        "function handleAcctChange(value) { queryBalance(value); }"
+    )
     assert outcome.dropped == []
 
 

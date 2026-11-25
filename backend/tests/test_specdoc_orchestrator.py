@@ -7,6 +7,7 @@ from datetime import UTC, datetime
 
 from app.contracts.specdoc import Action, Step
 from app.core.config import Settings
+from app.requirement.chains import derive_chains
 from app.schemas import Project, SpecDocTask
 from app.specdoc.orchestrator import SCHEMA_VERSION, SpecDocOrchestrator
 from app.specdoc.render import render_markdown
@@ -17,11 +18,17 @@ VALID_RULES = {
     "rules": [
         {
             "featureId": "f1",
+            "chainId": next(
+                chain.id for chain in derive_chains(spec_graph()).for_page(
+                    "src/pages/Transfer.tsx#Transfer"
+                ) if chain.element.node_id.endswith("jsx:button")
+            ),
+            "elementId": "src/pages/Transfer.tsx#Transfer/jsx:button",
             "category": "validation",
             "target": "付款账户",
             "condition": "未选择付款账户",
             "result": "转账按钮置灰，不可提交",
-            "quote": "请选择付款账户",
+            "quote": "转账",
         },
         {
             "category": "display",
@@ -38,6 +45,7 @@ VALID_MAPPINGS = {
             "frontField": "payeeAccount",
             "backendParam": "payee_account",
             "api": "POST /api/transfer",
+            "elementId": "src/pages/Transfer.tsx#Transfer/jsx:button",
             "quote": "POST /api/transfer",
         }
     ]
@@ -117,7 +125,7 @@ async def test_full_pipeline_numbers_rules_and_echoes_meta() -> None:
     assert len(llm.calls) == 3  # 三个章节各一次调用
     # prompt 里没有页面画像——硬约束：语料只能是代码原文
     system, user = llm.calls[0]
-    assert "功能点" in user and "页面语料" in user
+    assert "功能点" in user and "结构化证据包" in user
 
 
 async def test_steps_render_action_text_without_root_model_repr() -> None:

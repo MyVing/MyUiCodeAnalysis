@@ -17,8 +17,16 @@
 from __future__ import annotations
 
 from collections import defaultdict
+from collections.abc import Callable
+from typing import Any
 
-from app.contracts.specdoc import ElementKind, SpecDocMap
+from app.contracts.specdoc import (
+    ApiMapping,
+    Element,
+    ElementKind,
+    SpecDocMap,
+    VerifiedEvidence,
+)
 from app.specdoc.elements import kind_label
 
 _CATEGORY_LABEL = {
@@ -124,12 +132,18 @@ def render_markdown(doc: SpecDocMap) -> str:
             parts.append("| 事件ID | 触发要素 | 事件类型 | Handler | HttpCall |")
             parts.append("| --- | --- | --- | --- | --- |")
             for event in page_events:
-                element = element_by_id.get(event.elementId)
-                name = element.uiText if element and element.uiText else event.elementId
+                event_element: Element | None = element_by_id.get(event.elementId)
+                name = (
+                    event_element.uiText
+                    if event_element and event_element.uiText
+                    else event.elementId
+                )
                 handler = event.handler.name
                 if event.handler.file:
                     handler = f"`{event.handler.file}#{event.handler.name}`"
-                calls = "、".join(f"{call.method} {call.url}" for call in event.httpCalls)
+                calls = "、".join(
+                    f"{call.method} {call.url}" for call in event.httpCalls or []
+                )
                 row = f"| {event.id} | {name} | {event.eventType or '-'} | {handler} | {calls} |"
                 parts.append(row)
             parts.append("")
@@ -205,7 +219,7 @@ def render_markdown(doc: SpecDocMap) -> str:
     return "\n".join(parts).rstrip() + "\n"
 
 
-def _required_column(element) -> str:
+def _required_column(element: Element) -> str:
     if element.kind is ElementKind.data:
         if element.required is True:
             return "**必填**"
@@ -215,21 +229,25 @@ def _required_column(element) -> str:
     return _KIND_REQUIRED_COLUMN[element.kind]
 
 
-def _evidence_text(evidence) -> str:
+def _evidence_text(evidence: VerifiedEvidence) -> str:
     if evidence.file is None:
         return f"`{evidence.nodeId}`"
     anchor = f"#L{evidence.loc.line}" if evidence.loc is not None else ""
     return f"`{evidence.file}{anchor}`"
 
 
-def _group(items, key_of) -> dict[str, list]:
+def _group(
+    items: list[Any], key_of: Callable[[Any], str]
+) -> dict[str, list[Any]]:
     result: dict[str, list] = defaultdict(list)
     for item in items:
         result[key_of(item)].append(item)
     return result
 
 
-def _group_by_element_page(doc: SpecDocMap, element_by_id) -> dict[str, list]:
+def _group_by_element_page(
+    doc: SpecDocMap, element_by_id: dict[str, Element]
+) -> dict[str, list[ApiMapping]]:
     """接口映射按触发要素的页面归组。
 
     mapping.elementId 是图上要素节点的原始 id（`...#Login/jsx:form/onSubmit`），
@@ -247,9 +265,9 @@ def _group_by_element_page(doc: SpecDocMap, element_by_id) -> dict[str, list]:
 
     result: dict[str, list] = defaultdict(list)
     for mapping in doc.apiMappings:
-        element = element_by_id.get(mapping.elementId)
-        if element is not None:
-            result[element.pageId].append(mapping)
+        api_element = element_by_id.get(mapping.elementId)
+        if api_element is not None:
+            result[api_element.pageId].append(mapping)
         else:
             result[page_by_raw_element_id.get(mapping.elementId, "")].append(mapping)
     return result
