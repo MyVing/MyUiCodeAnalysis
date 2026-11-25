@@ -19,8 +19,13 @@ class EvidencePack:
     """Prompt projection plus only the text that was actually exposed to the model."""
 
     pages: tuple[dict[str, Any], ...]
-    texts_by_page_node: dict[str, dict[str, tuple[str, ...]]] = field(default_factory=dict)
     warnings: tuple[str, ...] = ()
+    _prompt_warnings: tuple[str, ...] = field(
+        default=(), init=False, repr=False, compare=False
+    )
+    _prompt_pages: tuple[dict[str, Any], ...] = field(
+        default=(), init=False, repr=False, compare=False
+    )
 
     def _serialized(self, pages: list[dict[str, Any]]) -> str:
         return json.dumps({"pages": pages}, ensure_ascii=False, separators=(",", ":"))
@@ -29,29 +34,46 @@ class EvidencePack:
         return self._serialized(list(self.pages))
 
     def prompt_view(self) -> tuple[str, dict[str, dict[str, tuple[str, ...]]]]:
-        """Return the bounded payload and exactly the indexed text it exposes."""
-        pages = [dict(page) for page in self.pages]
+        """Return the bounded payload and exactly the index derived from its visible facts."""
+        pages = [json.loads(json.dumps(page, ensure_ascii=False)) for page in self.pages]
+        warnings = set(self.warnings)
         encoded = self._serialized(pages)
         if len(encoded) > MAX_PACK_CHARS:
             for page in pages:
-                page.pop("forms", None)
-                page.pop("apiFacts", None)
+                if page.get("forms"):
+                    page["forms"] = []
+                    warnings.add("evidence_forms_truncated")
+                if page.get("apiFacts"):
+                    page["apiFacts"] = []
+                    warnings.add("evidence_api_facts_truncated")
             encoded = self._serialized(pages)
         if len(encoded) > MAX_PACK_CHARS:
             for page in pages:
-                page["chains"] = page["chains"][:20]
+                chains = page.get("chains", [])
+                if len(chains) > 20:
+                    page["chains"] = chains[:20]
+                    warnings.add("evidence_chains_truncated")
             encoded = self._serialized(pages)
         if len(encoded) > MAX_PACK_CHARS:
             for page in pages:
-                page["elements"] = page["elements"][:20]
-                page["events"] = page["events"][:20]
+                elements = page.get("elements", [])
+                events = page.get("events", [])
+                if len(elements) > 20:
+                    page["elements"] = elements[:20]
+                    warnings.add("evidence_elements_truncated")
+                if len(events) > 20:
+                    page["events"] = events[:20]
+                    warnings.add("evidence_events_truncated")
             encoded = self._serialized(pages)
         if len(encoded) > MAX_PACK_CHARS:
             for page in pages:
-                page["uiText"] = []
-                page["chains"] = []
-                page["elements"] = []
-                page["events"] = []
+                if page.get("uiText"):
+                    page["uiText"] = []
+                    warnings.add("evidence_ui_text_truncated")
+                for key in ("chains", "elements", "events"):
+                    if page.get(key):
+                        page[key] = []
+                        warnings.add(f"evidence_{key}_truncated")
             encoded = self._serialized(pages)
 
         text_index: dict[str, dict[str, tuple[str, ...]]] = {}
@@ -70,10 +92,14 @@ class EvidencePack:
             for text in page.get("uiText", []):
                 add(page_id, text)
             for element in page.get("elements", []):
-                add(element.get("nodeId"), element.get("viewText"))
+                node_id = element.get("nodeId")
+                add(node_id, element.get("viewText"))
                 for column in element.get("columns", []):
                     if isinstance(column, dict):
-                        add(element.get("nodeId"), column.get("title"))
+                        add(node_id, column.get("title"))
+                form_field = element.get("formField")
+                if isinstance(form_field, dict):
+                    add(node_id, form_field.get("quote"))
             for form in page.get("forms", []):
                 field_info = form.get("frontField")
                 if isinstance(field_info, dict):
@@ -94,18 +120,49 @@ class EvidencePack:
                 node_id = fact.get("nodeId")
                 add(node_id, fact.get("method"))
                 add(node_id, fact.get("url"))
+                method, url = fact.get("method"), fact.get("url")
+                if isinstance(method, str) and isinstance(url, str):
+                    add(node_id, f"{method} {url}")
                 request_body = fact.get("requestBody")
-                if isinstance(request_body, str):
-                    add(node_id, request_body)
-                elif isinstance(request_body, dict):
-                    for key, value in sorted(request_body.items()):
-                        add(node_id, f"{key}: {value}")
+                if isinstance(request_body, (dict, list)):
+                    add(
+                        node_id,
+                        json.dumps(
+                            request_body, ensure_ascii=False, sort_keys=True,
+                            separators=(",", ":"),
+                        ),
+                    )
+
+                def add_body_text(value: Any, target_node_id: str = node_id) -> None:
+                    if isinstance(value, dict):
+                        for key, nested in value.items():
+                            add(target_node_id, key)
+                            add_body_text(nested, target_node_id)
+                    elif isinstance(value, list):
+                        for nested in value:
+                            add_body_text(nested, target_node_id)
+                    else:
+                        add(target_node_id, value)
+
+                add_body_text(request_body)
             text_index[page_id] = {key: tuple(items) for key, items in values.items()}
+        object.__setattr__(self, "_prompt_warnings", tuple(sorted(warnings)))
+        object.__setattr__(self, "_prompt_pages", tuple(pages))
         return encoded, text_index
 
     def prompt_json(self) -> str:
-        """Apply deterministic truncation to the serialized prompt view."""
         return self.prompt_view()[0]
+
+    @property
+    def prompt_warnings(self) -> tuple[str, ...]:
+        self.prompt_view()
+        return self._prompt_warnings
+
+    @property
+    def prompt_pages(self) -> tuple[dict[str, Any], ...]:
+        self.prompt_view()
+        return self._prompt_pages
+
 
 
 def build_evidence_pack(
@@ -114,27 +171,52 @@ def build_evidence_pack(
 ) -> EvidencePack:
     """Project existing IR-derived materials into a stable, bounded JSON payload."""
     page_values: list[dict[str, Any]] = []
-    texts_by_page_node: dict[str, dict[str, tuple[str, ...]]] = {}
     warnings: list[str] = []
     for material in sorted(
         materials.pages, key=lambda item: (item.page.pageNo, item.page.pageId)
     ):
         page, node = material.page, material.node
-        elements = sorted(material.elements, key=lambda item: item.node.id)[
-            :MAX_ELEMENTS_PER_PAGE
-        ]
-        chains = sorted(material.chains, key=lambda item: item.id)
+        if len(material.elements) > MAX_ELEMENTS_PER_PAGE:
+            warnings.append("evidence_elements_truncated")
+        if len(material.chains) > MAX_CHAINS_PER_PAGE:
+            warnings.append("evidence_chains_truncated")
+        event_element_ids = {
+            event.elementId for event in (events_by_page or {}).get(page.pageId, [])
+        }
+        matched_elements = {
+            chain.element.node_id
+            for chain in material.chains
+            if chain.id in set(material.matched_chain_ids)
+        }
+        element_sources = sorted(
+            material.elements,
+            key=lambda item: (
+                not isinstance(item.node.attrs.get("formField"), dict),
+                item.node.id not in event_element_ids,
+                not bool(item.matched_features),
+                item.node.id not in matched_elements,
+                item.node.id,
+            ),
+        )
+        if len(element_sources) > MAX_ELEMENTS_PER_PAGE:
+            if any(isinstance(item.node.attrs.get("formField"), dict)
+                   for item in element_sources[MAX_ELEMENTS_PER_PAGE:]):
+                warnings.append("evidence_forms_truncated")
+            if any(item.node.id in event_element_ids
+                   for item in element_sources[MAX_ELEMENTS_PER_PAGE:]):
+                warnings.append("evidence_events_truncated")
+        elements = element_sources[:MAX_ELEMENTS_PER_PAGE]
         matched = set(material.matched_chain_ids)
-        chains = sorted(chains, key=lambda item: (item.id not in matched, item.id))[
-            :MAX_CHAINS_PER_PAGE
-        ]
+        chains = sorted(
+            material.chains, key=lambda item: (item.id not in matched, item.id)
+        )[:MAX_CHAINS_PER_PAGE]
         element_values: list[dict[str, Any]] = []
         events: list[dict[str, Any]] = []
         forms: list[dict[str, Any]] = []
         texts: dict[str, list[str]] = {}
 
         def add_text(target: dict[str, list[str]], node_id: Any, value: Any) -> None:
-            if isinstance(value, str) and value.strip():
+            if isinstance(node_id, str) and isinstance(value, str) and value.strip():
                 values = target.setdefault(node_id, [])
                 if value not in values:
                     values.append(value)
@@ -195,6 +277,8 @@ def build_evidence_pack(
                         add_text(texts, target_node, handler)
 
         if events_by_page is not None:
+            if len(events_by_page.get(page.pageId, [])) > 20:
+                warnings.append("evidence_events_truncated")
             for event in events_by_page.get(page.pageId, []):
                 source = next((item for item in elements if item.node.id == event.elementId), None)
                 bindings = source.node.attrs.get("events", []) if source else []
@@ -290,13 +374,8 @@ def build_evidence_pack(
             ],
         }
         page_values.append(page_value)
-        exposed_nodes = {node.id, *(source.node.id for source in elements)}
-        exposed_nodes.update(step.node_id for chain in chains for step in chain.steps)
-        texts_by_page_node[page.pageId] = {
-            key: tuple(value) for key, value in texts.items() if key in exposed_nodes
-        }
 
     encoded = json.dumps({"pages": page_values}, ensure_ascii=False, separators=(",", ":"))
     if len(encoded) > MAX_PACK_CHARS:
         warnings.append("evidence_pack_truncated")
-    return EvidencePack(tuple(page_values), texts_by_page_node, tuple(warnings))
+    return EvidencePack(tuple(page_values), tuple(warnings))

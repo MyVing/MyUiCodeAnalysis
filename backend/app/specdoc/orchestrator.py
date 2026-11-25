@@ -11,7 +11,8 @@
 
 from __future__ import annotations
 
-from collections import defaultdict
+import logging
+from collections import Counter, defaultdict
 from datetime import UTC, datetime
 
 from app.contracts import IRGraph, RequirementMap
@@ -40,6 +41,7 @@ from app.specdoc.events import build_events
 from app.specdoc.infer import InferOutcome, infer_sections
 
 SCHEMA_VERSION = "1.0"
+logger = logging.getLogger(__name__)
 
 
 class SpecDocOrchestrator:
@@ -70,6 +72,20 @@ class SpecDocOrchestrator:
             events_by_page,
         )
         warnings.extend(_convert_warnings(infer_outcome.warnings or []))
+        shadow_counts = getattr(infer_outcome, "shadow_counts", {})
+        if shadow_counts:
+            logger.info(
+                "Specdoc inference shadow would_drop: task=%s counts=%s",
+                task.id,
+                shadow_counts,
+            )
+        warning_counts = Counter(item.code for item in infer_outcome.warnings or [])
+        if warning_counts:
+            logger.info(
+                "Specdoc inference warnings: task=%s counts=%s",
+                task.id,
+                dict(sorted(warning_counts.items())),
+            )
         deterministic_mappings = [] if task.dry_run else deterministic_field_mappings(materials)
         field_mappings = _merge_field_mappings(deterministic_mappings, infer_outcome.field_mappings)
 
@@ -157,7 +173,7 @@ class SpecDocOrchestrator:
         )
 
     def _number_steps(self, steps: list[Step]) -> list[Step]:
-        """步骤 id 用来源功能点号：step.{featureId}（featureId 本身就是 f1/f2…）。"""
+        """推断阶段按 featureId 顺序生成 step.{featureId}.{n}；装配阶段保留这些稳定 ID。"""
         return list(steps)
 
     def _number_rules(self, rules: list[Rule]) -> list[Rule]:
@@ -192,6 +208,7 @@ class _SkippedOutcome:
         self.field_mappings: list[FieldMapping] = []
         self.dropped: list[RequirementDropped] = []
         self.warnings: list[RequirementWarning] = warnings or []
+        self.shadow_counts: dict[str, int] = {}
 
 
 

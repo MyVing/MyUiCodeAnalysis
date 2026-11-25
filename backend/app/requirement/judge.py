@@ -218,9 +218,9 @@ def _build_user_prompt(
 
 
 def capped_confidence(model_confidence: float, *, quote_ambiguous: bool) -> float:
-    """落库置信度：硬上限 0.6；引文歧义时再按系数降权（差距表 #24）。
+    """落库置信度：先硬封顶 0.6；引文歧义时再乘降权系数 0.8。
 
-    降权发生在封顶之后，结果必然仍在 0.6 以内，不与「AI 推断封顶 0.6」冲突；
+    降权发生在封顶之后，因此歧义结果最高为 0.48，仍不超过「AI 推断封顶 0.6」。
     模型原始值始终记在 modelConfidence 里，降权幅度可审计。
     两条判定路径（页面级 judge / 链路级 locate）共用本函数——降权规则只能有一份。
     """

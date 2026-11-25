@@ -426,7 +426,7 @@ async def test_quote_shared_across_candidates_is_flagged() -> None:
     # 差距表 #24：歧义引文降权——0.8 先封顶到 0.6，再按 0.8 系数降权；
     # 模型原始值保留在 modelConfidence 里，降权幅度可审计
     match = outcome.matches[0]
-    assert match.confidence == pytest.approx(0.6 * 0.8)
+    assert match.confidence == pytest.approx(0.48)
     assert match.modelConfidence == 0.8
     assert "降权" in flagged[0].message
 

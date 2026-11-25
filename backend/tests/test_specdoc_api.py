@@ -19,7 +19,7 @@ VALID_RULES = {
     "rules": [
         {
             "featureId": "f1",
-            "category": "validation",
+            "category": "display",
             "target": "付款账户",
             "condition": "未选择付款账户",
             "result": "转账按钮置灰",

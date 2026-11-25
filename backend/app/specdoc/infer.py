@@ -13,6 +13,7 @@
 from __future__ import annotations
 
 import re
+from collections import Counter
 from dataclasses import dataclass, field
 
 from app.contracts.requirement import (
@@ -45,13 +46,14 @@ _STEPS_SYSTEM = """\
 为每个功能点产出「业务操作步骤」。
 
 只输出 JSON，形状：
-{"steps": [{"featureId": "f1", "pageId": "页面id（可选）", "chainId": "链路id", "nodeId": "节点id",
+{"steps": [{"featureId": "f1", "pageId": "页面id（可选）",
+  "chainId": "链路id（可选）", "nodeId": "节点id（可选）",
   "precondition": ["前置条件"], "actions": ["操作1"], "quote": "逐字引文", "confidence": 0.8}]}
 
 要求：
-1. 每个功能点最多一组步骤；featureId 必须使用给定 id，不得编造。
-2. 必须返回 evidence pack 中真实的 chainId 和该链路内的 nodeId；可提供 pageId 指明目标页面，
-   必须与链路归属一致。步骤只能来自链路节点事实。
+1. 每个功能点可产出多组步骤；featureId 必须使用给定 id，不得编造。
+2. 有链路锚点时必须使用该功能点在目标页面的真实 chainId，并将 nodeId 限制在链路内；
+   无链路锚点时可使用目标页面真实节点文本，但不得编造引用标识。可提供 pageId 指明目标页面。
 3. actions 是有序的用户操作，每条一句话，写到「系统给出什么反馈」为止。
 4. quote 必须从对应 node 的文本字段逐字复制，禁止改写或拼凑。
 5. 禁止编造；无匹配链路或证据不足时省略该功能点。
@@ -70,8 +72,9 @@ _RULES_SYSTEM = """\
 要求：
 1. category 必须是五类之一；功能点规则必须用给定 featureId，页面级规则可省略。可选 pageId 只可指向
    该功能点命中的页面。
-2. 必须返回真实 elementId 或 chainId；display 规则若引用页面级 uiText，可不提供 chainId，
-   改提供目标 pageId（可附该页面 nodeId）。所有引用标识必须属于目标页面。
+2. 必须返回真实 elementId 或 chainId。display 规则可引用页面级 uiText 并提供 pageId；
+   即使同时有有效 chainId，页面文案也按页面节点校验。其他类别应使用链路或元素范围内的事实。
+   所有显式引用标识必须属于目标页面。所有显式引用标识必须属于目标页面。
 3. 仅当证据出现校验文案、disabled、条件渲染、权限分支、分页/空态参数或联动行为时输出；
    静态文案不是业务规则。
 4. quote 必须从对应节点文本逐字复制，禁止改写或拼凑。
@@ -127,6 +130,7 @@ class InferOutcome:
     field_mappings: list[FieldMapping] = field(default_factory=list)
     dropped: list[Dropped] = field(default_factory=list)
     warnings: list[RequirementWarning] = field(default_factory=list)
+    shadow_counts: dict[str, int] = field(default_factory=dict)
 
 
 async def infer_sections(
@@ -142,29 +146,27 @@ async def infer_sections(
     contexts = _page_contexts(materials)
     evidence_pack = build_evidence_pack(materials, events_by_page)
     evidence_json, exposed_texts = evidence_pack.prompt_view()
+    exposed_pages = evidence_pack.prompt_pages
     for context in contexts:
         context.texts_by_node = exposed_texts.get(
             context.material.page.pageId, {}
         )
-        ui_attrs = context.material.node.attrs.get("uiText")
-        ui_values = {
-            entry.get("text")
-            for entry in (ui_attrs.get("texts", []) if isinstance(ui_attrs, dict) else [])
-            if isinstance(entry, dict) and isinstance(entry.get("text"), str)
-        }
+        exposed_page = next(
+            (page for page in exposed_pages if page.get("pageId") == context.material.page.pageId),
+            {},
+        )
+        ui_texts = set(exposed_page.get("uiText", []))
         context.ui_text = tuple(
             text for text in context.texts_by_node.get(context.material.page.pageId, ())
-            if text in ui_values
+            if text in ui_texts
         )
+        exposed_chains = {
+            item.get("chainId") for item in exposed_page.get("chains", [])
+        }
         context.chain_nodes = {
             chain.id: frozenset(chain.node_ids)
             for chain in context.material.chains
-            if chain.id in {
-                item.get("chainId")
-                for page in evidence_pack.pages
-                if page.get("pageId") == context.material.page.pageId
-                for item in page.get("chains", [])
-            }
+            if chain.id in exposed_chains
         }
         context.feature_chains = {
             feature_id: frozenset(
@@ -181,15 +183,16 @@ async def infer_sections(
         }
     feature_pages = _feature_pages(requirement_map, contexts)
     features = list(requirement_map.features)
+    shadow_counts: Counter[str] = Counter()
 
     outcome = InferOutcome(
         warnings=[
             RequirementWarning(
                 code=warning,
                 severity=Severity.warning,
-                message="结构化证据包超过预算，已按确定性顺序裁剪。",
+                message=f"结构化证据包已裁剪类别：{warning.removeprefix('evidence_').removesuffix('_truncated')}。",
             )
-            for warning in evidence_pack.warnings
+            for warning in evidence_pack.prompt_warnings
         ]
     )
     steps, dropped, warnings = await _infer_steps(
@@ -197,19 +200,32 @@ async def infer_sections(
     )
     outcome.steps, outcome.dropped = steps, dropped
     outcome.warnings.extend(warnings or [])
+    shadow_counts.update(_shadow_drop_counts(dropped))
     rules, dropped, warnings = await _infer_rules(
         requirement, features, feature_pages, contexts, llm, max_calls, evidence_json
     )
     outcome.rules.extend(rules)
     outcome.dropped.extend(dropped)
     outcome.warnings.extend(warnings or [])
+    shadow_counts.update(_shadow_drop_counts(dropped))
     mappings, dropped, warnings = await _infer_mappings(
-        requirement, contexts, llm, max_calls, evidence_json
+        requirement, contexts, llm, max_calls, evidence_json,
+        available=not any(
+            code in evidence_pack.prompt_warnings
+            for code in ("evidence_forms_truncated", "evidence_api_facts_truncated")
+        ),
     )
     outcome.field_mappings.extend(mappings)
     outcome.dropped.extend(dropped)
     outcome.warnings.extend(warnings or [])
+    shadow_counts.update(_shadow_drop_counts(dropped))
+    outcome.shadow_counts = dict(sorted(shadow_counts.items()))
     return outcome
+
+
+def _shadow_drop_counts(dropped: list[Dropped]) -> Counter[str]:
+    """Collect privacy-safe reason counts without changing validation outcomes."""
+    return Counter(item.reason.value for item in dropped)
 
 
 async def _call_json(
@@ -310,11 +326,26 @@ def _page_contexts(materials: Materials) -> list[_PageContext]:
                         handler_step,
                     ),
                 )
+        for api_id, api_node in material.api_nodes.items():
+            request_body = api_node.attrs.get("requestBody")
+            request_texts = (
+                [request_body]
+                if isinstance(request_body, str)
+                else [f"{key}: {value}" for key, value in sorted(request_body.items())]
+                if isinstance(request_body, dict)
+                else []
+            )
+            for text in request_texts:
+                if text.strip():
+                    evidence_by_text.setdefault(text, _evidence_from_step(api_id, text, None))
         contexts.append(
             _PageContext(
                 material=material,
                 evidence_by_text=evidence_by_text,
-                api_urls=tuple(all_api_steps(material.chains)),
+                api_urls=tuple(
+                    (str(method or ""), str(url or ""))
+                    for method, url in all_api_steps(material.chains)
+                ),
             )
         )
     return contexts
@@ -368,7 +399,10 @@ def _select_feature_context(
     chain_pages = tuple(
         candidate for candidate in pages
         if chain_id is not None
-        and chain_id in context_by_page[candidate].feature_chains.get(feature_id, frozenset())
+        and chain_id in (
+            context_by_page[candidate].feature_chains.get(feature_id, frozenset())
+            or frozenset(context_by_page[candidate].chain_nodes)
+        )
     )
     if chain_id is not None:
         if len(chain_pages) != 1:
@@ -489,7 +523,9 @@ async def _infer_steps(
         return [], [], [_unavailable_warning("步骤推断")]
     context_by_page = {ctx.material.page.pageId: ctx for ctx in contexts}
     steps: list[Step] = []
+    step_counters: dict[str, int] = {}
     dropped: list[Dropped] = []
+    warnings: list[RequirementWarning] = []
     entries = parsed.get("steps")
     if not isinstance(entries, list):
         return [], [], [_shape_warning("steps")]
@@ -564,11 +600,9 @@ async def _infer_steps(
                 )
             )
             continue
-        evidence = (
-            _verified(quote, context, node_id=node_id, chain_id=chain_id)
-            if isinstance(quote, str) and chain_id is not None and node_id is not None
-            else None
-        )
+        evidence = None
+        if isinstance(quote, str):
+            evidence = _verified(quote, context, node_id=node_id, chain_id=chain_id)
         if evidence is None:
             dropped.append(
                 Dropped(
@@ -578,9 +612,10 @@ async def _infer_steps(
                 )
             )
             continue
+        step_counters[feature_id] = step_counters.get(feature_id, 0) + 1
         steps.append(
             Step(
-                id=f"step.{feature_id}",
+                id=f"step.{feature_id}.{step_counters[feature_id]}",
                 featureId=feature_id,
                 pageId=context.material.page.pageId,
                 precondition=_str_list(entry.get("precondition")) or None,
@@ -589,7 +624,16 @@ async def _infer_steps(
                 evidence=[evidence],
             )
         )
-    return steps, dropped, []
+        if chain_id is None:
+            warnings.append(
+                RequirementWarning(
+                    code="evidence_ref_missing",
+                    severity=Severity.warning,
+                    message="步骤缺少链路锚点，已使用页面范围逐字校验。",
+                    featureId=feature_id,
+                )
+            )
+    return steps, dropped, warnings
 
 
 async def _infer_rules(
@@ -718,15 +762,35 @@ async def _infer_rules(
                         )
                     )
                     continue
-                evidence = _verified(
-                    quote, context, chain_id=chain_id, element_id=element_id,
-                    node_id=node_id,
-                )
+                if category == RuleCategory.display.value and quote in context.ui_text:
+                    if element_id is not None or (
+                        node_id not in (None, context.material.page.pageId)
+                    ):
+                        dropped.append(
+                            Dropped(reason=Reason.node_not_in_candidates, featureId=feature_id,
+                                    chainId=chain_id, nodeId=node_id, quote=_str_or_none(quote))
+                        )
+                        continue
+                    evidence = _verified(
+                        quote, context, node_id=context.material.page.pageId, ui_text_only=True
+                    )
+                else:
+                    evidence = _verified(
+                        quote, context, chain_id=chain_id, element_id=element_id,
+                        node_id=node_id,
+                    )
                 if evidence is not None:
                     page_id = context.material.page.pageId
             elif isinstance(quote, str):
                 display_without_chain = category == RuleCategory.display.value
-                if display_without_chain and (
+                if (
+                    not display_without_chain
+                    and quote in context.ui_text
+                    and node_id is None
+                    and element_id is None
+                ):
+                    evidence = None
+                elif display_without_chain and (
                     node_id not in (None, context.material.page.pageId)
                     or element_id is not None
                 ):
@@ -734,25 +798,27 @@ async def _infer_rules(
                         Dropped(
                             reason=Reason.node_not_in_candidates,
                             featureId=feature_id,
-                            nodeId=node_id,
+                            nodeId=node_id or element_id,
                             quote=_str_or_none(quote),
                         )
                     )
                     continue
-                evidence = _verified(
-                    quote,
-                    context,
-                    node_id=node_id,
-                    element_id=element_id,
-                    ui_text_only=display_without_chain,
-                )
-                warnings.append(
-                    RequirementWarning(
-                        code="evidence_ref_missing",
-                        severity=Severity.warning,
-                        message="功能点规则缺少链路锚点，已使用页面级逐字校验。",
+                else:
+                    evidence = _verified(
+                        quote,
+                        context,
+                        node_id=node_id,
+                        element_id=element_id,
+                        ui_text_only=display_without_chain,
                     )
-                )
+                if chain_id is None:
+                    warnings.append(
+                        RequirementWarning(
+                            code="evidence_ref_missing",
+                            severity=Severity.warning,
+                            message="功能点规则缺少链路锚点，已使用页面级逐字校验。",
+                        )
+                    )
             page_id = page_id or context.material.page.pageId
         else:
             # 页面级规则仍要求跨页面唯一命中；若给出锚点，还必须在锚定范围内命中。
@@ -802,7 +868,17 @@ async def _infer_mappings(
     llm: LLMClient,
     max_calls: int,
     evidence_json: str,
+    *,
+    available: bool = True,
 ) -> tuple[list[FieldMapping], list[Dropped], list[RequirementWarning] | None]:
+    if not available:
+        return [], [], [
+            RequirementWarning(
+                code="field_mapping_evidence_truncated",
+                severity=Severity.warning,
+                message="字段映射推断已跳过：证据预算裁剪后 forms 或 apiFacts 不完整。",
+            )
+        ]
     parsed = await _call_json(
         llm,
         _MAPPING_SYSTEM,
@@ -902,20 +978,23 @@ def _locate_mapping_quote(
         return None, None
     url = api.split(None, 1)[1] if " " in api else api
     for context in contexts:
-        if any(candidate == url or candidate[1] == url for candidate in context.api_urls):
-            if any(source.node.id == element_id for source in context.material.elements):
-                api_node_id = next(
-                    (
-                        node_id for node_id, api_node in context.material.api_nodes.items()
-                        if api_node.attrs.get("url") == url
-                    ),
-                    None,
-                )
-                if api_node_id is not None:
-                    evidence = _verified(quote, context, node_id=api_node_id)
-                    if evidence is not None:
-                        return evidence, context.material.page.pageId
-            return None, None
+        if not any(candidate_url == url for _, candidate_url in context.api_urls):
+            continue
+        if not any(source.node.id == element_id for source in context.material.elements):
+            continue
+        api_node_ids = [
+            node_id for node_id, api_node in context.material.api_nodes.items()
+            if api_node.attrs.get("url") == url
+        ]
+        # 表单字段引文必须归属于模型声明的元素节点。
+        evidence = _verified(quote, context, node_id=element_id)
+        if evidence is not None:
+            return evidence, context.material.page.pageId
+        # requestBody / API 文本必须归属于该 URL 对应的 API 节点。
+        for api_node_id in api_node_ids:
+            evidence = _verified(quote, context, node_id=api_node_id)
+            if evidence is not None:
+                return evidence, context.material.page.pageId
     return None, None
 
 

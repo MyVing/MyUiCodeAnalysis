@@ -9,7 +9,12 @@ from app.contracts.requirement import Match, Reason
 from app.requirement.chains import derive_chains
 from app.requirement.llm import LLMCallError
 from app.specdoc.collect import collect_materials
-from app.specdoc.infer import infer_sections
+from app.specdoc.infer import (
+    _evidence_from_step,
+    _locate_mapping_quote,
+    _page_contexts,
+    infer_sections,
+)
 from tests.fakes import FakeLLMClient
 from tests.graph_fixture import edge, node, page
 from tests.specdoc_fixture import spec_graph, spec_requirement_map
@@ -323,6 +328,129 @@ async def test_rule_node_outside_chain_is_rejected_as_invalid_anchor() -> None:
     assert dropped.nodeId == "not-in-chain"
 
 
+async def test_page_level_match_can_infer_steps_with_page_evidence() -> None:
+    graph_ = spec_graph()
+    requirement_map = spec_requirement_map(graph_)
+    requirement_map.matches[0] = requirement_map.matches[0].model_copy(update={"chainId": None})
+    steps = {"steps": [{
+        "featureId": "f1", "pageId": PAGE_ID, "nodeId": PAGE_ID,
+        "actions": ["页面展示转账信息"], "quote": "请选择付款账户",
+    }]}
+    outcome = await infer_sections(
+        requirement_map.requirement, requirement_map, collect_materials(requirement_map, graph_),
+        _llm_with(steps=steps), max_calls=1,
+    )
+    assert len(outcome.steps) == 1
+    assert outcome.steps[0].evidence[0].nodeId == PAGE_ID
+    assert any(w.code == "evidence_ref_missing" for w in outcome.warnings)
+
+
+async def test_page_level_match_can_infer_steps_from_real_chain_without_chain_ref() -> None:
+    graph_ = spec_graph()
+    requirement_map = spec_requirement_map(graph_)
+    requirement_map.matches[0] = requirement_map.matches[0].model_copy(update={"chainId": None})
+    steps = {"steps": [{
+        "featureId": "f1", "pageId": PAGE_ID,
+        "nodeId": "src/pages/Transfer.tsx#Transfer/jsx:button",
+        "actions": ["点击转账"], "quote": "转账",
+    }]}
+    outcome = await infer_sections(
+        requirement_map.requirement, requirement_map, collect_materials(requirement_map, graph_),
+        _llm_with(steps=steps), max_calls=1,
+    )
+    assert len(outcome.steps) == 1
+    assert outcome.steps[0].evidence[0].nodeId == "src/pages/Transfer.tsx#Transfer/jsx:button"
+
+
+async def test_repeated_steps_receive_unique_stable_ids() -> None:
+    steps = {"steps": [
+        {"featureId": "f1", "chainId": _VALID_STEPS["steps"][0]["chainId"],
+         "nodeId": "src/pages/Transfer.tsx#Transfer/jsx:button",
+         "actions": ["点击转账"], "quote": "转账"},
+        {"featureId": "f1", "chainId": _VALID_STEPS["steps"][0]["chainId"],
+         "nodeId": "src/pages/Transfer.tsx#Transfer/jsx:button",
+         "actions": ["再次点击"], "quote": "转账"},
+    ]}
+    requirement_map = spec_requirement_map(spec_graph())
+    first = await infer_sections(requirement_map.requirement, requirement_map, _materials(),
+                                 _llm_with(steps=steps), max_calls=1)
+    second = await infer_sections(requirement_map.requirement, requirement_map, _materials(),
+                                  _llm_with(steps=steps), max_calls=1)
+    assert [step.id for step in first.steps] == ["step.f1.1", "step.f1.2"]
+    assert [step.id for step in second.steps] == [step.id for step in first.steps]
+
+
+async def test_valid_chain_display_rule_can_quote_page_ui_text() -> None:
+    chain_id = _VALID_STEPS["steps"][0]["chainId"]
+    rules = {"rules": [{
+        "featureId": "f1", "chainId": chain_id, "category": "display",
+        "condition": "页面加载时", "result": "显示付款账户提示",
+        "quote": "请选择付款账户",
+    }]}
+    requirement_map = spec_requirement_map(spec_graph())
+    outcome = await infer_sections(requirement_map.requirement, requirement_map, _materials(),
+                                   _llm_with(rules=rules), max_calls=1)
+    assert len(outcome.rules) == 1
+    assert outcome.rules[0].evidence[0].nodeId == PAGE_ID
+
+
+async def test_non_display_rule_rejects_real_page_ui_text_with_chain() -> None:
+    chain_id = _VALID_STEPS["steps"][0]["chainId"]
+    rules = {"rules": [{
+        "featureId": "f1", "chainId": chain_id, "category": "validation",
+        "condition": "未选择账户", "result": "提示错误",
+        "quote": "请选择付款账户",
+    }]}
+    requirement_map = spec_requirement_map(spec_graph())
+    outcome = await infer_sections(requirement_map.requirement, requirement_map, _materials(),
+                                   _llm_with(rules=rules), max_calls=1)
+    assert outcome.rules == []
+    assert outcome.dropped[0].reason == Reason.quote_not_found
+
+
+async def test_mapping_form_quote_points_to_form_element() -> None:
+    graph_ = spec_graph()
+    select = next(node for node in graph_.nodes if node.id.endswith("jsx:select"))
+    select.attrs["formField"] = {"name": "payeeAccount", "quote": '<select name="payeeAccount">'}
+    requirement_map = spec_requirement_map(graph_)
+    mapping = {"fieldMappings": [{
+        "frontField": "payeeAccount", "backendParam": "payee_account",
+        "elementId": select.id, "api": "POST /api/transfer",
+        "quote": '<select name="payeeAccount">',
+    }]}
+    outcome = await infer_sections(requirement_map.requirement, requirement_map,
+                                   collect_materials(requirement_map, graph_),
+                                   _llm_with(mappings=mapping), max_calls=1)
+    assert len(outcome.field_mappings) == 1
+    assert outcome.field_mappings[0].evidence[0].nodeId == select.id
+
+
+async def test_mapping_continues_to_later_page_with_same_api_url() -> None:
+    requirement_map, materials, second_id, _, element_id = _multi_page_inputs()
+    first_api = next(node for node in materials.pages[0].api_nodes.values()
+                     if node.attrs.get("url") == "/api/transfer")
+    first_api.attrs["requestBody"] = {"unrelated": "first page body"}
+    second_api = next(node for node in materials.pages[1].api_nodes.values()
+                      if node.attrs.get("url") == "/api/transfer/review")
+    second_api.attrs["url"] = "/api/transfer"
+    second_api.attrs["requestBody"] = {"payee_account": "second page body"}
+    second_element_id = next(source.node.id for source in materials.pages[1].elements
+                             if source.node.attrs.get("tag") == "button")
+    contexts = _page_contexts(materials)
+    contexts[1].api_urls = (*contexts[1].api_urls, ("POST", "/api/transfer"))
+    contexts[1].texts_by_node[second_api.id] = ("payee_account: second page body",)
+    contexts[1].evidence_by_text["payee_account: second page body"] = _evidence_from_step(
+        second_api.id, "payee_account: second page body", None
+    )
+    evidence, page_id = _locate_mapping_quote(
+        "POST /api/transfer", "payee_account: second page body", contexts,
+        element_id=second_element_id,
+    )
+    assert evidence is not None
+    assert page_id == second_id
+    assert evidence.nodeId == second_api.id
+
+
 async def test_valid_outputs_are_capped_and_bound_to_pages() -> None:
     """引文命中：AI 证据封顶 0.6（0.9 自报也不透传）；步骤/规则挂到定位页面。"""
     requirement_map = spec_requirement_map(spec_graph())
@@ -335,7 +463,7 @@ async def test_valid_outputs_are_capped_and_bound_to_pages() -> None:
     )
     assert len(outcome.steps) == 1
     step = outcome.steps[0]
-    assert step.id == "step.f1"
+    assert step.id == "step.f1.1"
     assert step.pageId == PAGE_ID
     evidence = step.evidence[0]
     assert evidence.source.value == "ai"

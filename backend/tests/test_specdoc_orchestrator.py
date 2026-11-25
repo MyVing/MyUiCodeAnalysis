@@ -128,6 +128,28 @@ async def test_full_pipeline_numbers_rules_and_echoes_meta() -> None:
     assert "功能点" in user and "结构化证据包" in user
 
 
+async def test_full_pipeline_preserves_unique_step_ids() -> None:
+    graph_ = spec_graph()
+    chain_id = next(
+        chain.id for chain in derive_chains(graph_).for_page("src/pages/Transfer.tsx#Transfer")
+        if chain.element.node_id.endswith("jsx:button")
+    )
+    steps = {"steps": [
+        {"featureId": "f1", "chainId": chain_id,
+         "nodeId": "src/pages/Transfer.tsx#Transfer/jsx:button",
+         "actions": ["点击转账"], "quote": "转账"},
+        {"featureId": "f1", "chainId": chain_id,
+         "nodeId": "src/pages/Transfer.tsx#Transfer/jsx:button",
+         "actions": ["确认转账"], "quote": "转账"},
+    ]}
+    llm = FakeLLMClient([json.dumps(steps), json.dumps({"rules": []}),
+                         json.dumps({"fieldMappings": []})])
+    doc = await SpecDocOrchestrator(
+        Settings(_env_file=None), llm=llm
+    ).run(_PROJECT, _task(), spec_requirement_map(graph_), graph_)
+    assert [step.id for step in doc.steps] == ["step.f1.1", "step.f1.2"]
+
+
 async def test_steps_render_action_text_without_root_model_repr() -> None:
     """RootModel actions render as plain text rather than ``root='...'``."""
     graph_ = spec_graph()
