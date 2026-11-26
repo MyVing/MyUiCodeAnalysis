@@ -96,7 +96,7 @@ async def test_tool_steps_only_validate_quotes_returned_by_retrieval() -> None:
     )
 
     class ToolFake:
-        async def chat_with_tools(self, system, user, *, tools, executor, max_tool_calls):
+        async def chat_with_tools(self, system, user, *, tools, executor):
             result = await executor("search_evidence", {
                 "pageId": PAGE_ID, "chainId": chain_id, "category": "chain"
             })
@@ -189,7 +189,7 @@ async def test_tool_prompt_contains_only_requirement_matched_chains() -> None:
     captured_users: list[str] = []
 
     class ToolFake:
-        async def chat_with_tools(self, system, user, *, tools, executor, max_tool_calls):
+        async def chat_with_tools(self, system, user, *, tools, executor):
             captured_users.append(user)
             if "步骤" in system:
                 return json.dumps({"steps": []})

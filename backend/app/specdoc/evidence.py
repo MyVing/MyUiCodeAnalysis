@@ -242,6 +242,101 @@ def build_skeleton(
     return {"pages": pages}
 
 
+def build_skeleton_from_pages(
+    pages: tuple[dict[str, Any], ...],
+    feature_pages: dict[str, tuple[str, ...]] | None = None,
+    chain_ids_by_page: dict[str, frozenset[str]] | None = None,
+) -> dict[str, Any]:
+    """从证据包页面投影构造导航骨架。
+
+    内存检索（EvidenceSearch）的事实只来自这份投影：骨架必须使用同一份
+    数据，否则会出现「骨架里列了某个节点/链路，检索器却判定越界」。
+    因此这里额外过滤掉不会产生任何事实的 forms 与 chains。
+    """
+    included: set[str] | None = None
+    if feature_pages is not None:
+        included = {
+            page_id
+            for values in feature_pages.values()
+            for page_id in values
+        }
+    result: list[dict[str, Any]] = []
+    for page in pages:
+        page_id = page.get("pageId")
+        if not isinstance(page_id, str):
+            continue
+        if included is not None and page_id not in included:
+            continue
+        forms = [
+            {"nodeId": item.get("nodeId")}
+            for item in page.get("forms", [])
+            if isinstance(item, dict)
+            and isinstance(item.get("nodeId"), str)
+            and isinstance(item.get("frontField"), dict)
+            and isinstance(item["frontField"].get("quote"), str)
+            and item["frontField"]["quote"].strip()
+        ]
+        api_facts = [
+            {
+                "nodeId": item.get("nodeId"),
+                "method": item.get("method"),
+                "url": item.get("url"),
+            }
+            for item in page.get("apiFacts", [])
+            if isinstance(item, dict)
+            and isinstance(item.get("nodeId"), str)
+            and any(
+                isinstance(value, str) and value.strip()
+                for value in (item.get("method"), item.get("url"))
+            )
+        ]
+        matched = (
+            chain_ids_by_page.get(page_id)
+            if chain_ids_by_page is not None
+            else None
+        )
+        chains = [
+            {
+                "chainId": item.get("chainId"),
+                "elementId": item.get("elementId"),
+                "steps": [
+                    {
+                        "role": step.get("role"),
+                        "name": step.get("name"),
+                        "nodeId": step.get("nodeId"),
+                    }
+                    for step in item.get("steps", [])
+                    if isinstance(step, dict)
+                ],
+            }
+            for item in page.get("chains", [])
+            if isinstance(item, dict)
+            and (matched is None or not matched or item.get("chainId") in matched)
+            and any(
+                isinstance(step, dict) and step.get("texts")
+                for step in item.get("steps", [])
+            )
+        ]
+        result.append(
+            {
+                "pageId": page_id,
+                "name": page.get("name"),
+                "route": page.get("route"),
+                "featureIds": sorted(page.get("featureIds") or []),
+                "counts": {
+                    "elements": len(page.get("elements", [])),
+                    "forms": len(forms),
+                    "apiFacts": len(api_facts),
+                    "chains": len(chains),
+                },
+                "forms": forms,
+                "apiFacts": api_facts,
+                "chains": chains,
+            }
+        )
+    return {"pages": result}
+
+
 def build_evidence_pack(
     materials: Materials,
     events_by_page: dict[str, list[Event]] | None = None,

@@ -35,7 +35,6 @@ CHAT_SYSTEM_PROMPT = """你是前端需求澄清助手，帮用户把模糊的�
 
 _CHAT_TEMPERATURE = 0.7
 _TOOL_CHAT_TEMPERATURE = 0.2
-_MAX_REQUIREMENT_TOOL_CALLS = 8
 
 BUSINESS_ANALYSIS_SYSTEM_PROMPT = (
     "你是当前项目代码的业务逻辑分析助手。你必须先使用提供的只读工具查找页面和交互，"
@@ -127,7 +126,6 @@ class RequirementChatService:
                     messages=tool_messages,
                     tools=REQUIREMENT_TOOLS,
                     executor=tools.execute,
-                    max_tool_calls=_MAX_REQUIREMENT_TOOL_CALLS,
                     temperature=_TOOL_CHAT_TEMPERATURE,
                 )
                 return reply.strip(), None, None, None

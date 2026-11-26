@@ -43,7 +43,11 @@ from app.requirement.judge import capped_confidence, match_quote, parse_json
 from app.requirement.llm import LLMCallError, LLMClient
 from app.specdoc.apimap import all_api_steps
 from app.specdoc.collect import Materials, PageMaterial
-from app.specdoc.evidence import build_evidence_pack, build_skeleton
+from app.specdoc.evidence import (
+    build_evidence_pack,
+    build_skeleton,
+    build_skeleton_from_pages,
+)
 from app.specdoc.evidence_query import EvidenceQuery, graph_rows_exist
 from app.specdoc.llm import OpenAICompatibleToolLLM
 from app.specdoc.retrieval import EVIDENCE_TOOL, EvidenceLedger, EvidenceSearch, QueryCache
@@ -201,46 +205,62 @@ async def infer_sections(
             _apply_material_scope(context, requirement_map)
     else:
         evidence_pack = build_evidence_pack(materials, events_by_page)
-        evidence_json, exposed_texts = evidence_pack.prompt_view()
-        exposed_pages = evidence_pack.prompt_pages
-        for context in contexts:
-            context.texts_by_node = exposed_texts.get(
-                context.material.page.pageId, {}
-            )
-            exposed_page = next(
-                (
-                    page for page in exposed_pages
-                    if page.get("pageId") == context.material.page.pageId
-                ),
-                {},
-            )
-            ui_texts = set(exposed_page.get("uiText", []))
-            context.ui_text = tuple(
-                text for text in context.texts_by_node.get(context.material.page.pageId, ())
-                if text in ui_texts
-            )
-            exposed_chains = {
-                item.get("chainId") for item in exposed_page.get("chains", [])
-            }
-            context.chain_nodes = {
-                chain.id: frozenset(chain.node_ids)
-                for chain in context.material.chains
-                if chain.id in exposed_chains
-            }
-            context.feature_chains = {
-                feature_id: frozenset(
-                    match.chainId for match in (requirement_map.matches or [])
-                    if match.featureId == feature_id
-                    and match.pageNodeId == context.material.page.pageId
-                    and match.chainId is not None
-                    and match.chainId in context.chain_nodes
+        if tool_mode:
+            # 工具模式下证据包不进入提示词，检索作用域直接取完整投影；
+            # 若仍用 prompt_view 裁剪后的页面，骨架会列出检索器里不存在的
+            # 节点/链路，导致模型一查就 evidence_out_of_scope。
+            evidence_json = ""
+            exposed_texts = {}
+            exposed_pages = evidence_pack.pages
+            for context in contexts:
+                _apply_material_scope(context, requirement_map)
+        else:
+            evidence_json, exposed_texts = evidence_pack.prompt_view()
+            exposed_pages = evidence_pack.prompt_pages
+            for context in contexts:
+                context.texts_by_node = exposed_texts.get(
+                    context.material.page.pageId, {}
                 )
-                for feature_id in {
-                    match.featureId for match in (requirement_map.matches or [])
-                    if match.pageNodeId == context.material.page.pageId
+                exposed_page = next(
+                    (
+                        page for page in exposed_pages
+                        if page.get("pageId") == context.material.page.pageId
+                    ),
+                    {},
+                )
+                ui_texts = set(exposed_page.get("uiText", []))
+                context.ui_text = tuple(
+                    text for text in context.texts_by_node.get(
+                        context.material.page.pageId, ()
+                    )
+                    if text in ui_texts
+                )
+                exposed_chains = {
+                    item.get("chainId") for item in exposed_page.get("chains", [])
                 }
-            }
-    pack_warnings = evidence_pack.prompt_warnings if evidence_pack is not None else ()
+                context.chain_nodes = {
+                    chain.id: frozenset(chain.node_ids)
+                    for chain in context.material.chains
+                    if chain.id in exposed_chains
+                }
+                context.feature_chains = {
+                    feature_id: frozenset(
+                        match.chainId for match in (requirement_map.matches or [])
+                        if match.featureId == feature_id
+                        and match.pageNodeId == context.material.page.pageId
+                        and match.chainId is not None
+                        and match.chainId in context.chain_nodes
+                    )
+                    for feature_id in {
+                        match.featureId for match in (requirement_map.matches or [])
+                        if match.pageNodeId == context.material.page.pageId
+                    }
+                }
+    pack_warnings = (
+        evidence_pack.prompt_warnings
+        if evidence_pack is not None and not tool_mode
+        else ()
+    )
     feature_pages = _feature_pages(requirement_map, contexts)
     page_nodes, chain_nodes, chain_pages = _scope_maps(materials)
     # 直接复用 collect 已按页面校验过的命中链路，避免从 matches 重算时
@@ -249,10 +269,16 @@ async def infer_sections(
         material.page.pageId: material.matched_chain_ids
         for material in materials.pages
     }
-    skeleton_json = json.dumps(
-        build_skeleton(materials, feature_pages, chain_ids_by_page),
-        ensure_ascii=False,
+    # 骨架必须与检索器使用同一作用域：SQL 模式取 materials，
+    # 内存模式取证据包投影，否则骨架里会出现检索器无法命中的 id。
+    skeleton = (
+        build_skeleton(materials, feature_pages, chain_ids_by_page)
+        if use_sql_query
+        else build_skeleton_from_pages(
+            evidence_pack.pages, feature_pages, chain_ids_by_page
+        )
     )
+    skeleton_json = json.dumps(skeleton, ensure_ascii=False)
     features = list(requirement_map.features)
     ledger = EvidenceLedger()
     # 三章共享同一份查询结果缓存：ledger 与预算仍各自独立，
@@ -318,7 +344,6 @@ async def infer_sections(
                 + "\n请先按需调用 search_evidence 获取引文，再输出步骤 JSON。",
                 tools=[EVIDENCE_TOOL],
                 executor=search.execute,
-                max_tool_calls=max(1, max_calls * 2),
             )
             parsed = parse_json(parsed_text)
         else:
@@ -370,7 +395,6 @@ async def infer_sections(
                 + skeleton_json
                 + "\n请按需检索链路、界面文本或事件事实，再输出规则 JSON。",
                 tools=[EVIDENCE_TOOL], executor=rules_search.execute,
-                max_tool_calls=max(1, max_calls * 2),
             )
             rules_parsed = parse_json(rules_text)
             rules_warning = None
@@ -412,7 +436,6 @@ async def infer_sections(
                 + "\n仅为 fieldMappings 引用 forms 与 apiFacts；"
                 "请先检索 category=form 与 category=apiFact 所需事实，再输出映射 JSON。",
                 tools=[EVIDENCE_TOOL], executor=mapping_search.execute,
-                max_tool_calls=max(1, max_calls * 2),
             )
             mappings_parsed = parse_json(mappings_text)
             mappings_warning = None
@@ -908,7 +931,13 @@ async def _infer_steps(
             )
             continue
         quote = entry.get("quote")
-        valid_chains = context.feature_chains.get(feature_id, frozenset())
+        # 与 _select_feature_context 保持一致：feature 没有显式命中链路时，
+        # 允许使用该页面的全部链路；否则聊天路径（无 chainId）会把模型
+        # 按提示词产出的链路步骤全部判为越界。
+        valid_chains = (
+            context.feature_chains.get(feature_id, frozenset())
+            or frozenset(context.chain_nodes)
+        )
         if chain_id is not None and chain_id not in valid_chains:
             dropped.append(
                 Dropped(
@@ -1055,7 +1084,13 @@ async def _infer_rules(
                 dropped.append(Dropped(reason=Reason.node_not_in_candidates,
                                        featureId=feature_id, quote=_str_or_none(quote)))
                 continue
-            valid_chains = context.feature_chains.get(feature_id, frozenset())
+            # 与 _select_feature_context 保持一致：feature 没有显式命中链路时，
+            # 允许使用该页面的全部链路；否则聊天路径（无 chainId）会把模型
+            # 按提示词产出的链路步骤全部判为越界。
+            valid_chains = (
+                context.feature_chains.get(feature_id, frozenset())
+                or frozenset(context.chain_nodes)
+            )
             if chain_id is not None and chain_id not in valid_chains:
                 dropped.append(
                     Dropped(

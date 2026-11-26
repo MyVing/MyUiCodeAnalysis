@@ -114,25 +114,83 @@ async def test_tool_loop_rejects_unknown_tool_arguments(
     assert error.value.code == "unknown_tool"
 
 
-async def test_tool_loop_enforces_call_budget(monkeypatch: pytest.MonkeyPatch) -> None:
+async def test_tool_loop_has_no_call_budget(monkeypatch: pytest.MonkeyPatch) -> None:
     client = OpenAICompatibleToolLLM(Settings(_env_file=None, llm_enabled=True, llm_api_key="test"))
+    requests = 0
 
     async def request(payload):
-        return {
-            "tool_calls": [
-                {"id": "call-1", "type": "function", "function": {"name": "t", "arguments": "{}"}},
-                {"id": "call-2", "type": "function", "function": {"name": "t", "arguments": "{}"}},
-            ]
-        }
+        nonlocal requests
+        requests += 1
+        if requests <= 12:
+            return {
+                "tool_calls": [
+                    {
+                        "id": f"call-{requests}",
+                        "type": "function",
+                        "function": {"name": "t", "arguments": "{}"},
+                    }
+                ]
+            }
+        return {"content": "done"}
+
+    monkeypatch.setattr(client, "_request", request)
+    executed: list[str] = []
+
+    async def execute(name: str, arguments: dict) -> dict:
+        executed.append(name)
+        return {}
+
+    result = await client.chat_with_tools(
+        "system",
+        "user",
+        tools=[{"type": "function", "function": {"name": "t"}}],
+        executor=execute,
+    )
+    assert result == "done"
+    assert len(executed) == 12
+
+
+async def test_tool_execution_error_is_returned_to_model(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    client = OpenAICompatibleToolLLM(Settings(_env_file=None, llm_enabled=True, llm_api_key="test"))
+    requests: list[dict] = []
+
+    async def request(payload):
+        requests.append(payload)
+        if len(requests) == 1:
+            return {
+                "tool_calls": [
+                    {
+                        "id": "call-1",
+                        "type": "function",
+                        "function": {"name": "search_evidence", "arguments": "{}"},
+                    }
+                ]
+            }
+        return {"content": '{"steps": []}'}
 
     monkeypatch.setattr(client, "_request", request)
 
     async def execute(name: str, arguments: dict) -> dict:
-        return {}
+        raise SpecDocToolError("节点不在本次证据范围内", code="evidence_out_of_scope")
 
-    with pytest.raises(SpecDocToolError) as error:
-        await client.chat_with_tools("system", "user", tools=[], executor=execute, max_tool_calls=1)
-    assert error.value.code == "tool_budget_exhausted"
+    result = await client.chat_with_tools(
+        "system",
+        "user",
+        tools=[{"type": "function", "function": {"name": "search_evidence"}}],
+        executor=execute,
+    )
+
+    assert result == '{"steps": []}'
+    tool_messages = [
+        message for message in requests[1]["messages"] if message.get("role") == "tool"
+    ]
+    assert json.loads(tool_messages[-1]["content"]) == {
+        "status": "error",
+        "code": "evidence_out_of_scope",
+        "message": "节点不在本次证据范围内",
+    }
 
 
 async def test_tool_loop_surfaces_endpoint_rejection(monkeypatch: pytest.MonkeyPatch) -> None:

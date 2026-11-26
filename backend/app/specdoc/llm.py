@@ -128,7 +128,6 @@ class OpenAICompatibleToolLLM:
         messages: list[dict[str, Any]] | None = None,
         tools: list[dict[str, Any]],
         executor: ToolExecutor,
-        max_tool_calls: int = 6,
         temperature: float = 0,
     ) -> str:
         if messages is not None and user is not None:
@@ -154,7 +153,6 @@ class OpenAICompatibleToolLLM:
         payload["temperature"] = temperature
         payload["tools"] = tools
         payload["tool_choice"] = "auto"
-        used_calls = 0
         while True:
             message = await self._request_with_retry(payload)
             calls = message.get("tool_calls")
@@ -165,8 +163,6 @@ class OpenAICompatibleToolLLM:
                 raise SpecDocToolError("specdoc 模型最终响应缺少文本 content")
             if not isinstance(calls, list) or not calls:
                 raise SpecDocToolError("specdoc 模型 tool_calls 格式无效")
-            if used_calls + len(calls) > max_tool_calls:
-                raise SpecDocToolError("specdoc 工具调用次数超过上限", code="tool_budget_exhausted")
             assistant_message = {
                 "role": "assistant",
                 "content": message.get("content"),
@@ -189,10 +185,20 @@ class OpenAICompatibleToolLLM:
                     raise SpecDocToolError("specdoc 工具参数必须是 JSON object")
                 try:
                     result = await executor(name, arguments)
-                except SpecDocToolError:
-                    raise
+                except SpecDocToolError as error:
+                    # 工具执行失败（如 id 越界）不是协议错误：把错误回传给模型，
+                    # 让它在后续轮次里改用正确参数，而不是整章直接失败。
+                    result = {
+                        "status": "error",
+                        "code": error.code,
+                        "message": str(error),
+                    }
                 except Exception as error:  # noqa: BLE001 - tool boundary normalizes failures
-                    raise SpecDocToolError(f"specdoc 证据检索失败：{error}") from error
+                    result = {
+                        "status": "error",
+                        "code": "tool_error",
+                        "message": str(error),
+                    }
                 messages.append(
                     {
                         "role": "tool",
@@ -200,7 +206,6 @@ class OpenAICompatibleToolLLM:
                         "content": json.dumps(result, ensure_ascii=False, separators=(",", ":")),
                     }
                 )
-                used_calls += 1
             payload = self._payload(system, messages, with_tools=True)
             payload["temperature"] = temperature
             payload["tools"] = tools

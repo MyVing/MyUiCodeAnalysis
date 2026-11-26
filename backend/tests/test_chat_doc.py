@@ -75,7 +75,7 @@ class FakeToolLLM:
     def __init__(self) -> None:
         self.calls: list[str] = []
 
-    async def chat_with_tools(self, system, user, *, tools, executor, max_tool_calls=6):
+    async def chat_with_tools(self, system, user, *, tools, executor):
         assert any(tool.get("function", {}).get("name") == "search_evidence" for tool in tools)
         self.calls.append("search_evidence")
         await executor("search_evidence", {"category": "all"})
@@ -315,7 +315,7 @@ async def test_business_analysis_uses_requirement_tools() -> None:
 
     class BusinessToolLLM:
         async def chat_with_tools(
-            self, system, *, messages, tools, executor, max_tool_calls, temperature
+            self, system, *, messages, tools, executor, temperature
         ):
             assert "只读工具" in system
             assert messages[-1]["content"] == "转账按钮点击后"
@@ -326,7 +326,6 @@ async def test_business_analysis_uses_requirement_tools() -> None:
                 "get_interaction_chain",
                 "read_source_range",
             }
-            assert max_tool_calls == 8
             assert temperature == pytest.approx(0.2)
             result = await executor("search_pages", {"query": "转账", "top_k": 1})
             assert result["status"] == "ok"

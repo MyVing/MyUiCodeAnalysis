@@ -529,7 +529,7 @@ class _RepeatQueryToolLLM:
     def __init__(self, chain_id: str) -> None:
         self._chain_id = chain_id
 
-    async def chat_with_tools(self, system, user, *, tools, executor, max_tool_calls):
+    async def chat_with_tools(self, system, user, *, tools, executor):
         await executor(
             "search_evidence", {"chainId": self._chain_id, "category": "chain"}
         )
@@ -616,7 +616,7 @@ class _ChainToolLLM:
     def __init__(self, chain_id: str) -> None:
         self._chain_id = chain_id
 
-    async def chat_with_tools(self, system, user, *, tools, executor, max_tool_calls):
+    async def chat_with_tools(self, system, user, *, tools, executor):
         if "操作步骤" in system:
             result = await executor(
                 "search_evidence", {"chainId": self._chain_id, "category": "chain"}
