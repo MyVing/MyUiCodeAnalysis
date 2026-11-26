@@ -123,19 +123,35 @@ class OpenAICompatibleToolLLM:
     async def chat_with_tools(
         self,
         system: str,
-        user: str,
+        user: str | None = None,
         *,
+        messages: list[dict[str, Any]] | None = None,
         tools: list[dict[str, Any]],
         executor: ToolExecutor,
         max_tool_calls: int = 6,
+        temperature: float = 0,
     ) -> str:
-        messages: list[dict[str, Any]] = [{"role": "user", "content": user}]
+        if messages is not None and user is not None:
+            raise ValueError("pass either user or messages, not both")
+        if messages is None:
+            if user is None:
+                raise ValueError("user or messages is required")
+            messages = [{"role": "user", "content": user}]
+        else:
+            messages = [dict(message) for message in messages]
+            if not messages or any(
+                message.get("role") not in {"user", "assistant"}
+                or not isinstance(message.get("content"), str)
+                for message in messages
+            ):
+                raise ValueError("messages must contain user/assistant text messages")
         allowed_tools = {
             tool.get("function", {}).get("name")
             for tool in tools
             if isinstance(tool, dict) and isinstance(tool.get("function"), dict)
         }
         payload = self._payload(system, messages, with_tools=True)
+        payload["temperature"] = temperature
         payload["tools"] = tools
         payload["tool_choice"] = "auto"
         used_calls = 0
@@ -178,11 +194,15 @@ class OpenAICompatibleToolLLM:
                 except Exception as error:  # noqa: BLE001 - tool boundary normalizes failures
                     raise SpecDocToolError(f"specdoc 证据检索失败：{error}") from error
                 messages.append(
-                    {"role": "tool", "tool_call_id": call_id,
-                     "content": json.dumps(result, ensure_ascii=False, separators=(",", ":"))}
+                    {
+                        "role": "tool",
+                        "tool_call_id": call_id,
+                        "content": json.dumps(result, ensure_ascii=False, separators=(",", ":")),
+                    }
                 )
                 used_calls += 1
             payload = self._payload(system, messages, with_tools=True)
+            payload["temperature"] = temperature
             payload["tools"] = tools
             payload["tool_choice"] = "auto"
 

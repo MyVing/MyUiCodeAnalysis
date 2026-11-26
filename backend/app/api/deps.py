@@ -212,8 +212,11 @@ SpecDocServiceDep = Annotated[SpecDocService, Depends(get_specdoc_service)]
 def get_requirement_chat_service(
     llm: Annotated[LLMClient | None, Depends(get_llm_client)],
     settings: SettingsDep,
+    specdoc_llm: Annotated[
+        OpenAICompatibleToolLLM | None, Depends(get_specdoc_llm_client)
+    ],
 ) -> RequirementChatService:
-    return RequirementChatService(llm, settings)
+    return RequirementChatService(llm, settings, specdoc_llm=specdoc_llm)
 
 
 RequirementChatServiceDep = Annotated[

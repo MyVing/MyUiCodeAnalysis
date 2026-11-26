@@ -69,6 +69,42 @@ _NO_MATCH_INTENT = json.dumps(
 _CLARIFY_INTENT = json.dumps({"intent": "clarify", "featureText": None})
 
 
+class FakeToolLLM:
+    """工具客户端假实现：每个推断章节实际执行证据检索。"""
+
+    def __init__(self) -> None:
+        self.calls: list[str] = []
+
+    async def chat_with_tools(self, system, user, *, tools, executor, max_tool_calls=6):
+        assert any(tool.get("function", {}).get("name") == "search_evidence" for tool in tools)
+        self.calls.append("search_evidence")
+        await executor("search_evidence", {"category": "all"})
+        if "业务操作步骤" in system:
+            return json.dumps(_VALID_STEPS, ensure_ascii=False)
+        if "前端业务规则" in system:
+            return json.dumps(_VALID_RULES, ensure_ascii=False)
+        return json.dumps(_VALID_MAPPINGS, ensure_ascii=False)
+
+
+async def test_doc_query_uses_tool_llm_for_evidence_search(caplog) -> None:
+    chat_llm = FakeLLMClient([_DOC_INTENT])
+    specdoc_llm = FakeToolLLM()
+    service = RequirementChatService(chat_llm, settings_with(), specdoc_llm=specdoc_llm)
+
+    reply, draft, markdown, page = await service.chat(
+        [{"role": "user", "content": "转账的前端交互视图"}],
+        project=_PROJECT,
+        graph=spec_graph(),
+    )
+
+    assert "已定位到页面" in reply
+    assert draft is None and markdown is not None and page == "Transfer"
+    assert len(chat_llm.message_calls) == 1
+    assert specdoc_llm.calls
+    assert set(specdoc_llm.calls) == {"search_evidence"}
+    assert "evidence_full_prompt_fallback" not in caplog.text
+
+
 def _service(llm: FakeLLMClient, settings: Settings | None = None) -> RequirementChatService:
     return RequirementChatService(llm, settings or settings_with())
 
@@ -102,11 +138,13 @@ async def test_doc_query_locates_page_and_returns_markdown() -> None:
 
 async def test_route_path_locates_page_without_intent_rewrite() -> None:
     """显式路由不依赖模型 featureText 或词表即可定位页面。"""
-    llm = FakeLLMClient([
-        json.dumps(_VALID_STEPS),
-        json.dumps(_VALID_RULES),
-        json.dumps(_VALID_MAPPINGS),
-    ])
+    llm = FakeLLMClient(
+        [
+            json.dumps(_VALID_STEPS),
+            json.dumps(_VALID_RULES),
+            json.dumps(_VALID_MAPPINGS),
+        ]
+    )
     best = locate_route_feature(spec_graph(), "/transfer/")
     assert best is not None
     assert best.candidate.name == "Transfer"
@@ -155,7 +193,6 @@ async def test_raw_query_fallback_preserves_explicit_route_anchor() -> None:
     assert page == "Transfer"
     assert markdown is not None
     assert "已定位到页面" in reply
-
 
     """澄清类消息不走文档生成：单次模型调用，草稿照常返回。"""
     llm = FakeLLMClient(
@@ -269,3 +306,39 @@ def test_synthetic_match_caps_confidence_within_contract() -> None:
     match = _synthetic_requirement_map(_PROJECT, best, "转账", spec_graph()).matches[0]
     assert match.modelConfidence == 1.0
     assert match.confidence == 0.6
+
+
+async def test_business_analysis_uses_requirement_tools() -> None:
+    chat_llm = FakeLLMClient(
+        [json.dumps({"intent": "business_analysis", "featureText": "转账按钮点击后"})]
+    )
+
+    class BusinessToolLLM:
+        async def chat_with_tools(
+            self, system, *, messages, tools, executor, max_tool_calls, temperature
+        ):
+            assert "只读工具" in system
+            assert messages[-1]["content"] == "转账按钮点击后"
+            names = {tool["function"]["name"] for tool in tools}
+            assert names == {
+                "search_pages",
+                "search_interactions",
+                "get_interaction_chain",
+                "read_source_range",
+            }
+            assert max_tool_calls == 8
+            assert temperature == pytest.approx(0.2)
+            result = await executor("search_pages", {"query": "转账", "top_k": 1})
+            assert result["status"] == "ok"
+            return "转账按钮处理链路见代码证据。"
+
+    service = RequirementChatService(chat_llm, settings_with(), specdoc_llm=BusinessToolLLM())
+    reply, draft, markdown, page = await service.chat(
+        [{"role": "user", "content": "转账按钮点击后做什么？"}],
+        project=_PROJECT,
+        graph=spec_graph(),
+    )
+
+    assert reply == "转账按钮处理链路见代码证据。"
+    assert draft is None and markdown is None and page is None
+    assert len(chat_llm.message_calls) == 1

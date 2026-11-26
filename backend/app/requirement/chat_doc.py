@@ -40,20 +40,24 @@ from app.requirement.recall import (
     route_target_pages,
 )
 from app.schemas import Project, SpecDocTask
+from app.specdoc.llm import OpenAICompatibleToolLLM
 from app.specdoc.orchestrator import SpecDocOrchestrator
 from app.specdoc.render import render_markdown
 
 INTENT_SYSTEM_PROMPT = """你是前端需求助手的意图判定器。根据对话历史与最新用户消息，\
-判断用户是否在询问某个功能的「前端交互视图 / 交互逻辑 / 业务操作步骤」类文档。
+判断用户是想查看某个功能的前端交互文档、分析项目里实际的业务逻辑，还是继续澄清需求。
 
 规则：
 1. intent=doc_query：用户想看某个已实现（或规划中）功能在页面上的交互细节，
-   featureText 输出该功能的中文描述（去掉寒暄与指代，保留页面 / 操作 / 数据信息）。
-2. intent=clarify：其他一切情况——需求澄清、闲聊、与文档无关的问题。
+   featureText 输出该功能的中文描述。
+2. intent=business_analysis：用户询问现有代码的业务处理过程、点击后行为、状态变化、
+   接口调用或代码实现依据，featureText 输出具体问题。
+3. intent=clarify：其他情况，包括新功能需求澄清、闲聊、与项目代码分析无关的问题。
    featureText 输出 null。
-3. 只做判定，不要回答用户的问题。
+4. 只做判定，不要回答用户的问题。
 
-始终输出 JSON 对象：{"intent": "doc_query" | "clarify", "featureText": string | null}。"""
+始终输出 JSON 对象：
+{"intent": "doc_query" | "business_analysis" | "clarify", "featureText": string | null}。"""
 
 _INTENT_TEMPERATURE = 0.2
 
@@ -97,7 +101,7 @@ async def decide_intent(llm: LLMClient, messages: list[dict[str, str]]) -> _Inte
     intent = parsed.get("intent")
     feature_text = parsed.get("featureText")
     return _Intent(
-        intent=intent if intent == "doc_query" else "clarify",
+        intent=intent if intent in {"doc_query", "business_analysis"} else "clarify",
         feature_text=(
             feature_text.strip() if isinstance(feature_text, str) and feature_text.strip() else None
         ),
@@ -118,9 +122,7 @@ def locate_route_feature(graph: IRGraph, route_path: str) -> CandidateDetail | N
     if not route_nodes:
         return None
     targets = route_target_pages(graph, nodes)
-    page_ids_for_route = [
-        page_id for node in route_nodes for page_id in targets.get(node.id, [])
-    ]
+    page_ids_for_route = [page_id for node in route_nodes for page_id in targets.get(node.id, [])]
     page_ids_for_route = list(
         dict.fromkeys(page_id for page_id in page_ids_for_route if page_id in page_ids)
     )
@@ -142,9 +144,7 @@ def locate_route_feature(graph: IRGraph, route_path: str) -> CandidateDetail | N
         anchorEdgeIds=[
             edge.id
             for edge in graph.edges
-            if edge.kind is EdgeKind.renders
-            and edge.from_ == route_node.id
-            and edge.to == page.id
+            if edge.kind is EdgeKind.renders and edge.from_ == route_node.id and edge.to == page.id
         ]
         or None,
     )
@@ -168,9 +168,7 @@ def _normalize_route(value: str) -> str:
     return route.rstrip("/") or "/" if route != "/" else "/"
 
 
-def locate_feature(
-    graph: IRGraph, feature_text: str, top_k: int = 3
-) -> CandidateDetail | None:
+def locate_feature(graph: IRGraph, feature_text: str, top_k: int = 3) -> CandidateDetail | None:
     """用锚点反向召回定位页面，返回得分最高的候选（无命中返回 None）。"""
     candidates = []
     for feature in decompose(feature_text):
@@ -188,6 +186,7 @@ async def build_chat_doc(
     llm: LLMClient,
     settings: Settings,
     *,
+    specdoc_llm: OpenAICompatibleToolLLM | None = None,
     route_path: str | None = None,
     fallback_text: str | None = None,
 ) -> ChatDocOutcome:
@@ -213,7 +212,7 @@ async def build_chat_doc(
         dry_run=False,
         created_at=datetime.now(UTC),
     )
-    orchestrator = SpecDocOrchestrator(settings, llm)
+    orchestrator = SpecDocOrchestrator(settings, specdoc_llm or llm)
     doc = await orchestrator.run(project, task, requirement_map, graph)
     markdown = render_markdown(doc)
     page = best.candidate.name or best.candidate.nodeId

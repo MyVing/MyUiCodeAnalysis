@@ -9,19 +9,57 @@ from app.core.config import Settings
 from app.specdoc.llm import OpenAICompatibleToolLLM, SpecDocToolError, build_specdoc_llm_client
 
 
+async def test_tool_loop_preserves_prior_messages_and_temperature(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    requests: list[dict] = []
+    client = OpenAICompatibleToolLLM(Settings(_env_file=None, llm_enabled=True, llm_api_key="test"))
+    history = [
+        {"role": "user", "content": "分析转账"},
+        {"role": "assistant", "content": "正在查找页面"},
+    ]
+
+    async def request(payload):
+        requests.append(payload)
+        return {"content": "已完成分析"}
+
+    monkeypatch.setattr(client, "_request", request)
+    result = await client.chat_with_tools(
+        "system",
+        messages=history,
+        tools=[],
+        executor=lambda *_: None,  # type: ignore[arg-type]
+        temperature=0.2,
+    )
+
+    assert result == "已完成分析"
+    assert requests[0]["messages"][-2:] == history
+    assert requests[0]["temperature"] == pytest.approx(0.2)
+    assert history == [
+        {"role": "user", "content": "分析转账"},
+        {"role": "assistant", "content": "正在查找页面"},
+    ]
+
+
 async def test_tool_loop_returns_final_text_and_round_trips_tool_result(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     requests: list[dict] = []
     responses = [
-        {"tool_calls": [{"id": "call-1", "type": "function", "function": {
-            "name": "search_evidence", "arguments": '{"category":"chain"}'
-        }}]},
+        {
+            "tool_calls": [
+                {
+                    "id": "call-1",
+                    "type": "function",
+                    "function": {"name": "search_evidence", "arguments": '{"category":"chain"}'},
+                }
+            ]
+        },
         {"content": '{"steps": []}'},
     ]
-    client = OpenAICompatibleToolLLM(Settings(
-        _env_file=None, llm_enabled=True, llm_api_key="test", llm_response_format=True
-    ))
+    client = OpenAICompatibleToolLLM(
+        Settings(_env_file=None, llm_enabled=True, llm_api_key="test", llm_response_format=True)
+    )
 
     async def request(payload):
         requests.append(payload)
@@ -34,7 +72,9 @@ async def test_tool_loop_returns_final_text_and_round_trips_tool_result(
         return {"status": "ok", "facts": [{"text": "点击转账"}]}
 
     result = await client.chat_with_tools(
-        "system", "user", tools=[{"type": "function", "function": {"name": "search_evidence"}}],
+        "system",
+        "user",
+        tools=[{"type": "function", "function": {"name": "search_evidence"}}],
         executor=execute,
     )
 
@@ -43,7 +83,8 @@ async def test_tool_loop_returns_final_text_and_round_trips_tool_result(
     assert requests[0]["messages"][-1] == {"role": "user", "content": "user"}
     assert requests[1]["messages"][-2]["tool_calls"][0]["id"] == "call-1"
     assert json.loads(requests[1]["messages"][-1]["content"]) == {
-        "status": "ok", "facts": [{"text": "点击转账"}]
+        "status": "ok",
+        "facts": [{"text": "点击转账"}],
     }
 
 
@@ -53,9 +94,15 @@ async def test_tool_loop_rejects_unknown_tool_arguments(
     client = OpenAICompatibleToolLLM(Settings(_env_file=None, llm_enabled=True, llm_api_key="test"))
 
     async def request(payload):
-        return {"tool_calls": [{"id": "call-1", "type": "function", "function": {
-            "name": "unknown", "arguments": "{}"
-        }}]}
+        return {
+            "tool_calls": [
+                {
+                    "id": "call-1",
+                    "type": "function",
+                    "function": {"name": "unknown", "arguments": "{}"},
+                }
+            ]
+        }
 
     monkeypatch.setattr(client, "_request", request)
 
@@ -71,10 +118,12 @@ async def test_tool_loop_enforces_call_budget(monkeypatch: pytest.MonkeyPatch) -
     client = OpenAICompatibleToolLLM(Settings(_env_file=None, llm_enabled=True, llm_api_key="test"))
 
     async def request(payload):
-        return {"tool_calls": [
-            {"id": "call-1", "type": "function", "function": {"name": "t", "arguments": "{}"}},
-            {"id": "call-2", "type": "function", "function": {"name": "t", "arguments": "{}"}},
-        ]}
+        return {
+            "tool_calls": [
+                {"id": "call-1", "type": "function", "function": {"name": "t", "arguments": "{}"}},
+                {"id": "call-2", "type": "function", "function": {"name": "t", "arguments": "{}"}},
+            ]
+        }
 
     monkeypatch.setattr(client, "_request", request)
 
@@ -87,9 +136,7 @@ async def test_tool_loop_enforces_call_budget(monkeypatch: pytest.MonkeyPatch) -
 
 
 async def test_tool_loop_surfaces_endpoint_rejection(monkeypatch: pytest.MonkeyPatch) -> None:
-    client = OpenAICompatibleToolLLM(
-        Settings(_env_file=None, llm_enabled=True, llm_api_key="test")
-    )
+    client = OpenAICompatibleToolLLM(Settings(_env_file=None, llm_enabled=True, llm_api_key="test"))
 
     async def post(*args, **kwargs):
         return httpx.Response(400, json={"error": {"message": "tools unsupported"}})
@@ -101,7 +148,10 @@ async def test_tool_loop_surfaces_endpoint_rejection(monkeypatch: pytest.MonkeyP
     monkeypatch.setattr(client, "_http", lambda: HTTP())
     with pytest.raises(SpecDocToolError) as error:
         await client.chat_with_tools(
-            "system", "user", tools=[], executor=lambda *_: None  # type: ignore[arg-type]
+            "system",
+            "user",
+            tools=[],
+            executor=lambda *_: None,  # type: ignore[arg-type]
         )
     assert error.value.retryable is False
 
@@ -116,9 +166,7 @@ async def test_tool_loop_retries_retryable_request_errors(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     """超时 / 429 / 5xx 属于可重试错误：重发同一 payload，不消耗对话进度。"""
-    client = OpenAICompatibleToolLLM(
-        Settings(_env_file=None, llm_enabled=True, llm_api_key="test")
-    )
+    client = OpenAICompatibleToolLLM(Settings(_env_file=None, llm_enabled=True, llm_api_key="test"))
     client._tool_retry_backoff = 0
     attempts = 0
 
@@ -132,7 +180,10 @@ async def test_tool_loop_retries_retryable_request_errors(
     monkeypatch.setattr(client, "_request", request)
 
     result = await client.chat_with_tools(
-        "system", "user", tools=[], executor=lambda *_: None  # type: ignore[arg-type]
+        "system",
+        "user",
+        tools=[],
+        executor=lambda *_: None,  # type: ignore[arg-type]
     )
 
     assert result == '{"steps": []}'
@@ -142,9 +193,7 @@ async def test_tool_loop_retries_retryable_request_errors(
 async def test_tool_loop_does_not_retry_non_retryable_errors(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    client = OpenAICompatibleToolLLM(
-        Settings(_env_file=None, llm_enabled=True, llm_api_key="test")
-    )
+    client = OpenAICompatibleToolLLM(Settings(_env_file=None, llm_enabled=True, llm_api_key="test"))
     client._tool_retry_backoff = 0
     attempts = 0
 
@@ -157,7 +206,10 @@ async def test_tool_loop_does_not_retry_non_retryable_errors(
 
     with pytest.raises(SpecDocToolError):
         await client.chat_with_tools(
-            "system", "user", tools=[], executor=lambda *_: None  # type: ignore[arg-type]
+            "system",
+            "user",
+            tools=[],
+            executor=lambda *_: None,  # type: ignore[arg-type]
         )
     assert attempts == 1
 
@@ -165,9 +217,7 @@ async def test_tool_loop_does_not_retry_non_retryable_errors(
 async def test_tool_loop_gives_up_after_retries_exhausted(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    client = OpenAICompatibleToolLLM(
-        Settings(_env_file=None, llm_enabled=True, llm_api_key="test")
-    )
+    client = OpenAICompatibleToolLLM(Settings(_env_file=None, llm_enabled=True, llm_api_key="test"))
     client._tool_retry_backoff = 0
     client._tool_retry_attempts = 2
     attempts = 0
@@ -181,6 +231,9 @@ async def test_tool_loop_gives_up_after_retries_exhausted(
 
     with pytest.raises(SpecDocToolError):
         await client.chat_with_tools(
-            "system", "user", tools=[], executor=lambda *_: None  # type: ignore[arg-type]
+            "system",
+            "user",
+            tools=[],
+            executor=lambda *_: None,  # type: ignore[arg-type]
         )
     assert attempts == 2

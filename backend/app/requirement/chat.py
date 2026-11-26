@@ -16,7 +16,9 @@ from app.core.config import Settings
 from app.requirement.chat_doc import build_chat_doc, decide_intent
 from app.requirement.judge import parse_json
 from app.requirement.llm import LLMClient
+from app.requirement.tools import REQUIREMENT_TOOLS, RequirementAnalysisTools
 from app.schemas import Project
+from app.specdoc.llm import OpenAICompatibleToolLLM
 
 CHAT_SYSTEM_PROMPT = """你是前端需求澄清助手，帮用户把模糊的功能想法聊成一段清晰的功能需求描述。
 
@@ -32,6 +34,20 @@ CHAT_SYSTEM_PROMPT = """你是前端需求澄清助手，帮用户把模糊的�
 始终输出 JSON 对象：{"reply": string, "draftRequirement": string | null}。"""
 
 _CHAT_TEMPERATURE = 0.7
+_TOOL_CHAT_TEMPERATURE = 0.2
+_MAX_REQUIREMENT_TOOL_CALLS = 8
+
+BUSINESS_ANALYSIS_SYSTEM_PROMPT = (
+    "你是当前项目代码的业务逻辑分析助手。你必须先使用提供的只读工具查找页面和交互，"
+    "再根据工具结果回答。\n\n"
+    "约束：\n"
+    "1. 业务事实只能来自工具结果；不得编造节点、调用边、接口、状态变化或未读取的源码逻辑。\n"
+    "2. 优先 search_pages → search_interactions → get_interaction_chain；\n"
+    "   需要函数内部细节时再 read_source_range。\n"
+    "3. 只有工具返回成功的源码片段才算读过；缺少可信 endLine、链路断点或工具错误要如实说明。\n"
+    "4. 清楚区分代码已确认的信息与无法从当前分析结果确认的信息；证据不足时提出澄清问题。\n"
+    "5. 用中文回答，尽可能列出页面、函数、接口以及 file:line-line 来源。\n"
+)
 
 
 class RequirementChatPreconditionError(Exception):
@@ -44,9 +60,16 @@ class RequirementChatPreconditionError(Exception):
 
 
 class RequirementChatService:
-    def __init__(self, llm: LLMClient | None, settings: Settings | None = None) -> None:
+    def __init__(
+        self,
+        llm: LLMClient | None,
+        settings: Settings | None = None,
+        *,
+        specdoc_llm: OpenAICompatibleToolLLM | None = None,
+    ) -> None:
         self._llm = llm
         self._settings = settings
+        self._specdoc_llm = specdoc_llm
 
     async def chat(
         self,
@@ -79,10 +102,35 @@ class RequirementChatService:
                     graph,
                     self._llm,
                     self._settings,
+                    specdoc_llm=self._specdoc_llm,
                     route_path=route_path,
                 )
                 return outcome.reply, None, outcome.doc_markdown, outcome.page_name
             intent = await decide_intent(self._llm, messages)
+            if intent.intent == "business_analysis" and intent.feature_text:
+                if self._specdoc_llm is None:
+                    raise RequirementChatPreconditionError(
+                        "tool_calling_unavailable",
+                        "当前模型客户端未启用工具调用，暂时无法分析项目业务逻辑",
+                    )
+                tools = RequirementAnalysisTools(project.root_path, graph)
+                tool_messages = [*messages]
+                if tool_messages and tool_messages[-1]["role"] == "user":
+                    tool_messages[-1] = {
+                        "role": "user",
+                        "content": intent.feature_text,
+                    }
+                else:
+                    tool_messages.append({"role": "user", "content": intent.feature_text})
+                reply = await self._specdoc_llm.chat_with_tools(
+                    BUSINESS_ANALYSIS_SYSTEM_PROMPT,
+                    messages=tool_messages,
+                    tools=REQUIREMENT_TOOLS,
+                    executor=tools.execute,
+                    max_tool_calls=_MAX_REQUIREMENT_TOOL_CALLS,
+                    temperature=_TOOL_CHAT_TEMPERATURE,
+                )
+                return reply.strip(), None, None, None
             if intent.intent == "doc_query" and intent.feature_text:
                 outcome = await build_chat_doc(
                     project,
@@ -90,6 +138,7 @@ class RequirementChatService:
                     graph,
                     self._llm,
                     self._settings,
+                    specdoc_llm=self._specdoc_llm,
                     fallback_text=latest_user_text,
                 )
                 return outcome.reply, None, outcome.doc_markdown, outcome.page_name
