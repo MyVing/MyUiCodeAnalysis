@@ -17,7 +17,6 @@ import logging
 import re
 from collections import Counter
 from dataclasses import dataclass, field
-from typing import Any
 
 from sqlalchemy.ext.asyncio import AsyncEngine
 
@@ -44,8 +43,8 @@ from app.requirement.judge import capped_confidence, match_quote, parse_json
 from app.requirement.llm import LLMCallError, LLMClient
 from app.specdoc.apimap import all_api_steps
 from app.specdoc.collect import Materials, PageMaterial
-from app.specdoc.evidence import build_evidence_pack
-from app.specdoc.evidence_query import EvidenceQuery
+from app.specdoc.evidence import build_evidence_pack, build_skeleton
+from app.specdoc.evidence_query import EvidenceQuery, graph_rows_exist
 from app.specdoc.llm import OpenAICompatibleToolLLM
 from app.specdoc.retrieval import EVIDENCE_TOOL, EvidenceLedger, EvidenceSearch
 
@@ -163,55 +162,92 @@ async def infer_sections(
     后者是老链路——Memory 实现、单测、或数据库 schema 未升级时自动走这条。
     """
     contexts = _page_contexts(materials)
-    evidence_pack = build_evidence_pack(materials, events_by_page)
-    evidence_json, exposed_texts = evidence_pack.prompt_view()
-    exposed_pages = evidence_pack.prompt_pages
-    for context in contexts:
-        context.texts_by_node = exposed_texts.get(
-            context.material.page.pageId, {}
-        )
-        exposed_page = next(
-            (page for page in exposed_pages if page.get("pageId") == context.material.page.pageId),
-            {},
-        )
-        ui_texts = set(exposed_page.get("uiText", []))
-        context.ui_text = tuple(
-            text for text in context.texts_by_node.get(context.material.page.pageId, ())
-            if text in ui_texts
-        )
-        exposed_chains = {
-            item.get("chainId") for item in exposed_page.get("chains", [])
-        }
-        context.chain_nodes = {
-            chain.id: frozenset(chain.node_ids)
-            for chain in context.material.chains
-            if chain.id in exposed_chains
-        }
-        context.feature_chains = {
-            feature_id: frozenset(
-                match.chainId for match in (requirement_map.matches or [])
-                if match.featureId == feature_id
-                and match.pageNodeId == context.material.page.pageId
-                and match.chainId is not None
-                and match.chainId in context.chain_nodes
-            )
-            for feature_id in {
-                match.featureId for match in (requirement_map.matches or [])
-                if match.pageNodeId == context.material.page.pageId
-            }
-        }
-    feature_pages = _feature_pages(requirement_map, contexts)
-    features = list(requirement_map.features)
-    ledger = EvidenceLedger()
     tool_mode = callable(getattr(llm, "chat_with_tools", None))
     use_sql_query = (
-        engine is not None and project_id is not None and analysis_id is not None
+        tool_mode
+        and engine is not None
+        and project_id is not None
+        and analysis_id is not None
     )
+    sql_fallback_warning: RequirementWarning | None = None
     if use_sql_query:
-        logger.info(
-            "specdoc 推断使用 EvidenceQuery（SQL 层按需检索）："
-            "project=%s analysis=%s", project_id, analysis_id,
+        # P0-5：老图没有行式投影时回退内存检索，避免 MySQL 路径静默全空
+        use_sql_query = await graph_rows_exist(
+            engine, project_id, analysis_id, "static"  # type: ignore[arg-type]
         )
+        if use_sql_query:
+            logger.info(
+                "specdoc 推断使用 EvidenceQuery（SQL 层按需检索）："
+                "project=%s analysis=%s", project_id, analysis_id,
+            )
+        else:
+            logger.warning(
+                "graph_nodes 行表为空（历史图未回填），证据检索回退内存实现："
+                "project=%s analysis=%s", project_id, analysis_id,
+            )
+            sql_fallback_warning = RequirementWarning(
+                code="evidence_sql_fallback",
+                severity=Severity.warning,
+                message="图行式索引为空（历史图未回填），本次证据检索已回退内存检索。",
+            )
+
+    if use_sql_query:
+        # P1-3：SQL 路径的校验边界直接取 materials，不经过证据包裁剪
+        evidence_pack = None
+        evidence_json = ""
+        exposed_texts = {}
+        exposed_pages = ()
+        for context in contexts:
+            _apply_material_scope(context, requirement_map)
+    else:
+        evidence_pack = build_evidence_pack(materials, events_by_page)
+        evidence_json, exposed_texts = evidence_pack.prompt_view()
+        exposed_pages = evidence_pack.prompt_pages
+        for context in contexts:
+            context.texts_by_node = exposed_texts.get(
+                context.material.page.pageId, {}
+            )
+            exposed_page = next(
+                (
+                    page for page in exposed_pages
+                    if page.get("pageId") == context.material.page.pageId
+                ),
+                {},
+            )
+            ui_texts = set(exposed_page.get("uiText", []))
+            context.ui_text = tuple(
+                text for text in context.texts_by_node.get(context.material.page.pageId, ())
+                if text in ui_texts
+            )
+            exposed_chains = {
+                item.get("chainId") for item in exposed_page.get("chains", [])
+            }
+            context.chain_nodes = {
+                chain.id: frozenset(chain.node_ids)
+                for chain in context.material.chains
+                if chain.id in exposed_chains
+            }
+            context.feature_chains = {
+                feature_id: frozenset(
+                    match.chainId for match in (requirement_map.matches or [])
+                    if match.featureId == feature_id
+                    and match.pageNodeId == context.material.page.pageId
+                    and match.chainId is not None
+                    and match.chainId in context.chain_nodes
+                )
+                for feature_id in {
+                    match.featureId for match in (requirement_map.matches or [])
+                    if match.pageNodeId == context.material.page.pageId
+                }
+            }
+    pack_warnings = evidence_pack.prompt_warnings if evidence_pack is not None else ()
+    feature_pages = _feature_pages(requirement_map, contexts)
+    page_nodes, chain_nodes, chain_pages = _scope_maps(materials)
+    skeleton_json = json.dumps(
+        build_skeleton(materials, feature_pages), ensure_ascii=False
+    )
+    features = list(requirement_map.features)
+    ledger = EvidenceLedger()
 
     def _build_search(ledger_arg: EvidenceLedger, allowed_page_ids: set[str]):
         """有 engine 时走 EvidenceQuery（SQL 层），否则 fallback EvidenceSearch。"""
@@ -220,7 +256,11 @@ async def infer_sections(
                 engine=engine,  # type: ignore[arg-type]
                 project_id=project_id,  # type: ignore[arg-type]
                 analysis_id=analysis_id,  # type: ignore[arg-type]
+                graph_kind="static",
                 ledger=ledger_arg,
+                page_nodes=page_nodes,
+                chain_nodes=chain_nodes,
+                chain_pages=chain_pages,
             )
         return EvidenceSearch(exposed_pages, ledger_arg, allowed_page_ids)
 
@@ -236,9 +276,11 @@ async def infer_sections(
                 severity=Severity.warning,
                 message=f"结构化证据包已裁剪类别：{warning.removeprefix('evidence_').removesuffix('_truncated')}。",
             )
-            for warning in evidence_pack.prompt_warnings
+            for warning in pack_warnings
         ]
     )
+    if sql_fallback_warning is not None:
+        outcome.warnings.append(sql_fallback_warning)
     try:
         if tool_mode:
             parsed_text = await llm.chat_with_tools(
@@ -246,7 +288,7 @@ async def infer_sections(
                 "需求：" + requirement + "\n功能点：\n"
                 + "\n".join(f"- {item.id}: {item.text}" for item in features)
                 + "\n页面与链路骨架：\n"
-                + json.dumps(search.skeleton(feature_pages), ensure_ascii=False)
+                + skeleton_json
                 + "\n请先按需调用 search_evidence 获取引文，再输出步骤 JSON。",
                 tools=[EVIDENCE_TOOL],
                 executor=search.execute,
@@ -299,7 +341,7 @@ async def infer_sections(
                 "需求：" + requirement + "\n功能点：\n"
                 + "\n".join(f"- {item.id}: {item.text}" for item in features)
                 + "\n页面与链路骨架：\n"
-                + json.dumps(rules_search.skeleton(feature_pages), ensure_ascii=False)
+                + skeleton_json
                 + "\n请按需检索链路、界面文本或事件事实，再输出规则 JSON。",
                 tools=[EVIDENCE_TOOL], executor=rules_search.execute,
                 max_tool_calls=max(1, max_calls * 2),
@@ -340,12 +382,7 @@ async def infer_sections(
             mappings_text = await llm.chat_with_tools(
                 _MAPPING_SYSTEM,
                 "需求：" + requirement + "\n页面、表单与接口范围：\n"
-                + json.dumps(
-                    mapping_search.skeleton({
-                        "mapping": tuple(context.material.page.pageId for context in contexts)
-                    }),
-                    ensure_ascii=False,
-                )
+                + skeleton_json
                 + "\n仅为 fieldMappings 引用 forms 与 apiFacts；"
                 "请先检索 category=form 与 category=apiFact 所需事实，再输出映射 JSON。",
                 tools=[EVIDENCE_TOOL], executor=mapping_search.execute,
@@ -366,7 +403,7 @@ async def infer_sections(
         mappings, dropped, warnings = await _infer_mappings(
             requirement, contexts, llm, max_calls, "", parsed_override=mappings_parsed,
             available=not any(
-                code in evidence_pack.prompt_warnings
+                code in pack_warnings
                 for code in ("evidence_forms_truncated", "evidence_api_facts_truncated")
             ),
         ) if mappings_parsed is not None else ([], [], [_unavailable_warning("字段映射推断")])
@@ -376,7 +413,7 @@ async def infer_sections(
         mappings, dropped, warnings = await _infer_mappings(
             requirement, contexts, llm, max_calls, evidence_json,
             available=not any(
-                code in evidence_pack.prompt_warnings
+                code in pack_warnings
                 for code in ("evidence_forms_truncated", "evidence_api_facts_truncated")
             ),
         )
@@ -542,6 +579,72 @@ def _evidence_from_step(
         source=Source.ai,
         confidence=0.0,  # 占位：resolve 后按 capped_confidence 覆盖
     )
+
+
+def _apply_material_scope(
+    context: _PageContext, requirement_map: RequirementMap
+) -> None:
+    """SQL 模式：校验边界直接取 materials，不受证据包裁剪影响。
+
+    - ui_text：页面节点的 uiText 全量（display 规则按页校验）
+    - chain_nodes：该页全部链路（不经 60k 裁剪）
+    - feature_chains：featureId → 命中链路，供锚点校验
+    """
+    material = context.material
+    page_id = material.page.pageId
+    ui_texts: list[str] = []
+    ui_attr = material.node.attrs.get("uiText")
+    if isinstance(ui_attr, dict):
+        for entry in ui_attr.get("texts") or []:
+            text = entry.get("text") if isinstance(entry, dict) else None
+            if isinstance(text, str) and text.strip() and text not in ui_texts:
+                ui_texts.append(text)
+    context.ui_text = tuple(ui_texts)
+    context.chain_nodes = {
+        chain.id: frozenset(chain.node_ids) for chain in material.chains
+    }
+    context.feature_chains = {
+        feature_id: frozenset(
+            match.chainId for match in (requirement_map.matches or [])
+            if match.featureId == feature_id
+            and match.pageNodeId == page_id
+            and match.chainId is not None
+            and match.chainId in context.chain_nodes
+        )
+        for feature_id in {
+            match.featureId for match in (requirement_map.matches or [])
+            if match.pageNodeId == page_id
+        }
+    }
+
+
+def _scope_maps(
+    materials: Materials,
+) -> tuple[
+    dict[str, tuple[str, ...]],
+    dict[str, tuple[str, ...]],
+    dict[str, str],
+]:
+    """构造 SQL 证据检索的授权映射。
+
+    页面边界与 EvidenceSearch 保持一致：页面节点、元素、接口、链路节点
+    都归属其所在页面；链路节点（handler / api）不在元素清单里，但仍需能按
+    链路检索，因此单独保留 chain_nodes / chain_pages。
+    """
+    page_nodes: dict[str, tuple[str, ...]] = {}
+    chain_nodes: dict[str, tuple[str, ...]] = {}
+    chain_pages: dict[str, str] = {}
+    for material in materials.pages:
+        page_id = material.page.pageId
+        node_ids = [material.node.id]
+        node_ids.extend(source.node.id for source in material.elements)
+        node_ids.extend(material.api_nodes.keys())
+        for chain in material.chains:
+            chain_nodes[chain.id] = tuple(chain.node_ids)
+            chain_pages[chain.id] = page_id
+            node_ids.extend(chain.node_ids)
+        page_nodes[page_id] = tuple(dict.fromkeys(node_ids))
+    return page_nodes, chain_nodes, chain_pages
 
 
 def _feature_pages(

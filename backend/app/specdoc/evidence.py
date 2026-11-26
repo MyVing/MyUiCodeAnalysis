@@ -165,6 +165,71 @@ class EvidencePack:
 
 
 
+def build_skeleton(
+    materials: Materials,
+    feature_pages: dict[str, tuple[str, ...]] | None = None,
+) -> dict[str, Any]:
+    """构造轻量导航骨架：只含定位信息，不含契约数据。
+
+    三个推断章节共用同一份骨架，不再依赖具体检索器（SQL / 内存）实现，
+    避免 EvidenceQuery 与 EvidenceSearch 各出一套结构。
+    """
+    included: set[str] | None = None
+    if feature_pages is not None:
+        included = {
+            page_id
+            for values in feature_pages.values()
+            for page_id in values
+        }
+    pages: list[dict[str, Any]] = []
+    for material in materials.pages:
+        page = material.page
+        if included is not None and page.pageId not in included:
+            continue
+        form_node_ids = sorted(
+            source.node.id
+            for source in material.elements
+            if isinstance(source.node.attrs.get("formField"), dict)
+        )
+        api_facts = [
+            {
+                "nodeId": api_id,
+                "method": api.attrs.get("method"),
+                "url": api.attrs.get("url"),
+            }
+            for api_id, api in sorted(material.api_nodes.items())
+        ]
+        chains = [
+            {
+                "chainId": chain.id,
+                "elementId": chain.element.node_id,
+                "steps": [
+                    {"role": step.role, "name": step.name, "nodeId": step.node_id}
+                    for step in chain.steps
+                ],
+            }
+            for chain in material.chains
+        ]
+        pages.append(
+            {
+                "pageId": page.pageId,
+                "name": page.name,
+                "route": material.route_path,
+                "featureIds": sorted(page.featureIds or []),
+                "counts": {
+                    "elements": len(material.elements),
+                    "forms": len(form_node_ids),
+                    "apiFacts": len(api_facts),
+                    "chains": len(chains),
+                },
+                "forms": [{"nodeId": node_id} for node_id in form_node_ids],
+                "apiFacts": api_facts,
+                "chains": chains,
+            }
+        )
+    return {"pages": pages}
+
+
 def build_evidence_pack(
     materials: Materials,
     events_by_page: dict[str, list[Event]] | None = None,

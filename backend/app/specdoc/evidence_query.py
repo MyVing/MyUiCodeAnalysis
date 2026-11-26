@@ -8,6 +8,14 @@
 EvidenceQuery 实现了 EvidenceSearch 的 execute 接口，
 可以作为 specdoc EvidenceSearch 的零破坏替代：
 EVIDENCE_TOOL schema 不变 → orchestrator 无感替换 → AI 侧行为等价。
+
+证据范围（page / chain / node）由调用方在构造时注入 Authorization 映射：
+- page_nodes:  pageId → 该页面授权的节点 id（页面节点 + 元素 + 接口 + 链路节点）
+- chain_nodes: chainId → 链路节点 id（ActionChain.node_ids）
+- chain_pages: chainId → 所属页面 id
+
+chainId 是 ``f"{element.id}::{node_path}"``（见 requirement.chains），不是节点 id，
+因此不能再拿 chainId 当 node_id 去查节点，必须按注入映射展开。
 """
 
 from __future__ import annotations
@@ -16,7 +24,8 @@ import hashlib
 import json
 from typing import Any
 
-from sqlalchemy import Row, text
+from sqlalchemy import bindparam, text
+from sqlalchemy.exc import SQLAlchemyError
 from sqlalchemy.ext.asyncio import AsyncEngine
 
 from app.specdoc.llm import SpecDocToolError
@@ -25,7 +34,6 @@ from app.specdoc.retrieval import EvidenceFact, EvidenceLedger
 MAX_FACTS_PER_QUERY = 24  # 原来 EvidenceSearch 是 12；SQL 查询更可控，放宽一倍
 MAX_TEXT_CHARS_PER_FACT = 2_000
 MAX_LEDGER_CHARS = 24_000
-
 
 EVIDENCE_TOOL = {
     "type": "function",
@@ -51,6 +59,42 @@ EVIDENCE_TOOL = {
         },
     },
 }
+
+_VALID_CATEGORIES = frozenset(
+    {"chain", "element", "event", "uiText", "form", "apiFact", "all"}
+)
+
+
+async def graph_rows_exist(
+    engine: AsyncEngine,
+    project_id: str,
+    analysis_id: str,
+    graph_kind: str = "static",
+) -> bool:
+    """该版本的行式投影是否存在。
+
+    行表只在保存图时双写，升级前已保存的图没有行数据。空表（或表尚未创建）
+    意味着必须回退 EvidenceSearch，否则所有查询都会 ``evidence_out_of_scope``。
+    """
+    query = text(
+        """
+        SELECT 1 FROM graph_nodes
+        WHERE project_id = :pid AND analysis_id = :aid AND graph_kind = :kind
+        LIMIT 1
+        """
+    )
+    try:
+        async with engine.connect() as conn:
+            row = (
+                await conn.execute(
+                    query,
+                    {"pid": project_id, "aid": analysis_id, "kind": graph_kind},
+                )
+            ).first()
+    except SQLAlchemyError:
+        # schema 未升级（表不存在）也按「无行数据」处理，交给调用方回退
+        return False
+    return row is not None
 
 
 def _digest(page_id: str, node_id: str, chain_id: str | None, category: str, text: str) -> str:
@@ -80,8 +124,8 @@ class EvidenceQuery:
 
     构造时接收 engine + 三元组 (project_id, analysis_id, graph_kind)，
     所有查询都自动带 WHERE project_id=? AND analysis_id=? AND graph_kind=?，
-    不会跨版本漏查或串查。page_id 从组件节点的 attrs_json 里取，
-    与现有 specdoc 链路里 pageId 的语义完全一致。
+    不会跨版本漏查或串查。证据范围由注入的 page_nodes / chain_nodes /
+    chain_pages 决定；未提供映射时退化为按数据库存在性校验（兼容旧调用）。
     """
 
     def __init__(
@@ -91,16 +135,34 @@ class EvidenceQuery:
         analysis_id: str,
         graph_kind: str = "static",
         ledger: EvidenceLedger | None = None,
+        *,
+        page_nodes: dict[str, tuple[str, ...]] | None = None,
+        chain_nodes: dict[str, tuple[str, ...]] | None = None,
+        chain_pages: dict[str, str] | None = None,
     ) -> None:
         self._engine = engine
         self._pid = project_id
         self._aid = analysis_id
         self._kind = graph_kind
         self.ledger = ledger or EvidenceLedger()
+        self._page_nodes = dict(page_nodes or {})
+        self._chain_nodes = dict(chain_nodes or {})
+        self._chain_pages = dict(chain_pages or {})
+        # 节点 → 所属页面：page_nodes 的第一归属优先，用于事实归属与范围校验
+        self._node_page: dict[str, str] = {}
+        for page_id, node_ids in self._page_nodes.items():
+            for node_id in node_ids:
+                self._node_page.setdefault(node_id, page_id)
+        # 未注入任何映射时不限制节点范围（旧调用 / 内存 fixture）
+        self._authorized_nodes: set[str] | None = None
+        if self._page_nodes or self._chain_nodes:
+            authorized: set[str] = set(self._node_page)
+            for node_ids in self._chain_nodes.values():
+                authorized.update(node_ids)
+            self._authorized_nodes = authorized
         # 内存缓存：避免同一次 specdoc 生成里重复执行相同 SQL
         # 存 dict 而非 Row——SQLAlchemy Row 在不同驱动下字符串索引行为不一致
         self._node_cache: dict[str, dict[str, Any]] = {}
-        self._edges_cache: list[dict[str, Any]] | None = None
 
     # ------------------------------------------------------------------
     # 公共查询接口
@@ -119,9 +181,7 @@ class EvidenceQuery:
                 "未知的 specdoc 证据工具", code="unknown_tool"
             )
         category = arguments.get("category")
-        if category not in {
-            "chain", "element", "event", "uiText", "form", "apiFact", "all",
-        }:
+        if category not in _VALID_CATEGORIES:
             raise SpecDocToolError(
                 "证据类别无效", code="invalid_tool_arguments"
             )
@@ -141,18 +201,6 @@ class EvidenceQuery:
             }
         return {"status": "ok", "facts": [f.as_dict() for f in accepted]}
 
-    async def skeleton(
-        self, feature_pages: dict[str, tuple[str, ...]] | None = None
-    ) -> dict[str, Any]:
-        """生成轻量导航骨架：pageId + route + 统计数，不包含契约数据。"""
-        pages = await self._list_page_skeletons()
-        if feature_pages is not None:
-            included = {
-                pid for values in feature_pages.values() for pid in values
-            }
-            pages = [p for p in pages if p.get("pageId") in included]
-        return {"pages": pages}
-
     # ------------------------------------------------------------------
     # 内部实现
     # ------------------------------------------------------------------
@@ -167,7 +215,7 @@ class EvidenceQuery:
     ) -> list[EvidenceFact]:
         """按 category + 可选 pageId/chainId/nodeId 过滤查询事实。"""
         if node_id is not None:
-            return await self._query_node(node_id, category)
+            return await self._query_node(node_id, category, page_id=page_id)
         if chain_id is not None:
             return await self._query_chain(chain_id, category, page_id=page_id)
         if page_id is not None:
@@ -179,56 +227,66 @@ class EvidenceQuery:
         """缓存式按 node_id 精查单节点（返回 dict，兼容所有 SQLAlchemy 驱动）。"""
         if node_id in self._node_cache:
             return self._node_cache[node_id]
-        query = text(
-            """
-            SELECT * FROM graph_nodes
-            WHERE project_id = :pid AND analysis_id = :aid
-              AND graph_kind = :kind AND node_id = :node_id
-            """
-        )
-        async with self._engine.connect() as conn:
-            row = (
-                await conn.execute(
-                    query,
-                    {"pid": self._pid, "aid": self._aid,
-                     "kind": self._kind, "node_id": node_id},
-                )
-            ).first()
-        if row is not None:
-            as_dict = _row_dict(row)
-            self._node_cache[node_id] = as_dict
-            return as_dict
-        return None
+        nodes = await self._get_nodes([node_id])
+        return nodes.get(node_id)
 
-    async def _all_edges(self) -> list[dict[str, Any]]:
-        if self._edges_cache is not None:
-            return self._edges_cache
-        query = text(
-            """
-            SELECT * FROM graph_edges
-            WHERE project_id = :pid AND analysis_id = :aid AND graph_kind = :kind
-            """
-        )
-        async with self._engine.connect() as conn:
-            rows = (
-                await conn.execute(
-                    query, {"pid": self._pid, "aid": self._aid, "kind": self._kind}
-                )
-            ).all()
-        self._edges_cache = [_row_dict(r) for r in rows]
-        return self._edges_cache
+    async def _get_nodes(
+        self, node_ids: list[str]
+    ) -> dict[str, dict[str, Any]]:
+        """批量取节点：一次 SQL 取回未缓存的节点，避免链路查询的 N+1。"""
+        missing = [
+            node_id for node_id in dict.fromkeys(node_ids)
+            if node_id not in self._node_cache
+        ]
+        if missing:
+            query = text(
+                """
+                SELECT * FROM graph_nodes
+                WHERE project_id = :pid AND analysis_id = :aid
+                  AND graph_kind = :kind AND node_id IN :node_ids
+                """
+            ).bindparams(bindparam("node_ids", expanding=True))
+            async with self._engine.connect() as conn:
+                rows = (
+                    await conn.execute(
+                        query,
+                        {"pid": self._pid, "aid": self._aid,
+                         "kind": self._kind, "node_ids": missing},
+                    )
+                ).all()
+            for row in rows:
+                data = _row_dict(row)
+                self._node_cache[data["node_id"]] = data
+        return {
+            node_id: self._node_cache[node_id]
+            for node_id in node_ids if node_id in self._node_cache
+        }
+
+    def _check_node_scope(self, node_id: str) -> None:
+        if self._authorized_nodes is not None and node_id not in self._authorized_nodes:
+            raise SpecDocToolError(
+                "节点不在本次证据范围内", code="evidence_out_of_scope"
+            )
 
     # -- 按 node_id 查询 ------------------------------------------------
 
     async def _query_node(
-        self, node_id: str, category: str
+        self, node_id: str, category: str, *, page_id: str | None = None
     ) -> list[EvidenceFact]:
+        self._check_node_scope(node_id)
+        # 与 EvidenceSearch 的 pageId AND nodeId 过滤对齐：节点必须属于该页面
+        if page_id is not None and self._authorized_nodes is not None:
+            allowed = self._page_nodes.get(page_id)
+            if allowed is None or node_id not in allowed:
+                return []
         node = await self._get_node(node_id)
         if node is None:
             raise SpecDocToolError(
                 "节点不在本次证据范围内", code="evidence_out_of_scope"
             )
-        return self._node_to_facts(node, page_id=None, chain_id=None)
+        page_id = self._node_page.get(node_id) or self._page_id_from_node(node)
+        facts = self._node_to_facts(node, page_id=page_id, chain_id=None)
+        return self._filter_by_category(facts, category)
 
     # -- 按 chain_id 查询 -----------------------------------------------
 
@@ -239,45 +297,28 @@ class EvidenceQuery:
         *,
         page_id: str | None = None,
     ) -> list[EvidenceFact]:
-        """chain_id 在现有 IR 里是 element 节点的 node_id（链路起点）。
+        """按注入的 chain_nodes 映射展开链路节点。
 
-        沿边表 BFS：从起点沿 renders/calls/requests 等有向边走，
-        收集所有可达节点，再按 category 过滤生成事实。
+        chainId 不是节点 id（见模块 docstring），不能直接查节点；
+        缺失映射即视为越界，避免把任意 id 当成链路的起点。
         """
-        start = await self._get_node(chain_id)
-        if start is None:
+        node_ids = self._chain_nodes.get(chain_id)
+        if node_ids is None:
             raise SpecDocToolError(
                 "链路不在本次证据范围内", code="evidence_out_of_scope"
             )
+        chain_page = self._chain_pages.get(chain_id)
+        if page_id is not None and chain_page is not None and page_id != chain_page:
+            return []
 
-        # BFS 沿边
-        edges = await self._all_edges()
-        outgoing: dict[str, list[dict[str, Any]]] = {}
-        for e in edges:
-            outgoing.setdefault(e["from_node"], []).append(e)
-
-        visited: set[str] = set()
-        queue = [chain_id]
-        chain_node_ids: list[str] = []
-        while queue:
-            current = queue.pop(0)
-            if current in visited:
-                continue
-            visited.add(current)
-            chain_node_ids.append(current)
-            for edge in outgoing.get(current, []):
-                if edge["to_node"] not in visited:
-                    queue.append(edge["to_node"])
-
-        # 逐个节点展开事实
-        page_id_guess = page_id or self._page_id_from_node(start)
+        nodes = await self._get_nodes(list(node_ids))
         facts: list[EvidenceFact] = []
-        for nid in chain_node_ids:
-            node = await self._get_node(nid)
+        for node_id in node_ids:
+            node = nodes.get(node_id)
             if node is not None:
                 facts.extend(
                     self._node_to_facts(
-                        node, page_id=page_id_guess, chain_id=chain_id
+                        node, page_id=chain_page, chain_id=chain_id
                     )
                 )
         return self._filter_by_category(facts, category)
@@ -287,107 +328,59 @@ class EvidenceQuery:
     async def _query_page(
         self, page_id: str, category: str
     ) -> list[EvidenceFact]:
-        """page_id 在现有 IR 里是 component 节点的 node_id 或
-        attrs_json->'$.pageId' 字段。后者更通用，但前者是事实起点。
-
-        先查 component+pageId 节点本身（拿到 uiText、forms），
-        再查所有与该 component 相连的下游节点（elements、events、apis）。
-        """
-        # 1. 拿到 component 页面节点本身
-        page_node = await self._get_node(page_id)
+        """按注入的 page_nodes 精确取该页面授权的节点，杜绝跨页错误归属。"""
+        node_ids = self._page_nodes.get(page_id)
+        if node_ids is None:
+            raise SpecDocToolError(
+                "页面不在本次证据范围内", code="evidence_out_of_scope"
+            )
+        nodes = await self._get_nodes(list(node_ids))
         facts: list[EvidenceFact] = []
-        if page_node is not None:
-            facts.extend(
-                self._node_to_facts(page_node, page_id=page_id, chain_id=None)
-            )
-
-        # 2. 拿到所有与该 component 相关联的节点：
-        #    下游（被 renders 边指向）+ 上游（renders 边来自 component 的）
-        query = text(
-            """
-            SELECT DISTINCT n.* FROM graph_nodes n
-            JOIN graph_edges e
-              ON e.from_node = n.node_id OR e.to_node = n.node_id
-            WHERE n.project_id = :pid AND n.analysis_id = :aid
-              AND n.graph_kind = :kind
-              AND (e.from_node = :page_id OR e.to_node = :page_id)
-              AND n.node_id != :page_id
-            """
-        )
-        async with self._engine.connect() as conn:
-            rows = (
-                await conn.execute(
-                    query,
-                    {"pid": self._pid, "aid": self._aid,
-                     "kind": self._kind, "page_id": page_id},
+        for node_id in node_ids:
+            node = nodes.get(node_id)
+            if node is not None:
+                facts.extend(
+                    self._node_to_facts(node, page_id=page_id, chain_id=None)
                 )
-            ).all()
-        for row in rows:
-            facts.extend(
-                self._node_to_facts(_row_dict(row), page_id=page_id, chain_id=None)
-            )
         return self._filter_by_category(facts, category)
 
     # -- 全量查询 --------------------------------------------------------
 
     async def _query_all(self, category: str) -> list[EvidenceFact]:
-        """不指定 pageId/chainId/nodeId 的兜底查询：只返回前 MAX_FACTS_PER_QUERY 条。
+        """不指定 pageId/chainId/nodeId 的兜底查询。
 
-        这种模式应该尽量避免——优先让 AI 提供 pageId 或 chainId。
+        有授权映射时只查授权节点；没有时退化为前 500 个节点。
+        这种模式应尽量避免——优先让 AI 提供 pageId 或 chainId。
         """
-        query = text(
-            """
-            SELECT * FROM graph_nodes
-            WHERE project_id = :pid AND analysis_id = :aid AND graph_kind = :kind
-            LIMIT 500
-            """
-        )
-        async with self._engine.connect() as conn:
-            rows = (
-                await conn.execute(
-                    query, {"pid": self._pid, "aid": self._aid, "kind": self._kind}
-                )
-            ).all()
+        if self._authorized_nodes is not None:
+            node_ids = sorted(self._authorized_nodes)
+        else:
+            query = text(
+                """
+                SELECT node_id FROM graph_nodes
+                WHERE project_id = :pid AND analysis_id = :aid AND graph_kind = :kind
+                ORDER BY node_id
+                LIMIT 500
+                """
+            )
+            async with self._engine.connect() as conn:
+                rows = (
+                    await conn.execute(
+                        query,
+                        {"pid": self._pid, "aid": self._aid, "kind": self._kind},
+                    )
+                ).all()
+            node_ids = [str(_row_dict(row)["node_id"]) for row in rows]
+
+        nodes = await self._get_nodes(node_ids)
         facts: list[EvidenceFact] = []
-        for row in rows:
-            rdict = _row_dict(row)
-            pid = self._page_id_from_node(rdict)
-            facts.extend(self._node_to_facts(rdict, page_id=pid, chain_id=None))
+        for node_id in node_ids:
+            node = nodes.get(node_id)
+            if node is None:
+                continue
+            pid = self._node_page.get(node_id) or self._page_id_from_node(node)
+            facts.extend(self._node_to_facts(node, page_id=pid, chain_id=None))
         return self._filter_by_category(facts, category)
-
-    # -- 骨架生成 --------------------------------------------------------
-
-    async def _list_page_skeletons(self) -> list[dict[str, Any]]:
-        """列出 component 节点作为页面导航骨架。
-
-        不在 SQL 里做 JSON_EXTRACT：attrs_json 的 JSON 解析交给 Python 层，
-        让查询对 MySQL / SQLite 等后端完全数据库无关。
-        """
-        query = text(
-            """
-            SELECT node_id, name, attrs_json
-            FROM graph_nodes
-            WHERE project_id = :pid AND analysis_id = :aid
-              AND graph_kind = :kind AND kind = 'component'
-            """
-        )
-        async with self._engine.connect() as conn:
-            rows = (
-                await conn.execute(
-                    query, {"pid": self._pid, "aid": self._aid, "kind": self._kind}
-                )
-            ).all()
-
-        skeletons: list[dict[str, Any]] = []
-        for row in rows:
-            r = _row_dict(row)
-            attrs = self._parse_attrs(r["attrs_json"])
-            skeletons.append({
-                "pageId": attrs.get("pageId") or r["node_id"],
-                "name": r["name"],
-                "route": attrs.get("route"),
-            })
-        return skeletons
 
     # ------------------------------------------------------------------
     # 事实展开工具
@@ -400,96 +393,100 @@ class EvidenceQuery:
         page_id: str | None,
         chain_id: str | None,
     ) -> list[EvidenceFact]:
-        """根据节点 kind + attrs_json 展开多类事实，对应原来
-        EvidenceSearch 里 flatten pages 字典的逻辑。"""
+        """按 EvidenceSearch 的事实口径展开节点。
+
+        - component / server-component：只出 uiText（页面级文案）
+        - element：viewText + formField.quote（element 与 form 两类）
+          + columns.title + events[].handler（锚元素节点，event 类）
+        - fn：不产自然事实；链路场景用节点名作为一步文本
+        - api：method / url / 「METHOD url」/ requestBody JSON 与递归 key/value
+
+        链路查询（chain_id 非空）下所有文本统一标为 category="chain"，
+        与 EvidenceSearch 的 chain 事实保持同一口径。
+        """
         kind = node["kind"]
         node_id = node["node_id"]
         attrs = self._parse_attrs(node["attrs_json"])
         pid = page_id or self._page_id_from_node(node)
         file = node["file"]
         line = node["line"]
+        chain_mode = chain_id is not None
         facts: list[EvidenceFact] = []
 
-        # -- component（页面自身）---- uiText 全放在 component 节点的 attrs 里
-        if kind == "component":
-            ui_texts = self._safe_get(attrs, "uiText", "texts") or []
-            for t in ui_texts:
-                text_val = t.get("text") if isinstance(t, dict) else None
-                if text_val:
-                    facts.append(self._mk(
-                        pid, node_id, "uiText", text_val,
-                        chain_id=chain_id, file=file, line=line,
-                    ))
-            # form 字段
-            for form in self._safe_get(attrs, "forms") or []:
-                field_info = self._safe_get(form, "frontField")
-                if isinstance(field_info, dict) and field_info.get("quote"):
-                    facts.append(self._mk(
-                        pid, node_id, "form", field_info["quote"],
-                        chain_id=chain_id, file=file, line=line,
-                    ))
+        def add(category: str, value: Any) -> None:
+            if not isinstance(value, str):
+                return
+            fact = self._mk(
+                pid, node_id, "chain" if chain_mode else category, value,
+                chain_id=chain_id, file=file, line=line,
+            )
+            if fact is not None:
+                facts.append(fact)
 
-        # -- element ------ viewText / formField.quote / columns.title
+        if kind in ("component", "server-component"):
+            texts = self._safe_get(attrs, "uiText", "texts")
+            if isinstance(texts, list):
+                for entry in texts:
+                    if isinstance(entry, dict):
+                        add("uiText", entry.get("text"))
+
         elif kind == "element":
-            for key in ("viewText", "name"):
-                val = attrs.get(key)
-                if isinstance(val, str) and val.strip():
-                    facts.append(self._mk(
-                        pid, node_id, "element", val.strip(),
-                        chain_id=chain_id, file=file, line=line,
-                    ))
+            add("element", attrs.get("viewText"))
             field = attrs.get("formField")
-            if isinstance(field, dict) and field.get("quote"):
-                facts.append(self._mk(
-                    pid, node_id, "element", field["quote"],
-                    chain_id=chain_id, file=file, line=line,
-                ))
-            for col in self._safe_get(attrs, "columns") or []:
-                if isinstance(col, dict) and col.get("title"):
-                    facts.append(self._mk(
-                        pid, node_id, "element", col["title"],
-                        chain_id=chain_id, file=file, line=line,
-                    ))
+            if isinstance(field, dict):
+                add("element", field.get("quote"))
+                add("form", field.get("quote"))
+            columns = attrs.get("columns")
+            if isinstance(columns, list):
+                for column in columns:
+                    if isinstance(column, dict):
+                        add("element", column.get("title"))
+            events = attrs.get("events")
+            if isinstance(events, list):
+                for binding in events:
+                    if not isinstance(binding, dict):
+                        continue
+                    # 生产链路传入 events_by_page，事件事实的文本是 handler 名
+                    # （Event.handler.name）；与 EvidenceSearch 保持一致。
+                    handler_name = binding.get("handlerName")
+                    add("event", handler_name)
 
-        # -- fn（事件 handler）------ name 即 handler 名
         elif kind == "fn":
-            handler = node["name"]
-            if handler:
-                facts.append(self._mk(
-                    pid, node_id, "event", handler,
-                    chain_id=chain_id, file=file, line=line,
-                ))
+            if chain_mode:
+                add("chain", node["name"])
 
-        # -- api ------ method / url / requestBody
         elif kind == "api":
             method = attrs.get("method")
             url = attrs.get("url")
-            if method and url:
-                combined = f"{method} {url}"
-                facts.append(self._mk(
-                    pid, node_id, "apiFact", method,
-                    chain_id=chain_id, file=file, line=line,
-                ))
-                facts.append(self._mk(
-                    pid, node_id, "apiFact", url,
-                    chain_id=chain_id, file=file, line=line,
-                ))
-                facts.append(self._mk(
-                    pid, node_id, "apiFact", combined,
-                    chain_id=chain_id, file=file, line=line,
-                ))
+            add("apiFact", method)
+            add("apiFact", url)
+            if isinstance(method, str) and isinstance(url, str):
+                add("apiFact", f"{method} {url}")
             body = attrs.get("requestBody")
             if isinstance(body, (dict, list)):
-                compact = json.dumps(
-                    body, ensure_ascii=False, sort_keys=True,
-                    separators=(",", ":"),
+                add(
+                    "apiFact",
+                    json.dumps(
+                        body, ensure_ascii=False, sort_keys=True,
+                        separators=(",", ":"),
+                    ),
                 )
-                facts.append(self._mk(
-                    pid, node_id, "apiFact", compact,
-                    chain_id=chain_id, file=file, line=line,
-                ))
+                self._add_body_texts(add, body)
 
         return facts
+
+    @staticmethod
+    def _add_body_texts(add: Any, value: Any) -> None:
+        """递归展开 requestBody：key 与字符串值都作为 apiFact 事实。"""
+        if isinstance(value, dict):
+            for key, nested in value.items():
+                add("apiFact", key)
+                EvidenceQuery._add_body_texts(add, nested)
+        elif isinstance(value, list):
+            for nested in value:
+                EvidenceQuery._add_body_texts(add, nested)
+        else:
+            add("apiFact", value)
 
     def _mk(
         self,
@@ -515,16 +512,17 @@ class EvidenceQuery:
             category=category,
             text=text,
             chain_id=chain_id,
-            file=file,
-            line=line,
+            file=file if isinstance(file, str) else None,
+            line=line if isinstance(line, int) else None,
         )
 
     def _filter_by_category(
         self, facts: list[EvidenceFact], category: str
     ) -> list[EvidenceFact]:
-        if category == "all":
-            return [f for f in facts if f is not None]  # 过滤 _mk 里的 None
-        return [f for f in facts if f.category == category]
+        return [
+            fact for fact in facts
+            if fact is not None and (category == "all" or fact.category == category)
+        ]
 
     @staticmethod
     def _parse_attrs(attrs_json: Any) -> dict[str, Any]:

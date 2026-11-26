@@ -15,6 +15,8 @@ import logging
 from collections import Counter, defaultdict
 from datetime import UTC, datetime
 
+from sqlalchemy.ext.asyncio import AsyncEngine
+
 from app.contracts import IRGraph, RequirementMap
 from app.contracts.requirement import Dropped as RequirementDropped
 from app.contracts.requirement import RequirementWarning, Severity
