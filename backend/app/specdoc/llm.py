@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import logging
 from collections.abc import Awaitable, Callable
 from typing import Any
 
@@ -11,6 +12,8 @@ import httpx
 
 from app.core.config import Settings
 from app.requirement.llm import LLMCallError
+
+logger = logging.getLogger(__name__)
 
 ToolExecutor = Callable[[str, dict[str, Any]], Awaitable[dict[str, Any]]]
 
@@ -32,6 +35,9 @@ class OpenAICompatibleToolLLM:
         self._response_format = settings.llm_response_format
         self._client: httpx.AsyncClient | None = None
         self._loop: asyncio.AbstractEventLoop | None = None
+        # 工具循环内的单次请求重试：只针对可重试的传输层错误（超时 / 429 / 5xx）
+        self._tool_retry_attempts = 3
+        self._tool_retry_backoff = 0.5
 
     def _http(self) -> httpx.AsyncClient:
         loop = asyncio.get_running_loop()
@@ -80,6 +86,26 @@ class OpenAICompatibleToolLLM:
             payload["response_format"] = {"type": "json_object"}
         return payload
 
+    async def _request_with_retry(self, payload: dict[str, Any]) -> dict[str, Any]:
+        """工具循环内的请求重试。
+
+        只重试可重试的传输层错误（超时 / 429 / 5xx / 网络），因为此时对话状态
+        尚未推进，重发同一 payload 是安全的；协议类错误（工具参数非法、未知工具）
+        在 temperature=0 下重发不会有不同结果，直接上抛。
+        """
+        attempts = max(1, self._tool_retry_attempts)
+        for attempt in range(1, attempts + 1):
+            try:
+                return await self._request(payload)
+            except SpecDocToolError as error:
+                if not error.retryable or attempt >= attempts:
+                    raise
+                logger.warning(
+                    "specdoc 工具请求失败，第 %d/%d 次重试：%s", attempt, attempts, error
+                )
+                await asyncio.sleep(self._tool_retry_backoff * attempt)
+        raise AssertionError("unreachable")
+
     async def chat(self, system: str, user: str) -> str:
         return await self.chat_messages(system, [{"role": "user", "content": user}])
 
@@ -114,7 +140,7 @@ class OpenAICompatibleToolLLM:
         payload["tool_choice"] = "auto"
         used_calls = 0
         while True:
-            message = await self._request(payload)
+            message = await self._request_with_retry(payload)
             calls = message.get("tool_calls")
             if calls is None:
                 content = message.get("content")

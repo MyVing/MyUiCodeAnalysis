@@ -29,7 +29,7 @@ from sqlalchemy.exc import SQLAlchemyError
 from sqlalchemy.ext.asyncio import AsyncEngine
 
 from app.specdoc.llm import SpecDocToolError
-from app.specdoc.retrieval import EvidenceFact, EvidenceLedger
+from app.specdoc.retrieval import EvidenceFact, EvidenceLedger, QueryCache
 
 MAX_FACTS_PER_QUERY = 24  # 原来 EvidenceSearch 是 12；SQL 查询更可控，放宽一倍
 MAX_TEXT_CHARS_PER_FACT = 2_000
@@ -139,12 +139,15 @@ class EvidenceQuery:
         page_nodes: dict[str, tuple[str, ...]] | None = None,
         chain_nodes: dict[str, tuple[str, ...]] | None = None,
         chain_pages: dict[str, str] | None = None,
+        query_cache: QueryCache | None = None,
     ) -> None:
         self._engine = engine
         self._pid = project_id
         self._aid = analysis_id
         self._kind = graph_kind
         self.ledger = ledger or EvidenceLedger()
+        # 由调用方注入以跨章节复用查询结果；缺省时退化为实例内缓存
+        self._query_cache: QueryCache = query_cache if query_cache is not None else {}
         self._page_nodes = dict(page_nodes or {})
         self._chain_nodes = dict(chain_nodes or {})
         self._chain_pages = dict(chain_pages or {})
@@ -213,7 +216,25 @@ class EvidenceQuery:
         node_id: str | None,
         category: str,
     ) -> list[EvidenceFact]:
-        """按 category + 可选 pageId/chainId/nodeId 过滤查询事实。"""
+        """按 category + 可选 pageId/chainId/nodeId 过滤查询事实（带跨章节缓存）。"""
+        key = (page_id, chain_id, node_id, category)
+        cached = self._query_cache.get(key)
+        if cached is not None:
+            return cached
+        facts = await self._query_uncached(
+            page_id=page_id, chain_id=chain_id, node_id=node_id, category=category
+        )
+        self._query_cache[key] = facts
+        return facts
+
+    async def _query_uncached(
+        self,
+        *,
+        page_id: str | None,
+        chain_id: str | None,
+        node_id: str | None,
+        category: str,
+    ) -> list[EvidenceFact]:
         if node_id is not None:
             return await self._query_node(node_id, category, page_id=page_id)
         if chain_id is not None:

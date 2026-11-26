@@ -60,6 +60,11 @@ class EvidenceFact:
         }
 
 
+# 跨章节共享的查询结果缓存：键 = (pageId, chainId, nodeId, category)。
+# 三个章节各自持有独立 ledger（预算独立），但同一批事实无需重复检索/SQL。
+QueryCache = dict[tuple[str | None, str | None, str | None, str], list[EvidenceFact]]
+
+
 @dataclass
 class EvidenceLedger:
     """Only facts actually returned to the model are eligible for validation."""
@@ -97,10 +102,14 @@ class EvidenceSearch:
         pages: tuple[dict[str, Any], ...],
         ledger: EvidenceLedger,
         allowed_page_ids: set[str] | None = None,
+        *,
+        query_cache: QueryCache | None = None,
     ) -> None:
         self._facts: list[EvidenceFact] = []
         self._pages: dict[str, dict[str, Any]] = {}
         self.ledger = ledger
+        # 由调用方注入以跨章节复用；缺省时退化为实例内缓存
+        self._query_cache: QueryCache = query_cache if query_cache is not None else {}
         for page in pages:
             page_id = page.get("pageId")
             if not isinstance(page_id, str):
@@ -264,13 +273,16 @@ class EvidenceSearch:
             raise SpecDocToolError("节点不在本次证据范围内", code="evidence_out_of_scope")
         if chain_id is not None and not any(fact.chain_id == chain_id for fact in self._facts):
             raise SpecDocToolError("链路不在本次证据范围内", code="evidence_out_of_scope")
-        facts = [
-            fact for fact in self._facts
-            if (page_id is None or fact.page_id == page_id)
-            and (chain_id is None or fact.chain_id == chain_id)
-            and (node_id is None or fact.node_id == node_id)
-            and (category == "all" or fact.category == category)
-        ]
+        facts = self._query_cache.get((page_id, chain_id, node_id, category))
+        if facts is None:
+            facts = [
+                fact for fact in self._facts
+                if (page_id is None or fact.page_id == page_id)
+                and (chain_id is None or fact.chain_id == chain_id)
+                and (node_id is None or fact.node_id == node_id)
+                and (category == "all" or fact.category == category)
+            ]
+            self._query_cache[(page_id, chain_id, node_id, category)] = facts
         if chain_id is not None and not any(fact.chain_id == chain_id for fact in self._facts):
             raise SpecDocToolError("链路不在本次证据范围内", code="evidence_out_of_scope")
         matched = facts[:MAX_FACTS_PER_QUERY]

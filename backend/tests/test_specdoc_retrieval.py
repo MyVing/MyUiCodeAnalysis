@@ -67,6 +67,32 @@ async def test_search_budget_is_explicit() -> None:
     assert result["facts"] == []
 
 
+async def test_search_shares_query_cache_across_sections() -> None:
+    """三章各自独立 ledger，但同一查询只检索一次（跨章节共享缓存）。"""
+    cache: dict = {}
+    first = EvidenceSearch(_pages(), EvidenceLedger(), query_cache=cache)
+    second = EvidenceSearch(_pages(), EvidenceLedger(), query_cache=cache)
+    arguments = {"pageId": "page-1", "category": "uiText"}
+
+    first_result = await first.execute("search_evidence", arguments)
+    second_result = await second.execute("search_evidence", arguments)
+
+    key = ("page-1", None, None, "uiText")
+    assert list(cache) == [key]
+    assert [item["evidenceId"] for item in second_result["facts"]] == [
+        item["evidenceId"] for item in first_result["facts"]
+    ]
+    # 缓存只共享检索结果，不共享预算：第二个 ledger 仍单独记账
+    assert len(second.ledger.facts) == len(second_result["facts"]) > 0
+
+
+async def test_search_without_injected_cache_keeps_results_isolated() -> None:
+    first = EvidenceSearch(_pages(), EvidenceLedger())
+    second = EvidenceSearch(_pages(), EvidenceLedger())
+    await first.execute("search_evidence", {"pageId": "page-1", "category": "uiText"})
+    assert second._query_cache == {}
+
+
 async def test_forms_and_api_facts_have_separate_search_categories() -> None:
     page = dict(_pages()[0])
     page["forms"] = [{"nodeId": "button-1", "frontField": {"quote": "付款账户"}}]

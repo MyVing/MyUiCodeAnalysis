@@ -476,6 +476,101 @@ async def test_ledger_records_returned_facts_without_duplicates(spec_query):
     assert len(query.ledger.facts) == first
 
 
+async def test_query_cache_shared_across_sections_avoids_repeated_sql(
+    sqlite_engine, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """三章共享查询缓存：相同参数只落一次库，ledger 仍各自独立。"""
+    graph_ = spec_graph("an_cache")
+    requirement_map = spec_requirement_map(graph_)
+    materials = collect_materials(requirement_map, graph_)
+    project_id, analysis_id = await _seed(
+        sqlite_engine, graph_, analysis_id="an_cache"
+    )
+    page_nodes, chain_nodes, chain_pages = _scope_maps(materials)
+    cache: dict = {}
+    scope = {
+        "graph_kind": "static",
+        "page_nodes": page_nodes,
+        "chain_nodes": chain_nodes,
+        "chain_pages": chain_pages,
+        "query_cache": cache,
+    }
+    first = EvidenceQuery(
+        sqlite_engine, project_id, analysis_id, ledger=EvidenceLedger(), **scope
+    )
+    second = EvidenceQuery(
+        sqlite_engine, project_id, analysis_id, ledger=EvidenceLedger(), **scope
+    )
+
+    calls = 0
+    original = EvidenceQuery._query_uncached
+
+    async def counting(self, **kwargs):
+        nonlocal calls
+        calls += 1
+        return await original(self, **kwargs)
+
+    monkeypatch.setattr(EvidenceQuery, "_query_uncached", counting)
+    arguments = {"pageId": PAGE_ID, "category": "uiText"}
+    first_result = await first.execute("search_evidence", arguments)
+    second_result = await second.execute("search_evidence", arguments)
+
+    assert calls == 1
+    assert list(cache) == [(PAGE_ID, None, None, "uiText")]
+    assert [item["evidenceId"] for item in second_result["facts"]] == [
+        item["evidenceId"] for item in first_result["facts"]
+    ]
+    assert len(second.ledger.facts) == len(second_result["facts"]) > 0
+
+
+class _RepeatQueryToolLLM:
+    """三章都执行同一链路检索：用于验证跨章节查询缓存。"""
+
+    def __init__(self, chain_id: str) -> None:
+        self._chain_id = chain_id
+
+    async def chat_with_tools(self, system, user, *, tools, executor, max_tool_calls):
+        await executor(
+            "search_evidence", {"chainId": self._chain_id, "category": "chain"}
+        )
+        if "操作步骤" in system:
+            return json.dumps({"steps": []})
+        if "业务规则" in system:
+            return json.dumps({"rules": []})
+        return json.dumps({"fieldMappings": []})
+
+
+async def test_infer_sections_reuses_query_cache_across_sections(
+    sqlite_engine, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """三章各自检索同一链路时，底层查询只执行一次。"""
+    graph_ = spec_graph("an_shared")
+    requirement_map = spec_requirement_map(graph_)
+    materials = collect_materials(requirement_map, graph_)
+    project_id, analysis_id = await _seed(
+        sqlite_engine, graph_, analysis_id="an_shared"
+    )
+    chain = _button_chain(materials)
+
+    calls = 0
+    original = EvidenceQuery._query_uncached
+
+    async def counting(self, **kwargs):
+        nonlocal calls
+        calls += 1
+        return await original(self, **kwargs)
+
+    monkeypatch.setattr(EvidenceQuery, "_query_uncached", counting)
+    await infer_sections(
+        requirement_map.requirement, requirement_map, materials,
+        _RepeatQueryToolLLM(chain.id), max_calls=1,
+        engine=sqlite_engine, project_id=project_id, analysis_id=analysis_id,
+    )
+
+    # 步骤 / 规则 / 映射三章各查一次同一链路，共享缓存后只落库一次
+    assert calls == 1
+
+
 async def test_query_all_is_bounded(sqlite_engine):
     graph_ = user_graph("an_bound")
     project_id, analysis_id = await _seed(

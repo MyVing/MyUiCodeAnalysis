@@ -110,3 +110,77 @@ def test_specdoc_factory_is_independent_and_honors_readiness() -> None:
     settings = Settings(_env_file=None, llm_enabled=True, llm_api_key="test")
     assert isinstance(build_specdoc_llm_client(settings), OpenAICompatibleToolLLM)
     assert build_specdoc_llm_client(Settings(_env_file=None, llm_enabled=False)) is None
+
+
+async def test_tool_loop_retries_retryable_request_errors(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """超时 / 429 / 5xx 属于可重试错误：重发同一 payload，不消耗对话进度。"""
+    client = OpenAICompatibleToolLLM(
+        Settings(_env_file=None, llm_enabled=True, llm_api_key="test")
+    )
+    client._tool_retry_backoff = 0
+    attempts = 0
+
+    async def request(payload):
+        nonlocal attempts
+        attempts += 1
+        if attempts < 3:
+            raise SpecDocToolError("specdoc 模型返回 HTTP 429", retryable=True)
+        return {"content": '{"steps": []}'}
+
+    monkeypatch.setattr(client, "_request", request)
+
+    result = await client.chat_with_tools(
+        "system", "user", tools=[], executor=lambda *_: None  # type: ignore[arg-type]
+    )
+
+    assert result == '{"steps": []}'
+    assert attempts == 3
+
+
+async def test_tool_loop_does_not_retry_non_retryable_errors(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    client = OpenAICompatibleToolLLM(
+        Settings(_env_file=None, llm_enabled=True, llm_api_key="test")
+    )
+    client._tool_retry_backoff = 0
+    attempts = 0
+
+    async def request(payload):
+        nonlocal attempts
+        attempts += 1
+        raise SpecDocToolError("specdoc 模型返回 HTTP 401", retryable=False)
+
+    monkeypatch.setattr(client, "_request", request)
+
+    with pytest.raises(SpecDocToolError):
+        await client.chat_with_tools(
+            "system", "user", tools=[], executor=lambda *_: None  # type: ignore[arg-type]
+        )
+    assert attempts == 1
+
+
+async def test_tool_loop_gives_up_after_retries_exhausted(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    client = OpenAICompatibleToolLLM(
+        Settings(_env_file=None, llm_enabled=True, llm_api_key="test")
+    )
+    client._tool_retry_backoff = 0
+    client._tool_retry_attempts = 2
+    attempts = 0
+
+    async def request(payload):
+        nonlocal attempts
+        attempts += 1
+        raise SpecDocToolError("specdoc 模型请求超时", retryable=True)
+
+    monkeypatch.setattr(client, "_request", request)
+
+    with pytest.raises(SpecDocToolError):
+        await client.chat_with_tools(
+            "system", "user", tools=[], executor=lambda *_: None  # type: ignore[arg-type]
+        )
+    assert attempts == 2

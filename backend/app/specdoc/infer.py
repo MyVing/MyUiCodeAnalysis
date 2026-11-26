@@ -46,7 +46,7 @@ from app.specdoc.collect import Materials, PageMaterial
 from app.specdoc.evidence import build_evidence_pack, build_skeleton
 from app.specdoc.evidence_query import EvidenceQuery, graph_rows_exist
 from app.specdoc.llm import OpenAICompatibleToolLLM
-from app.specdoc.retrieval import EVIDENCE_TOOL, EvidenceLedger, EvidenceSearch
+from app.specdoc.retrieval import EVIDENCE_TOOL, EvidenceLedger, EvidenceSearch, QueryCache
 
 logger = logging.getLogger(__name__)
 
@@ -255,6 +255,9 @@ async def infer_sections(
     )
     features = list(requirement_map.features)
     ledger = EvidenceLedger()
+    # 三章共享同一份查询结果缓存：ledger 与预算仍各自独立，
+    # 但同一页面/链路/类别的事实只检索一次（SQL 只查一遍）。
+    query_cache: QueryCache = {}
 
     def _build_search(ledger_arg: EvidenceLedger, allowed_page_ids: set[str]):
         """有 engine 时走 EvidenceQuery（SQL 层），否则 fallback EvidenceSearch。"""
@@ -268,8 +271,11 @@ async def infer_sections(
                 page_nodes=page_nodes,
                 chain_nodes=chain_nodes,
                 chain_pages=chain_pages,
+                query_cache=query_cache,
             )
-        return EvidenceSearch(exposed_pages, ledger_arg, allowed_page_ids)
+        return EvidenceSearch(
+            exposed_pages, ledger_arg, allowed_page_ids, query_cache=query_cache
+        )
 
     search = _build_search(
         ledger, {pid for pids in feature_pages.values() for pid in pids}
