@@ -168,12 +168,17 @@ class EvidencePack:
 def build_skeleton(
     materials: Materials,
     feature_pages: dict[str, tuple[str, ...]] | None = None,
-    matched_chain_ids: set[str] | None = None,
+    chain_ids_by_page: dict[str, frozenset[str]] | None = None,
 ) -> dict[str, Any]:
     """构造轻量导航骨架：只含定位信息，不含契约数据。
 
     三个推断章节共用同一份骨架，不再依赖具体检索器（SQL / 内存）实现，
     避免 EvidenceQuery 与 EvidenceSearch 各出一套结构。
+
+    ``chain_ids_by_page`` 使用 collect 已按页面校验过的「命中链路」做裁剪；
+    某页命中集合为空时回退展示该页全部链路——页面级规则（无 featureId）
+    仍依赖链路导航，不能因为需求只定位到页面就把结构证据全部藏掉。
+    传 ``None`` 表示不做裁剪（兼容不需要需求范围的调用）。
     """
     included: set[str] | None = None
     if feature_pages is not None:
@@ -200,6 +205,11 @@ def build_skeleton(
             }
             for api_id, api in sorted(material.api_nodes.items())
         ]
+        matched = (
+            chain_ids_by_page.get(page.pageId)
+            if chain_ids_by_page is not None
+            else None
+        )
         chains = [
             {
                 "chainId": chain.id,
@@ -210,7 +220,7 @@ def build_skeleton(
                 ],
             }
             for chain in material.chains
-            if matched_chain_ids is None or chain.id in matched_chain_ids
+            if matched is None or not matched or chain.id in matched
         ]
         pages.append(
             {

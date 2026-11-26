@@ -243,16 +243,14 @@ async def infer_sections(
     pack_warnings = evidence_pack.prompt_warnings if evidence_pack is not None else ()
     feature_pages = _feature_pages(requirement_map, contexts)
     page_nodes, chain_nodes, chain_pages = _scope_maps(materials)
-    matched_chain_ids = {
-        match.chainId
-        for match in (requirement_map.matches or [])
-        if match.chainId is not None
-        and match.pageNodeId in {
-            page_id for page_ids in feature_pages.values() for page_id in page_ids
-        }
+    # 直接复用 collect 已按页面校验过的命中链路，避免从 matches 重算时
+    # 把旧图上已失效的 chainId 带进来（会让该页骨架的链路被误删干净）。
+    chain_ids_by_page = {
+        material.page.pageId: material.matched_chain_ids
+        for material in materials.pages
     }
     skeleton_json = json.dumps(
-        build_skeleton(materials, feature_pages, matched_chain_ids),
+        build_skeleton(materials, feature_pages, chain_ids_by_page),
         ensure_ascii=False,
     )
     features = list(requirement_map.features)

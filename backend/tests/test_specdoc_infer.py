@@ -182,6 +182,10 @@ def _multi_page_inputs():
 
 async def test_tool_prompt_contains_only_requirement_matched_chains() -> None:
     requirement_map, materials, _, _, _ = _multi_page_inputs()
+    # 模拟需求产物里残留旧图链路：骨架应只认 collect 校验过的每页命中集合
+    requirement_map.matches.append(
+        requirement_map.matches[-1].model_copy(update={"chainId": "stale::chain"})
+    )
     captured_users: list[str] = []
 
     class ToolFake:
@@ -205,21 +209,18 @@ async def test_tool_prompt_contains_only_requirement_matched_chains() -> None:
         json.loads(user.split("页面与链路骨架：\n", 1)[1].split("\n请", 1)[0])
         for user in captured_users[:2]
     ]
-    step_chains = {
-        chain["chainId"]
-        for page_value in skeletons[0]["pages"]
-        for chain in page_value["chains"]
+    expected_by_page = {
+        material.page.pageId: set(material.matched_chain_ids)
+        for material in materials.pages
     }
-    rule_chains = {
-        chain["chainId"]
-        for page_value in skeletons[1]["pages"]
-        for chain in page_value["chains"]
-    }
-    expected_chains = {
-        match.chainId for match in requirement_map.matches if match.chainId
-    }
-    assert step_chains == expected_chains
-    assert rule_chains == expected_chains
+    for skeleton in skeletons:
+        actual_by_page = {
+            page_value["pageId"]: {
+                chain["chainId"] for chain in page_value["chains"]
+            }
+            for page_value in skeleton["pages"]
+        }
+        assert actual_by_page == expected_by_page
     assert all(
         "texts" not in step
         for skeleton in skeletons

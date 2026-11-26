@@ -398,11 +398,12 @@ def test_build_skeleton_filters_to_matched_chains():
     requirement_map = spec_requirement_map(graph_)
     materials = collect_materials(requirement_map, graph_)
     matched_chain_id = requirement_map.matches[0].chainId
+    assert matched_chain_id is not None
 
     skeleton = build_skeleton(
         materials,
         {"f1": (PAGE_ID,)},
-        matched_chain_ids={matched_chain_id},
+        {PAGE_ID: frozenset({matched_chain_id})},
     )
 
     page_value = skeleton["pages"][0]
@@ -410,15 +411,22 @@ def test_build_skeleton_filters_to_matched_chains():
     assert all("texts" not in step for chain in page_value["chains"] for step in chain["steps"])
 
 
-def test_build_skeleton_empty_matched_chains_does_not_expand():
+def test_build_skeleton_page_without_matched_chains_keeps_navigation():
+    """页面级 match（无 chainId）时不能把该页链路全部藏掉。"""
     _, materials = _form_materials()
     skeleton = build_skeleton(
         materials,
         {"f1": (PAGE_ID,)},
-        matched_chain_ids=set(),
+        {PAGE_ID: frozenset()},
     )
 
-    assert skeleton["pages"][0]["chains"] == []
+    page_value = skeleton["pages"][0]
+    assert [chain["chainId"] for chain in page_value["chains"]] == [
+        chain.id for chain in materials.pages[0].chains
+    ]
+    assert page_value["forms"]
+    assert page_value["apiFacts"]
+    assert page_value["counts"]["chains"] == len(page_value["chains"])
 
 
 def test_build_skeleton_has_navigation_only():
@@ -451,7 +459,6 @@ def test_build_skeleton_has_navigation_only():
     # 不含契约数据
     assert "uiText" not in page
     assert "elements" not in page
-
 
 
 # =====================================================================
