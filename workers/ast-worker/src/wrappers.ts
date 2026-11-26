@@ -31,6 +31,7 @@ import type { WrapperMapping, WrapperRule } from "@uicodeanalysis/contracts";
 import { SyntaxKind, type Node, type Project } from "ts-morph";
 
 import type { DiscoveredComponent } from "./components.js";
+import { canonicalId } from "./ids.js";
 
 /** 映射格式版本。与 IR schema 版本独立演进，读入时校验。 */
 const SUPPORTED_SCHEMA_VERSION = "1.0";
@@ -262,7 +263,7 @@ export function serializeWrapper(
 
 /** 外部组件节点 id 的约定，与 renders 分析器保持一致。 */
 export function externalNodeId(packageName: string, componentName: string): string {
-  return `${packageName}#${componentName}`;
+  return canonicalId(`${packageName}#${componentName}`);
 }
 
 /** 项目根目录下的映射文件位置：`mapping.json` 与 `mappings/*.json`。 */

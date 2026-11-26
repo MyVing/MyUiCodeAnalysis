@@ -32,6 +32,7 @@ import { Node as MorphNode, SyntaxKind } from "ts-morph";
 import type { Evidence, IREdge, IRNode, Warning } from "@uicodeanalysis/contracts";
 
 import type { DiscoveredComponent } from "./components.js";
+import { canonicalId } from "./ids.js";
 import { isProjectSource, toProjectRelative } from "./paths.js";
 import { positionKey } from "./positions.js";
 import { functionIdentity, functionNodeOf, resolveIdentifierDeclarations, type FunctionIdentity } from "./symbols.js";
@@ -272,7 +273,7 @@ function toEvidence(
 }
 
 function nodeIdForState(componentId: string, stateName: string): string {
-  return `${componentId}/${stateName}`;
+  return canonicalId(`${componentId}/${stateName}`);
 }
 
 /**
@@ -371,7 +372,9 @@ export function analyzeHooks(input: HooksAnalysisInput): HooksAnalysisResult {
       // 解构 hook 返回值的绑定名：`const { onSubmit } = useLogin()` 里事件引用的
       // 是 onSubmit 而不是 hook 名，事件分析需要这份名单才能落点
       const destructuredNames = readDestructuredBindingNames(declaration);
-      const nodeId = `${component.id}/${hookSuffix(boundName, hookName, hookCounters, component.id)}`;
+      const nodeId = canonicalId(
+        `${component.id}/${hookSuffix(boundName, hookName, hookCounters, component.id)}`,
+      );
 
       const pos = sourceFile.getLineAndColumnAtPos(call.getStart());
 

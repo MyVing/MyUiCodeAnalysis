@@ -25,6 +25,7 @@ import { Node as MorphNode, SyntaxKind } from "ts-morph";
 
 import type { Warning } from "@uicodeanalysis/contracts";
 
+import { canonicalId } from "./ids.js";
 import { toProjectRelative } from "./paths.js";
 import { positionKey } from "./positions.js";
 
@@ -205,7 +206,7 @@ function toComponent(decl: Node, sourceFile: SourceFile, relativeFile: string): 
   const pos = sourceFile.getLineAndColumnAtPos(decl.getStart());
 
   return {
-    id: `${relativeFile}#${name}`,
+    id: canonicalId(`${relativeFile}#${name}`),
     name,
     file: relativeFile,
     loc: { line: pos.line, col: pos.column },

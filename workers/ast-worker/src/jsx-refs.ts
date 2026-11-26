@@ -16,6 +16,7 @@ import type { Node, SourceFile } from "ts-morph";
 import { Node as MorphNode, SyntaxKind } from "ts-morph";
 
 import type { DiscoveredComponent } from "./components.js";
+import { canonicalId } from "./ids.js";
 import { getPackageName, toProjectRelative } from "./paths.js";
 import { positionKey } from "./positions.js";
 import type { ResolutionIndex } from "./resolver.js";
@@ -134,7 +135,7 @@ function resolveSymbolTarget(tagNameNode: Node, context: TagResolveContext): Tag
 
   return {
     kind: "external",
-    nodeId: `${packageName}#${tagName}`,
+    nodeId: canonicalId(`${packageName}#${tagName}`),
     packageName,
     tagName,
   };
@@ -250,7 +251,7 @@ function componentIdentityOf(decl: Node, rootPath: string): string | null {
     name = decl.getName() ?? undefined;
   }
   if (!name && MorphNode.isFunctionDeclaration(decl)) name = decl.getName() ?? undefined;
-  return name ? `${relativeFile}#${name}` : null;
+  return name ? canonicalId(`${relativeFile}#${name}`) : null;
 }
 
 /** 在文件里查找某个本地名的 import 来源说明符。 */

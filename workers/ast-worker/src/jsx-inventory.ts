@@ -36,6 +36,7 @@ import type { Node, SourceFile } from "ts-morph";
 import { Node as MorphNode, SyntaxKind } from "ts-morph";
 
 import type { DiscoveredComponent } from "./components.js";
+import { canonicalId } from "./ids.js";
 import { buildOwnerIndex, findOwner } from "./ownership.js";
 import { toProjectRelative } from "./paths.js";
 
@@ -166,7 +167,7 @@ export function buildJsxInventory(
       const tag = tagNode.getText();
       const handlerNames = readHandlerNames(opening);
       const suffix = elementSuffix(tag, handlerNames, `${componentId} jsx:${tag}`, counters);
-      const id = `${componentId}/${suffix}`;
+      const id = canonicalId(`${componentId}/${suffix}`);
 
       const position = file.getLineAndColumnAtPos(tagNode.getStart());
       const info: JsxElementInfo = {

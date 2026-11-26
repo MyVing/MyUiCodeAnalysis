@@ -73,6 +73,7 @@ import {
   resolveTagTarget,
   type TagResolveContext,
 } from "./jsx-refs.js";
+import { canonicalId } from "./ids.js";
 import { toProjectRelative } from "./paths.js";
 import type { ResolutionIndex } from "./resolver.js";
 
@@ -604,7 +605,7 @@ class RouteCollector {
   }
 
   add(route: CollectedRoute): void {
-    const nodeId = `${route.file}#${route.path}`;
+    const nodeId = canonicalId(`${route.file}#${route.path}`);
     const existing = this.buckets.get(nodeId);
 
     if (existing) {

@@ -23,6 +23,7 @@
 import type { Node, SourceFile } from "ts-morph";
 import { Node as MorphNode, SyntaxKind } from "ts-morph";
 
+import { canonicalId } from "./ids.js";
 import { toProjectRelative } from "./paths.js";
 
 /**
@@ -114,7 +115,7 @@ export function functionIdentity(fn: Node, rootPath: string): FunctionIdentity |
 
   const pos = sourceFile.getLineAndColumnAtPos(fn.getStart());
   return {
-    id: `${relativeFile}#${name}`,
+    id: canonicalId(`${relativeFile}#${name}`),
     name,
     file: relativeFile,
     loc: { line: pos.line, col: pos.column },

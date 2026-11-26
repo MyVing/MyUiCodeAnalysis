@@ -36,6 +36,7 @@ import type { Evidence, IREdge, IRNode, Warning } from "@uicodeanalysis/contract
 
 import { findNearestOwner } from "./ownership.js";
 import { findImportSource } from "./jsx-refs.js";
+import { canonicalId } from "./ids.js";
 import { isProjectSource, toPosix, toProjectRelative } from "./paths.js";
 import { positionKey } from "./positions.js";
 
@@ -1103,7 +1104,7 @@ function readWrapperCall(
 
 /** api 节点 id：同一接口被多处调用时合并成一个节点。 */
 function apiNodeId(method: string, url: string): string {
-  return `api:${method}:${url}`;
+  return canonicalId(`api:${method}:${url}`);
 }
 
 /** 请求归属判定的结果。 */
@@ -1904,5 +1905,5 @@ function moduleFunctionIdOf(
   if (!name) return null;
   const relativeFile = toProjectRelative(rootPath, file.getFilePath());
   if (relativeFile === null) return null;
-  return `${relativeFile}#${name}`;
+  return canonicalId(`${relativeFile}#${name}`);
 }
