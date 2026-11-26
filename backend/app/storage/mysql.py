@@ -138,6 +138,50 @@ DDL_STATEMENTS: tuple[str, ...] = (
     ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4
     """,
     """
+    -- graph_nodes / graph_edges：为 AI 按需检索提供的行式索引层。
+    -- 原始图仍然以 payload JSON 完整保存在 graphs（或分块的 graph_revisions），
+    -- 新表是完整事实的冗余投影：每个 IRNode 一行、每个 IREdge 一行，
+    -- 让 AI 的 EvidenceQuery 可以直接走 WHERE kind=? / FROM / TO 等普通列索引，
+    -- 而不是先全量反序列化再在内存里 flatten 过滤。
+    -- 写入路径上 _save_graph 会双写：先清旧行再插新行，与 payload JSON 保持同步。
+    CREATE TABLE IF NOT EXISTS graph_nodes (
+      id            BIGINT AUTO_INCREMENT PRIMARY KEY,
+      project_id    VARCHAR(32) NOT NULL,
+      analysis_id   VARCHAR(32) NOT NULL,
+      graph_kind    VARCHAR(8) NOT NULL,
+      node_id       VARCHAR(512) NOT NULL,
+      kind          VARCHAR(32) NOT NULL,
+      name          VARCHAR(256) NOT NULL,
+      file          VARCHAR(512) NULL,
+      line          INT NULL,
+      loc_col       INT NULL,
+      attrs_json    JSON NOT NULL,
+      confidence    FLOAT NULL,
+      source        VARCHAR(8) NULL,
+      created_at    DATETIME(6) NOT NULL,
+      UNIQUE KEY uq_graph_node_biz (project_id, analysis_id, graph_kind, node_id),
+      KEY idx_graph_node_kind     (project_id, analysis_id, graph_kind, kind),
+      KEY idx_graph_node_file     (project_id, analysis_id, graph_kind, file(255))
+    ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4
+    """,
+    """
+    CREATE TABLE IF NOT EXISTS graph_edges (
+      id            BIGINT AUTO_INCREMENT PRIMARY KEY,
+      project_id    VARCHAR(32) NOT NULL,
+      analysis_id   VARCHAR(32) NOT NULL,
+      graph_kind    VARCHAR(8) NOT NULL,
+      edge_id       VARCHAR(512) NOT NULL,
+      from_node     VARCHAR(512) NOT NULL,
+      to_node       VARCHAR(512) NOT NULL,
+      kind          VARCHAR(32) NOT NULL,
+      created_at    DATETIME(6) NOT NULL,
+      UNIQUE KEY uq_graph_edge_biz (project_id, analysis_id, graph_kind, edge_id),
+      KEY idx_graph_edge_from     (project_id, analysis_id, graph_kind, from_node),
+      KEY idx_graph_edge_to       (project_id, analysis_id, graph_kind, to_node),
+      KEY idx_graph_edge_kind     (project_id, analysis_id, graph_kind, kind)
+    ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4
+    """,
+    """
     -- 页面画像：分析后异步生成的页面业务描述，按图版本缓存。
     -- 与 graphs 分开存：画像是模型产物（可再来一次），图是事实（不可重算）。
     CREATE TABLE IF NOT EXISTS page_profiles (
@@ -330,6 +374,120 @@ def _graph_payload(graph: IRGraph) -> tuple[str, bytes, str]:
     payload_bytes = payload.encode("utf-8")
     digest = hashlib.sha256(payload_bytes).hexdigest()
     return payload, payload_bytes, digest
+
+
+async def _write_graph_rows(
+    conn: Any,
+    project_id: str,
+    analysis_id: str,
+    graph_kind: str,
+    graph: IRGraph,
+    now: datetime,
+) -> None:
+    """将图的节点/边投影写入 graph_nodes / graph_edges，为 AI 按需检索提供行式索引层。
+
+    与 payload JSON 双写：先清旧行再插新行，保证同一 (project_id, analysis_id, kind)
+    三元组下两张表的内容与 payload 严格一致。attrs 自由扩展字段整体存 JSON，
+    常用查询列（kind / file / from_node / to_node）走普通列索引。
+    """
+    # 先清旧行（幂等）：常规写入和分块写入都会触发，保证 upsert 语义
+    await conn.execute(
+        text(
+            """
+            DELETE FROM graph_nodes
+            WHERE project_id = :pid AND analysis_id = :aid AND graph_kind = :kind
+            """
+        ),
+        {"pid": project_id, "aid": analysis_id, "kind": graph_kind},
+    )
+    await conn.execute(
+        text(
+            """
+            DELETE FROM graph_edges
+            WHERE project_id = :pid AND analysis_id = :aid AND graph_kind = :kind
+            """
+        ),
+        {"pid": project_id, "aid": analysis_id, "kind": graph_kind},
+    )
+
+    # 批量插节点：attrs 整体存 JSON；evidence 只取第一条的 confidence / source
+    node_rows = []
+    for node in graph.nodes:
+        first_evidence = node.evidence[0] if node.evidence else None
+        node_rows.append(
+            {
+                "pid": project_id,
+                "aid": analysis_id,
+                "kind": graph_kind,
+                "node_id": node.id,
+                "node_kind": node.kind.value,
+                "name": node.name,
+                "file": node.file,
+                "line": node.loc.line if node.loc is not None else None,
+                "loc_col": node.loc.col if node.loc is not None else None,
+                "attrs_json": json.dumps(
+                    node.attrs, ensure_ascii=False, sort_keys=True
+                ),
+                "confidence": (
+                    first_evidence.confidence
+                    if first_evidence is not None
+                    else None
+                ),
+                "source": (
+                    first_evidence.source.value
+                    if first_evidence is not None
+                    else None
+                ),
+                "created_at": now,
+            }
+        )
+
+    if node_rows:
+        await conn.execute(
+            text(
+                """
+                INSERT INTO graph_nodes
+                  (project_id, analysis_id, graph_kind, node_id, kind, name,
+                   file, line, loc_col, attrs_json, confidence, source, created_at)
+                VALUES
+                  (:pid, :aid, :kind, :node_id, :node_kind, :name,
+                   :file, :line, :loc_col, :attrs_json,
+                   :confidence, :source, :created_at)
+                """
+            ),
+            node_rows,
+        )
+
+    # 批量插边
+    edge_rows = []
+    for edge in graph.edges:
+        edge_rows.append(
+            {
+                "pid": project_id,
+                "aid": analysis_id,
+                "kind": graph_kind,
+                "edge_id": edge.id,
+                "from_node": edge.from_,
+                "to_node": edge.to,
+                "edge_kind": edge.kind.value,
+                "created_at": now,
+            }
+        )
+
+    if edge_rows:
+        await conn.execute(
+            text(
+                """
+                INSERT INTO graph_edges
+                  (project_id, analysis_id, graph_kind, edge_id,
+                   from_node, to_node, kind, created_at)
+                VALUES
+                  (:pid, :aid, :kind, :edge_id,
+                   :from_node, :to_node, :edge_kind, :created_at)
+                """
+            ),
+            edge_rows,
+        )
 
 
 class GraphStorageError(RuntimeError):
@@ -768,6 +926,10 @@ class MySqlAnalysisRepository:
                     "updated_at": now,
                 },
             )
+            # 双写：同步行式索引层，供 AI EvidenceQuery 按需检索
+            await _write_graph_rows(
+                conn, project_id, analysis_id, kind, graph, now
+            )
         logger.info(
             "图产物已保存：project=%s analysis=%s kind=%s bytes=%d sha256=%s",
             project_id,
@@ -875,6 +1037,10 @@ class MySqlAnalysisRepository:
                     """
                 ),
                 {"revision_id": revision_id, "published_at": now, "updated_at": now},
+            )
+            # 双写：同步行式索引层，供 AI EvidenceQuery 按需检索
+            await _write_graph_rows(
+                conn, project_id, analysis_id, kind, graph, now
             )
         logger.info(
             "图产物已分块保存：project=%s analysis=%s kind=%s bytes=%d chunks=%d sha256=%s",

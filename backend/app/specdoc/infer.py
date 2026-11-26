@@ -13,9 +13,13 @@
 from __future__ import annotations
 
 import json
+import logging
 import re
 from collections import Counter
 from dataclasses import dataclass, field
+from typing import Any
+
+from sqlalchemy.ext.asyncio import AsyncEngine
 
 from app.contracts.requirement import (
     Dropped,
@@ -41,8 +45,11 @@ from app.requirement.llm import LLMCallError, LLMClient
 from app.specdoc.apimap import all_api_steps
 from app.specdoc.collect import Materials, PageMaterial
 from app.specdoc.evidence import build_evidence_pack
+from app.specdoc.evidence_query import EvidenceQuery
 from app.specdoc.llm import OpenAICompatibleToolLLM
 from app.specdoc.retrieval import EVIDENCE_TOOL, EvidenceLedger, EvidenceSearch
+
+logger = logging.getLogger(__name__)
 
 _STEPS_SYSTEM = """\
 你是资深前端规格分析师。根据给定的需求、功能点与页面语料（均为代码原文），\
@@ -145,8 +152,16 @@ async def infer_sections(
     max_calls: int,
     *,
     events_by_page: dict[str, list[Event]] | None = None,
+    engine: AsyncEngine | None = None,
+    project_id: str | None = None,
+    analysis_id: str | None = None,
 ) -> InferOutcome:
-    """跑三个推断章节。模型彻底不可用时不抛错：章节留空 + llm_unavailable 告警。"""
+    """跑三个推断章节。模型彻底不可用时不抛错：章节留空 + llm_unavailable 告警。
+
+    当 engine + project_id + analysis_id 三者齐全时，使用 EvidenceQuery（SQL 层按需检索，
+    直接查 graph_nodes / graph_edges）；否则 fallback EvidenceSearch（全量 flatten 内存过滤）。
+    后者是老链路——Memory 实现、单测、或数据库 schema 未升级时自动走这条。
+    """
     contexts = _page_contexts(materials)
     evidence_pack = build_evidence_pack(materials, events_by_page)
     evidence_json, exposed_texts = evidence_pack.prompt_view()
@@ -188,11 +203,30 @@ async def infer_sections(
     feature_pages = _feature_pages(requirement_map, contexts)
     features = list(requirement_map.features)
     ledger = EvidenceLedger()
-    search = EvidenceSearch(
-        exposed_pages, ledger,
-        {page_id for page_ids in feature_pages.values() for page_id in page_ids},
-    )
     tool_mode = callable(getattr(llm, "chat_with_tools", None))
+    use_sql_query = (
+        engine is not None and project_id is not None and analysis_id is not None
+    )
+    if use_sql_query:
+        logger.info(
+            "specdoc 推断使用 EvidenceQuery（SQL 层按需检索）："
+            "project=%s analysis=%s", project_id, analysis_id,
+        )
+
+    def _build_search(ledger_arg: EvidenceLedger, allowed_page_ids: set[str]):
+        """有 engine 时走 EvidenceQuery（SQL 层），否则 fallback EvidenceSearch。"""
+        if use_sql_query:
+            return EvidenceQuery(
+                engine=engine,  # type: ignore[arg-type]
+                project_id=project_id,  # type: ignore[arg-type]
+                analysis_id=analysis_id,  # type: ignore[arg-type]
+                ledger=ledger_arg,
+            )
+        return EvidenceSearch(exposed_pages, ledger_arg, allowed_page_ids)
+
+    search = _build_search(
+        ledger, {pid for pids in feature_pages.values() for pid in pids}
+    )
     shadow_counts: Counter[str] = Counter()
 
     outcome = InferOutcome(
@@ -255,8 +289,8 @@ async def infer_sections(
         context.ledger = EvidenceLedger() if tool_mode else None
     if tool_mode:
         rules_ledger = EvidenceLedger()
-        rules_search = EvidenceSearch(
-            exposed_pages, rules_ledger,
+        rules_search = _build_search(
+            rules_ledger,
             {context.material.page.pageId for context in contexts},
         )
         try:
@@ -298,8 +332,8 @@ async def infer_sections(
     shadow_counts.update(_shadow_drop_counts(dropped))
     if tool_mode:
         mappings_ledger = EvidenceLedger()
-        mapping_search = EvidenceSearch(
-            exposed_pages, mappings_ledger,
+        mapping_search = _build_search(
+            mappings_ledger,
             {context.material.page.pageId for context in contexts},
         )
         try:

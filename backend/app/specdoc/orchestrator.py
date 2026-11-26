@@ -45,9 +45,15 @@ logger = logging.getLogger(__name__)
 
 
 class SpecDocOrchestrator:
-    def __init__(self, settings: Settings, llm: OpenAICompatibleToolLLM | None) -> None:
+    def __init__(
+        self,
+        settings: Settings,
+        llm: OpenAICompatibleToolLLM | None,
+        engine: AsyncEngine | None = None,
+    ) -> None:
         self._settings = settings
         self._llm = llm
+        self._engine = engine
 
     async def run(
         self,
@@ -70,6 +76,8 @@ class SpecDocOrchestrator:
         infer_outcome = await self._infer_sections(
             task, requirement_map.requirement, requirement_map, materials,
             events_by_page,
+            project_id=project.id,
+            analysis_id=graph.analysisId,
         )
         warnings.extend(_convert_warnings(infer_outcome.warnings or []))
         shadow_counts = getattr(infer_outcome, "shadow_counts", {})
@@ -144,6 +152,9 @@ class SpecDocOrchestrator:
         requirement_map: RequirementMap,
         materials: Materials,
         events_by_page: dict[str, list[Event]],
+        *,
+        project_id: str | None = None,
+        analysis_id: str | None = None,
     ) -> InferOutcome | _SkippedOutcome:
         """三个推断章节。dry-run / 无模型时留空 + 显式告警，不静默。"""
         if task.dry_run:
@@ -170,6 +181,9 @@ class SpecDocOrchestrator:
             self._llm,
             max_calls=self._settings.llm_max_calls_per_request,
             events_by_page=events_by_page,
+            engine=self._engine,
+            project_id=project_id,
+            analysis_id=analysis_id,
         )
 
     def _number_steps(self, steps: list[Step]) -> list[Step]:

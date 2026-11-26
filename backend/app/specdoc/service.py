@@ -23,6 +23,7 @@ from app.core.config import Settings
 from app.schemas import Project, SpecDocStart, SpecDocTask
 from app.specdoc.llm import OpenAICompatibleToolLLM
 from app.specdoc.orchestrator import SpecDocOrchestrator
+from app.storage.mysql import create_engine_from_url
 from app.storage.repositories import AnalysisRepository
 from app.storage.requirement import RequirementRepository
 from app.storage.specdoc import SpecDocRepository
@@ -164,5 +165,18 @@ class SpecDocService:
         requirement_map: RequirementMap,
         graph: IRGraph,
     ) -> SpecDocMap:
-        orchestrator = SpecDocOrchestrator(self._settings, self._llm)
-        return await orchestrator.run(project, task, requirement_map, graph)
+        # EvidenceQuery 走 SQL 层按需检索，需要 engine；Memory 实现 / 无 DB 时
+        # engine=None → orchestrator 自动 fallback EvidenceSearch（全量 flatten）
+        engine = (
+            create_engine_from_url(self._settings)
+            if self._settings.db_url is not None
+            else None
+        )
+        orchestrator = SpecDocOrchestrator(
+            self._settings, self._llm, engine=engine
+        )
+        try:
+            return await orchestrator.run(project, task, requirement_map, graph)
+        finally:
+            if engine is not None:
+                await engine.dispose()
