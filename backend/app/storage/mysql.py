@@ -582,7 +582,165 @@ async def _ensure_project_columns(conn: Any) -> None:
 
 
 async def _ensure_graph_schema(conn: Any) -> None:
-    """补齐旧 graphs 表的更新时间列和可用于 latest 查询的索引。"""
+    """补齐旧图表缺少的列和可用于 latest 查询的索引。"""
+    node_columns = (
+        await conn.execute(
+            text(
+                """
+                SELECT COLUMN_NAME FROM information_schema.COLUMNS
+                WHERE TABLE_SCHEMA = DATABASE() AND TABLE_NAME = 'graph_nodes'
+                """
+            )
+        )
+    ).all()
+    existing_node_columns = {str(row[0]) for row in node_columns}
+    if "node_id" not in existing_node_columns:
+        # 历史节点无法可靠还原稳定 ID；保留旧行并允许该新增列为空。
+        await conn.execute(
+            text("ALTER TABLE graph_nodes ADD COLUMN node_id VARCHAR(512) NULL")
+        )
+        logger.info("graph_nodes 表补充列 node_id")
+
+    legacy_columns = {"node_key", "stable_id", "stable_hash"}
+    legacy_rows = (
+        await conn.execute(
+            text(
+                """
+                SELECT INDEX_NAME, COLUMN_NAME
+                FROM information_schema.STATISTICS
+                WHERE TABLE_SCHEMA = DATABASE() AND TABLE_NAME = 'graph_nodes'
+                """
+            )
+        )
+    ).all()
+    legacy_indexes = {
+        str(row[0]) for row in legacy_rows if str(row[1]) in legacy_columns
+    }
+    for index_name in sorted(legacy_indexes):
+        # These identifiers are read from information_schema for this known table.
+        safe_index_name = index_name.replace("`", "``")
+        await conn.execute(text(f"ALTER TABLE graph_nodes DROP INDEX `{safe_index_name}`"))
+        logger.info("graph_nodes 表删除遗留索引 %s", index_name)
+
+    for column_name in sorted(legacy_columns & existing_node_columns):
+        await conn.execute(
+            text(f"ALTER TABLE graph_nodes DROP COLUMN `{column_name}`")
+        )
+        logger.info("graph_nodes 表删除遗留列 %s", column_name)
+
+    node_index_rows = (
+        await conn.execute(
+            text(
+                """
+                SELECT INDEX_NAME, SEQ_IN_INDEX, COLUMN_NAME, NON_UNIQUE
+                FROM information_schema.STATISTICS
+                WHERE TABLE_SCHEMA = DATABASE() AND TABLE_NAME = 'graph_nodes'
+                  AND INDEX_NAME = 'uq_graph_node_biz'
+                ORDER BY SEQ_IN_INDEX
+                """
+            )
+        )
+    ).all()
+    node_index_columns = [str(row[2]) for row in node_index_rows]
+    if node_index_columns != ["project_id", "analysis_id", "graph_kind", "node_id"] or (
+        node_index_rows and any(int(row[3]) != 0 for row in node_index_rows)
+    ):
+        if node_index_rows:
+            await conn.execute(text("ALTER TABLE graph_nodes DROP INDEX uq_graph_node_biz"))
+        await conn.execute(
+            text(
+                """ALTER TABLE graph_nodes ADD UNIQUE KEY uq_graph_node_biz
+                   (project_id, analysis_id, graph_kind, node_id)"""
+            )
+        )
+        logger.info("graph_nodes 表补充唯一索引 uq_graph_node_biz")
+
+    edge_columns = (
+        await conn.execute(
+            text(
+                """
+                SELECT COLUMN_NAME FROM information_schema.COLUMNS
+                WHERE TABLE_SCHEMA = DATABASE() AND TABLE_NAME = 'graph_edges'
+                """
+            )
+        )
+    ).all()
+    existing_edge_columns = {str(row[0]) for row in edge_columns}
+    edge_legacy_columns = {"edge_key", "from_key", "to_key", "stable_id"}
+    edge_index_rows = (
+        await conn.execute(
+            text(
+                """
+                SELECT INDEX_NAME, COLUMN_NAME
+                FROM information_schema.STATISTICS
+                WHERE TABLE_SCHEMA = DATABASE() AND TABLE_NAME = 'graph_edges'
+                """
+            )
+        )
+    ).all()
+    edge_legacy_indexes = {
+        str(row[0]) for row in edge_index_rows if str(row[1]) in edge_legacy_columns
+    }
+    for index_name in sorted(edge_legacy_indexes):
+        safe_index_name = index_name.replace("`", "``")
+        await conn.execute(text(f"ALTER TABLE graph_edges DROP INDEX `{safe_index_name}`"))
+        logger.info("graph_edges 表删除遗留索引 %s", index_name)
+
+    for column_name, definition in (
+        ("edge_id", "VARCHAR(512) NULL"),
+        ("from_node", "VARCHAR(512) NULL"),
+        ("to_node", "VARCHAR(512) NULL"),
+    ):
+        if column_name not in existing_edge_columns:
+            await conn.execute(
+                text(f"ALTER TABLE graph_edges ADD COLUMN `{column_name}` {definition}")
+            )
+            logger.info("graph_edges 表补充列 %s", column_name)
+
+    for column_name in sorted(edge_legacy_columns & existing_edge_columns):
+        await conn.execute(
+            text(f"ALTER TABLE graph_edges DROP COLUMN `{column_name}`")
+        )
+        logger.info("graph_edges 表删除遗留列 %s", column_name)
+
+    edge_index_rows = (
+        await conn.execute(
+            text(
+                """
+                SELECT INDEX_NAME, SEQ_IN_INDEX, COLUMN_NAME
+                FROM information_schema.STATISTICS
+                WHERE TABLE_SCHEMA = DATABASE() AND TABLE_NAME = 'graph_edges'
+                ORDER BY INDEX_NAME, SEQ_IN_INDEX
+                """
+            )
+        )
+    ).all()
+    edge_indexes = {
+        index_name: [str(row[2]) for row in edge_index_rows if str(row[0]) == index_name]
+        for index_name in {str(row[0]) for row in edge_index_rows}
+    }
+    edge_index_specs = (
+        ("uq_graph_edge_biz", ["project_id", "analysis_id", "graph_kind", "edge_id"], True),
+        ("idx_graph_edge_from", ["project_id", "analysis_id", "graph_kind", "from_node"], False),
+        ("idx_graph_edge_to", ["project_id", "analysis_id", "graph_kind", "to_node"], False),
+        ("idx_graph_edge_kind", ["project_id", "analysis_id", "graph_kind", "kind"], False),
+    )
+    for index_name, expected_columns, unique in edge_index_specs:
+        actual_columns = edge_indexes.get(index_name, [])
+        if actual_columns == expected_columns:
+            continue
+        if actual_columns:
+            safe_index_name = index_name.replace("`", "``")
+            await conn.execute(text(f"ALTER TABLE graph_edges DROP INDEX `{safe_index_name}`"))
+        unique_sql = "UNIQUE " if unique else ""
+        columns_sql = ", ".join(f"`{column}`" for column in expected_columns)
+        await conn.execute(
+            text(
+                f"ALTER TABLE graph_edges ADD {unique_sql}KEY `{index_name}` ({columns_sql})"
+            )
+        )
+        logger.info("graph_edges 表补充索引 %s", index_name)
+
     columns = (
         await conn.execute(
             text(

@@ -36,6 +36,8 @@ TABLES = (
     "requirement_maps",
     "requirement_tasks",
     "graphs",
+    "graph_edges",
+    "graph_nodes",
     "graph_revision_chunks",
     "graph_revisions",
     "analysis_tasks",
@@ -236,6 +238,233 @@ async def test_graph_roundtrip_and_latest(engine) -> None:
     assert latest is not None
     assert latest.analysisId == "an_test000001"
     assert await analyses.get_latest_graph("prj_missing") is None
+
+
+async def test_graph_nodes_legacy_schema_is_migrated(engine) -> None:
+    # 模拟历史结构：node_id 缺失，且旧实现遗留三列和相关索引。
+    async with engine.begin() as conn:
+        await conn.execute(text("ALTER TABLE graph_nodes DROP INDEX uq_graph_node_biz"))
+        await conn.execute(text("ALTER TABLE graph_nodes DROP COLUMN node_id"))
+        await conn.execute(
+            text("ALTER TABLE graph_nodes ADD COLUMN node_key CHAR(12) NOT NULL")
+        )
+        await conn.execute(
+            text("ALTER TABLE graph_nodes ADD COLUMN stable_id TEXT NOT NULL")
+        )
+        await conn.execute(
+            text("ALTER TABLE graph_nodes ADD COLUMN stable_hash CHAR(40) NOT NULL")
+        )
+        await conn.execute(
+            text("ALTER TABLE graph_nodes ADD UNIQUE KEY uq_graph_node_key "
+                 "(project_id, analysis_id, graph_kind, node_key)")
+        )
+        await conn.execute(
+            text("ALTER TABLE graph_nodes ADD KEY idx_graph_node_stable "
+                 "(project_id, analysis_id, graph_kind, stable_hash)")
+        )
+        await conn.execute(
+            text(
+                """
+                INSERT INTO graph_nodes
+                  (project_id, analysis_id, graph_kind, node_key, stable_id,
+                   stable_hash, kind, name, attrs_json, created_at)
+                VALUES
+                  ('prj_legacy', 'an_legacy', 'static', 'legacy-key',
+                   'legacy-stable-id', '0123456789012345678901234567890123456789',
+                   'component', 'Legacy', JSON_OBJECT(), NOW(6))
+                """
+            )
+        )
+
+    # 启动迁移应补齐当前 schema，移除遗留字段，且可重复执行。
+    await init_schema(engine)
+    await init_schema(engine)
+
+    async with engine.begin() as conn:
+        columns = (
+            await conn.execute(
+                text(
+                    """
+                    SELECT COLUMN_NAME FROM information_schema.COLUMNS
+                    WHERE TABLE_SCHEMA = DATABASE() AND TABLE_NAME = 'graph_nodes'
+                    """
+                )
+            )
+        ).all()
+        indexes = (
+            await conn.execute(
+                text(
+                    """
+                    SELECT INDEX_NAME FROM information_schema.STATISTICS
+                    WHERE TABLE_SCHEMA = DATABASE() AND TABLE_NAME = 'graph_nodes'
+                    """
+                )
+            )
+        ).all()
+    column_names = {str(row[0]) for row in columns}
+    index_names = {str(row[0]) for row in indexes}
+    assert "node_id" in column_names
+    assert not {"node_key", "stable_id", "stable_hash"} & column_names
+    assert not {"uq_graph_node_key", "idx_graph_node_stable"} & index_names
+
+    async with engine.begin() as conn:
+        legacy_count = (
+            await conn.execute(
+                text(
+                    """
+                    SELECT COUNT(*) FROM graph_nodes
+                    WHERE project_id = 'prj_legacy' AND analysis_id = 'an_legacy'
+                      AND name = 'Legacy'
+                    """
+                )
+            )
+        ).scalar_one()
+    assert legacy_count == 1
+
+    projects = MySqlProjectRepository(engine)
+    analyses = MySqlAnalysisRepository(engine)
+    await projects.add(_project())
+    await analyses.add_task(_task())
+    graph = _mini_graph("an_test000001")
+    await analyses.save_graph("prj_test000001", graph)
+
+    async with engine.begin() as conn:
+        saved_ids = (
+            await conn.execute(
+                text(
+                    """
+                    SELECT node_id FROM graph_nodes
+                    WHERE project_id = :project_id AND analysis_id = :analysis_id
+                    """
+                ),
+                {"project_id": "prj_test000001", "analysis_id": "an_test000001"},
+            )
+        ).scalars().all()
+    assert {str(node_id) for node_id in saved_ids} == {node.id for node in graph.nodes}
+
+
+async def test_graph_edges_legacy_schema_is_migrated(engine) -> None:
+    # 模拟历史结构及数据，迁移需保留行但清理旧字段和索引。
+    async with engine.begin() as conn:
+        await conn.execute(text("ALTER TABLE graph_edges DROP INDEX uq_graph_edge_biz"))
+        await conn.execute(text("ALTER TABLE graph_edges DROP INDEX idx_graph_edge_from"))
+        await conn.execute(text("ALTER TABLE graph_edges DROP INDEX idx_graph_edge_to"))
+        await conn.execute(text("ALTER TABLE graph_edges DROP INDEX idx_graph_edge_kind"))
+        await conn.execute(text("ALTER TABLE graph_edges DROP COLUMN edge_id"))
+        await conn.execute(text("ALTER TABLE graph_edges DROP COLUMN from_node"))
+        await conn.execute(text("ALTER TABLE graph_edges DROP COLUMN to_node"))
+        await conn.execute(
+            text("ALTER TABLE graph_edges ADD COLUMN edge_key CHAR(12) NOT NULL")
+        )
+        await conn.execute(
+            text("ALTER TABLE graph_edges ADD COLUMN from_key CHAR(12) NOT NULL")
+        )
+        await conn.execute(
+            text("ALTER TABLE graph_edges ADD COLUMN to_key CHAR(12) NOT NULL")
+        )
+        await conn.execute(
+            text("ALTER TABLE graph_edges ADD COLUMN stable_id TEXT NOT NULL")
+        )
+        await conn.execute(
+            text("ALTER TABLE graph_edges ADD UNIQUE KEY uq_graph_edge_key "
+                 "(project_id, analysis_id, graph_kind, edge_key)")
+        )
+        await conn.execute(
+            text("ALTER TABLE graph_edges ADD KEY idx_graph_edge_from "
+                 "(project_id, analysis_id, graph_kind, from_key)")
+        )
+        await conn.execute(
+            text("ALTER TABLE graph_edges ADD KEY idx_graph_edge_to "
+                 "(project_id, analysis_id, graph_kind, to_key)")
+        )
+        await conn.execute(
+            text(
+                """
+                INSERT INTO graph_edges
+                  (project_id, analysis_id, graph_kind, edge_key, from_key,
+                   to_key, stable_id, kind, created_at)
+                VALUES
+                  ('prj_legacy', 'an_legacy', 'static', 'legacy-edge',
+                   'legacy-from', 'legacy-to', 'legacy-stable-edge',
+                   'navigate', NOW(6))
+                """
+            )
+        )
+
+    await init_schema(engine)
+    await init_schema(engine)
+
+    async with engine.begin() as conn:
+        columns = (
+            await conn.execute(
+                text(
+                    """
+                    SELECT COLUMN_NAME FROM information_schema.COLUMNS
+                    WHERE TABLE_SCHEMA = DATABASE() AND TABLE_NAME = 'graph_edges'
+                    """
+                )
+            )
+        ).all()
+        indexes = (
+            await conn.execute(
+                text(
+                    """
+                    SELECT INDEX_NAME, SEQ_IN_INDEX, COLUMN_NAME
+                    FROM information_schema.STATISTICS
+                    WHERE TABLE_SCHEMA = DATABASE() AND TABLE_NAME = 'graph_edges'
+                    ORDER BY INDEX_NAME, SEQ_IN_INDEX
+                    """
+                )
+            )
+        ).all()
+        legacy_count = (
+            await conn.execute(
+                text("SELECT COUNT(*) FROM graph_edges WHERE project_id = 'prj_legacy'")
+            )
+        ).scalar_one()
+    column_names = {str(row[0]) for row in columns}
+    index_columns = {}
+    for index_name, _, column_name in indexes:
+        index_columns.setdefault(str(index_name), []).append(str(column_name))
+    assert {"edge_id", "from_node", "to_node"} <= column_names
+    assert not {"edge_key", "from_key", "to_key", "stable_id"} & column_names
+    assert "uq_graph_edge_key" not in index_columns
+    assert index_columns["uq_graph_edge_biz"] == [
+        "project_id", "analysis_id", "graph_kind", "edge_id"
+    ]
+    assert index_columns["idx_graph_edge_from"] == [
+        "project_id", "analysis_id", "graph_kind", "from_node"
+    ]
+    assert index_columns["idx_graph_edge_to"] == [
+        "project_id", "analysis_id", "graph_kind", "to_node"
+    ]
+    assert legacy_count == 1
+
+    projects = MySqlProjectRepository(engine)
+    analyses = MySqlAnalysisRepository(engine)
+    await projects.add(_project())
+    await analyses.add_task(_task())
+    graph = _mini_graph("an_test000001")
+    await analyses.save_graph("prj_test000001", graph)
+    async with engine.begin() as conn:
+        saved_edge_ids = (
+            await conn.execute(
+                text(
+                    """
+                    SELECT edge_id FROM graph_edges
+                    WHERE project_id = :project_id AND analysis_id = :analysis_id
+                    """
+                ),
+                {"project_id": "prj_test000001", "analysis_id": "an_test000001"},
+            )
+        ).scalars().all()
+    assert {str(edge_id) for edge_id in saved_edge_ids} == {edge.id for edge in graph.edges}
+
+
+def _mini_graph(analysis_id: str):
+    from tests.fakes import _mini_graph as make_graph
+
+    return make_graph(analysis_id)
 
 
 async def test_requirement_task_and_map(engine) -> None:
