@@ -168,6 +168,7 @@ class EvidencePack:
 def build_skeleton(
     materials: Materials,
     feature_pages: dict[str, tuple[str, ...]] | None = None,
+    matched_chain_ids: set[str] | None = None,
 ) -> dict[str, Any]:
     """构造轻量导航骨架：只含定位信息，不含契约数据。
 
@@ -209,6 +210,7 @@ def build_skeleton(
                 ],
             }
             for chain in material.chains
+            if matched_chain_ids is None or chain.id in matched_chain_ids
         ]
         pages.append(
             {

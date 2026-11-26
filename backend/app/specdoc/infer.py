@@ -243,8 +243,17 @@ async def infer_sections(
     pack_warnings = evidence_pack.prompt_warnings if evidence_pack is not None else ()
     feature_pages = _feature_pages(requirement_map, contexts)
     page_nodes, chain_nodes, chain_pages = _scope_maps(materials)
+    matched_chain_ids = {
+        match.chainId
+        for match in (requirement_map.matches or [])
+        if match.chainId is not None
+        and match.pageNodeId in {
+            page_id for page_ids in feature_pages.values() for page_id in page_ids
+        }
+    }
     skeleton_json = json.dumps(
-        build_skeleton(materials, feature_pages), ensure_ascii=False
+        build_skeleton(materials, feature_pages, matched_chain_ids),
+        ensure_ascii=False,
     )
     features = list(requirement_map.features)
     ledger = EvidenceLedger()
@@ -279,6 +288,19 @@ async def infer_sections(
             for warning in pack_warnings
         ]
     )
+    if not tool_mode:
+        logger.warning(
+            "specdoc 推断客户端不支持工具调用，回退到完整证据包提示：pages=%d chars=%d",
+            len(evidence_pack.pages) if evidence_pack is not None else 0,
+            len(evidence_json),
+        )
+        outcome.warnings.append(
+            RequirementWarning(
+                code="evidence_full_prompt_fallback",
+                severity=Severity.warning,
+                message="当前模型客户端不支持证据工具调用，推断使用兼容模式并将结构化证据包直接放入提示词。",
+            )
+        )
     if sql_fallback_warning is not None:
         outcome.warnings.append(sql_fallback_warning)
     try:

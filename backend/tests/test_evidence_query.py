@@ -393,7 +393,35 @@ async def test_fact_parity_with_evidence_search_on_four_categories(sqlite_engine
 # =====================================================================
 
 
-async def test_build_skeleton_has_navigation_only(sqlite_engine):
+def test_build_skeleton_filters_to_matched_chains():
+    graph_ = spec_graph()
+    requirement_map = spec_requirement_map(graph_)
+    materials = collect_materials(requirement_map, graph_)
+    matched_chain_id = requirement_map.matches[0].chainId
+
+    skeleton = build_skeleton(
+        materials,
+        {"f1": (PAGE_ID,)},
+        matched_chain_ids={matched_chain_id},
+    )
+
+    page_value = skeleton["pages"][0]
+    assert [chain["chainId"] for chain in page_value["chains"]] == [matched_chain_id]
+    assert all("texts" not in step for chain in page_value["chains"] for step in chain["steps"])
+
+
+def test_build_skeleton_empty_matched_chains_does_not_expand():
+    _, materials = _form_materials()
+    skeleton = build_skeleton(
+        materials,
+        {"f1": (PAGE_ID,)},
+        matched_chain_ids=set(),
+    )
+
+    assert skeleton["pages"][0]["chains"] == []
+
+
+def test_build_skeleton_has_navigation_only():
     _, materials = _form_materials()
     skeleton = build_skeleton(materials, {"f1": (PAGE_ID,)})
     pages = skeleton["pages"]
@@ -423,6 +451,7 @@ async def test_build_skeleton_has_navigation_only(sqlite_engine):
     # 不含契约数据
     assert "uiText" not in page
     assert "elements" not in page
+
 
 
 # =====================================================================

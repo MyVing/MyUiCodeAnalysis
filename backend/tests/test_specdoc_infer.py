@@ -180,6 +180,55 @@ def _multi_page_inputs():
     )
 
 
+async def test_tool_prompt_contains_only_requirement_matched_chains() -> None:
+    requirement_map, materials, _, _, _ = _multi_page_inputs()
+    captured_users: list[str] = []
+
+    class ToolFake:
+        async def chat_with_tools(self, system, user, *, tools, executor, max_tool_calls):
+            captured_users.append(user)
+            if "步骤" in system:
+                return json.dumps({"steps": []})
+            if "规则" in system:
+                return json.dumps({"rules": []})
+            return json.dumps({"fieldMappings": []})
+
+    await infer_sections(
+        requirement_map.requirement,
+        requirement_map,
+        materials,
+        ToolFake(),  # type: ignore[arg-type]
+        max_calls=1,
+    )
+
+    skeletons = [
+        json.loads(user.split("页面与链路骨架：\n", 1)[1].split("\n请", 1)[0])
+        for user in captured_users[:2]
+    ]
+    step_chains = {
+        chain["chainId"]
+        for page_value in skeletons[0]["pages"]
+        for chain in page_value["chains"]
+    }
+    rule_chains = {
+        chain["chainId"]
+        for page_value in skeletons[1]["pages"]
+        for chain in page_value["chains"]
+    }
+    expected_chains = {
+        match.chainId for match in requirement_map.matches if match.chainId
+    }
+    assert step_chains == expected_chains
+    assert rule_chains == expected_chains
+    assert all(
+        "texts" not in step
+        for skeleton in skeletons
+        for page_value in skeleton["pages"]
+        for chain in page_value["chains"]
+        for step in chain["steps"]
+    )
+
+
 async def test_steps_use_chain_page_for_multi_page_feature() -> None:
     requirement_map, materials, second_id, chain_id, element_id = _multi_page_inputs()
     steps = {"steps": [{
@@ -686,6 +735,7 @@ async def test_unresolvable_model_keeps_sections_empty_with_warning() -> None:
     )
     assert outcome.steps == [] and outcome.rules == [] and outcome.field_mappings == []
     assert [warning.code for warning in outcome.warnings] == [
+        "evidence_full_prompt_fallback",
         "llm_unavailable",
         "llm_unavailable",
         "llm_unavailable",
@@ -703,7 +753,8 @@ async def test_non_retryable_error_short_circuits() -> None:
         max_calls=3,
     )
     assert outcome.steps == []
-    assert outcome.warnings[0].code == "llm_unavailable"
+    assert outcome.warnings[0].code == "evidence_full_prompt_fallback"
+    assert outcome.warnings[1].code == "llm_unavailable"
 
 
 async def test_partial_failure_keeps_good_sections() -> None:
