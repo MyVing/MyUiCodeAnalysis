@@ -11,7 +11,11 @@ import time
 
 from fastapi.testclient import TestClient
 
-from app.api.deps import get_analysis_repository, get_llm_client, get_requirement_repository
+from app.api.deps import (
+    get_analysis_repository,
+    get_requirement_repository,
+    get_specdoc_llm_client,
+)
 from tests.fakes import FakeLLMClient
 from tests.specdoc_fixture import spec_graph, spec_requirement_map
 
@@ -62,7 +66,7 @@ def test_start_returns_task_and_full_flow_succeeds(client: TestClient, project: 
     graph_ = spec_graph(analysis_id="an_api")
     requirement_map = spec_requirement_map(graph_, requirement_id="req_api")
     _seed(client, project["id"], graph_, requirement_map)
-    client.app.dependency_overrides[get_llm_client] = lambda: FakeLLMClient(
+    client.app.dependency_overrides[get_specdoc_llm_client] = lambda: FakeLLMClient(
         [
             json.dumps({"steps": []}),
             json.dumps(VALID_RULES),

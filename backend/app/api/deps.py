@@ -31,6 +31,7 @@ from app.runtime.requirement_collect import RequirementCollectService
 from app.runtime.runner import RuntimeWorkerRunner, SubprocessRuntimeRunner
 from app.runtime.service import RuntimeService
 from app.services.project_service import ProjectService
+from app.specdoc.llm import OpenAICompatibleToolLLM, build_specdoc_llm_client
 from app.specdoc.service import SpecDocService
 from app.storage.chat import ChatSessionRepository
 from app.storage.checkpoint import MySqlCheckpointSaver
@@ -113,6 +114,10 @@ def get_llm_client() -> LLMClient | None:
     return build_llm_client(get_settings())
 
 
+def get_specdoc_llm_client() -> OpenAICompatibleToolLLM | None:
+    return build_specdoc_llm_client(get_settings())
+
+
 def get_analysis_service(
     repository: Annotated[AnalysisRepository, Depends(get_analysis_repository)],
     runner: Annotated[WorkerRunner, Depends(get_worker_runner)],
@@ -186,7 +191,7 @@ def get_specdoc_service(
     repository: Annotated[SpecDocRepository, Depends(get_specdoc_repository)],
     requirements: Annotated[RequirementRepository, Depends(get_requirement_repository)],
     analyses: Annotated[AnalysisRepository, Depends(get_analysis_repository)],
-    llm: Annotated[LLMClient | None, Depends(get_llm_client)],
+    llm: Annotated[object | None, Depends(get_specdoc_llm_client)],
     settings: SettingsDep,
 ) -> SpecDocService:
     return SpecDocService(repository, requirements, analyses, settings, llm)

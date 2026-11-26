@@ -32,20 +32,20 @@ from app.contracts.specdoc import (
 )
 from app.contracts.specdoc import RequirementWarning as DocWarning
 from app.core.config import Settings
-from app.requirement.llm import LLMClient
 from app.schemas import Project, SpecDocTask
 from app.specdoc.apimap import build_api_mappings
 from app.specdoc.collect import Materials, collect_materials, deterministic_field_mappings
 from app.specdoc.elements import build_elements
 from app.specdoc.events import build_events
 from app.specdoc.infer import InferOutcome, infer_sections
+from app.specdoc.llm import OpenAICompatibleToolLLM
 
 SCHEMA_VERSION = "1.0"
 logger = logging.getLogger(__name__)
 
 
 class SpecDocOrchestrator:
-    def __init__(self, settings: Settings, llm: LLMClient | None) -> None:
+    def __init__(self, settings: Settings, llm: OpenAICompatibleToolLLM | None) -> None:
         self._settings = settings
         self._llm = llm
 

@@ -20,8 +20,8 @@ from app.contracts import IRGraph
 from app.contracts.requirement import RequirementMap
 from app.contracts.specdoc import SpecDocMap
 from app.core.config import Settings
-from app.requirement.llm import LLMClient
 from app.schemas import Project, SpecDocStart, SpecDocTask
+from app.specdoc.llm import OpenAICompatibleToolLLM
 from app.specdoc.orchestrator import SpecDocOrchestrator
 from app.storage.repositories import AnalysisRepository
 from app.storage.requirement import RequirementRepository
@@ -46,7 +46,7 @@ class SpecDocService:
         requirements: RequirementRepository,
         analyses: AnalysisRepository,
         settings: Settings,
-        llm: LLMClient | None = None,
+        llm: OpenAICompatibleToolLLM | None = None,
     ) -> None:
         self._repository = repository
         self._requirements = requirements

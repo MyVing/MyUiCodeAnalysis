@@ -17,6 +17,7 @@ from app.api.deps import (
     get_requirement_repository,
     get_runtime_repository,
     get_runtime_worker_runner,
+    get_specdoc_llm_client,
     get_worker_runner,
 )
 from app.core.config import Settings, get_settings
@@ -117,6 +118,7 @@ def client(
     # 默认禁用 LLM（get_llm_client 直接读本地 .env，会打到真实服务）；
     # 需要 LLM 的用例在测试内自行覆盖为 FakeLLMClient
     app.dependency_overrides[get_llm_client] = lambda: None
+    app.dependency_overrides[get_specdoc_llm_client] = lambda: None
     with TestClient(app) as test_client:
         yield test_client
     app.dependency_overrides.clear()

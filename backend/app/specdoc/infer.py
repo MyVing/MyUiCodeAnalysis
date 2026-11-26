@@ -12,6 +12,7 @@
 
 from __future__ import annotations
 
+import json
 import re
 from collections import Counter
 from dataclasses import dataclass, field
@@ -40,6 +41,8 @@ from app.requirement.llm import LLMCallError, LLMClient
 from app.specdoc.apimap import all_api_steps
 from app.specdoc.collect import Materials, PageMaterial
 from app.specdoc.evidence import build_evidence_pack
+from app.specdoc.llm import OpenAICompatibleToolLLM
+from app.specdoc.retrieval import EVIDENCE_TOOL, EvidenceLedger, EvidenceSearch
 
 _STEPS_SYSTEM = """\
 你是资深前端规格分析师。根据给定的需求、功能点与页面语料（均为代码原文），\
@@ -107,6 +110,7 @@ class _PageContext:
     # 该页面的接口集合（method, url），字段映射按 api 反查页面用
     api_urls: tuple[tuple[str, str], ...] = ()
     # 页面内可用节点文本与节点所属链路，用于锚点范围校验
+    ledger: EvidenceLedger | None = None
     texts_by_node: dict[str, tuple[str, ...]] = field(default_factory=dict)
     chain_nodes: dict[str, frozenset[str]] = field(default_factory=dict)
     feature_chains: dict[str, frozenset[str]] = field(default_factory=dict)
@@ -137,7 +141,7 @@ async def infer_sections(
     requirement: str,
     requirement_map: RequirementMap,
     materials: Materials,
-    llm: LLMClient,
+    llm: OpenAICompatibleToolLLM,
     max_calls: int,
     *,
     events_by_page: dict[str, list[Event]] | None = None,
@@ -183,6 +187,12 @@ async def infer_sections(
         }
     feature_pages = _feature_pages(requirement_map, contexts)
     features = list(requirement_map.features)
+    ledger = EvidenceLedger()
+    search = EvidenceSearch(
+        exposed_pages, ledger,
+        {page_id for page_ids in feature_pages.values() for page_id in page_ids},
+    )
+    tool_mode = callable(getattr(llm, "chat_with_tools", None))
     shadow_counts: Counter[str] = Counter()
 
     outcome = InferOutcome(
@@ -195,26 +205,147 @@ async def infer_sections(
             for warning in evidence_pack.prompt_warnings
         ]
     )
-    steps, dropped, warnings = await _infer_steps(
-        requirement, features, feature_pages, contexts, llm, max_calls, evidence_json
-    )
+    try:
+        if tool_mode:
+            parsed_text = await llm.chat_with_tools(
+                _STEPS_SYSTEM,
+                "需求：" + requirement + "\n功能点：\n"
+                + "\n".join(f"- {item.id}: {item.text}" for item in features)
+                + "\n页面与链路骨架：\n"
+                + json.dumps(search.skeleton(feature_pages), ensure_ascii=False)
+                + "\n请先按需调用 search_evidence 获取引文，再输出步骤 JSON。",
+                tools=[EVIDENCE_TOOL],
+                executor=search.execute,
+                max_tool_calls=max(1, max_calls * 2),
+            )
+            parsed = parse_json(parsed_text)
+        else:
+            parsed = None
+    except LLMCallError as error:
+        parsed = None
+        tool_warning = RequirementWarning(
+            code=getattr(error, "code", "llm_unavailable"),
+            severity=Severity.warning,
+            message="步骤按需证据检索失败或预算耗尽，步骤章节已留空。",
+        )
+    else:
+        tool_warning = None
+    for context in contexts:
+        context.ledger = ledger if tool_mode else None
+        context.texts_by_node = ledger.texts_by_node() if tool_mode else exposed_texts.get(
+            context.material.page.pageId, {}
+        )
+    if tool_mode and parsed is None:
+        steps, dropped, warnings = [], [], [tool_warning or _unavailable_warning("步骤推断")]
+    elif tool_mode:
+        steps, dropped, warnings = await _infer_steps(
+            requirement, features, feature_pages, contexts, llm, max_calls, "",
+            parsed_override=parsed,
+        )
+        if tool_warning is not None:
+            warnings = [*(warnings or []), tool_warning]
+    else:
+        steps, dropped, warnings = await _infer_steps(
+            requirement, features, feature_pages, contexts, llm, max_calls, evidence_json
+        )
     outcome.steps, outcome.dropped = steps, dropped
     outcome.warnings.extend(warnings or [])
     shadow_counts.update(_shadow_drop_counts(dropped))
-    rules, dropped, warnings = await _infer_rules(
-        requirement, features, feature_pages, contexts, llm, max_calls, evidence_json
-    )
+    for context in contexts:
+        context.ledger = EvidenceLedger() if tool_mode else None
+    if tool_mode:
+        rules_ledger = EvidenceLedger()
+        rules_search = EvidenceSearch(
+            exposed_pages, rules_ledger,
+            {context.material.page.pageId for context in contexts},
+        )
+        try:
+            rules_text = await llm.chat_with_tools(
+                _RULES_SYSTEM,
+                "需求：" + requirement + "\n功能点：\n"
+                + "\n".join(f"- {item.id}: {item.text}" for item in features)
+                + "\n页面与链路骨架：\n"
+                + json.dumps(rules_search.skeleton(feature_pages), ensure_ascii=False)
+                + "\n请按需检索链路、界面文本或事件事实，再输出规则 JSON。",
+                tools=[EVIDENCE_TOOL], executor=rules_search.execute,
+                max_tool_calls=max(1, max_calls * 2),
+            )
+            rules_parsed = parse_json(rules_text)
+            rules_warning = None
+        except LLMCallError as error:
+            rules_parsed = None
+            rules_warning = RequirementWarning(
+                code=getattr(error, "code", "llm_unavailable"),
+                severity=Severity.warning,
+                message="业务规则按需证据检索失败或预算耗尽，规则章节已留空。",
+            )
+        for context in contexts:
+            context.ledger = rules_ledger
+            context.texts_by_node = rules_ledger.texts_by_node()
+        rules, dropped, warnings = await _infer_rules(
+            requirement, features, feature_pages, contexts, llm, max_calls, "",
+            parsed_override=rules_parsed,
+        ) if rules_parsed is not None else ([], [], [_unavailable_warning("业务规则推断")])
+        if rules_warning is not None:
+            warnings = [*(warnings or []), rules_warning]
+    else:
+        rules, dropped, warnings = await _infer_rules(
+            requirement, features, feature_pages, contexts, llm, max_calls, evidence_json
+        )
     outcome.rules.extend(rules)
     outcome.dropped.extend(dropped)
     outcome.warnings.extend(warnings or [])
     shadow_counts.update(_shadow_drop_counts(dropped))
-    mappings, dropped, warnings = await _infer_mappings(
-        requirement, contexts, llm, max_calls, evidence_json,
-        available=not any(
-            code in evidence_pack.prompt_warnings
-            for code in ("evidence_forms_truncated", "evidence_api_facts_truncated")
-        ),
-    )
+    if tool_mode:
+        mappings_ledger = EvidenceLedger()
+        mapping_search = EvidenceSearch(
+            exposed_pages, mappings_ledger,
+            {context.material.page.pageId for context in contexts},
+        )
+        try:
+            mappings_text = await llm.chat_with_tools(
+                _MAPPING_SYSTEM,
+                "需求：" + requirement + "\n页面、表单与接口范围：\n"
+                + json.dumps(
+                    mapping_search.skeleton({
+                        "mapping": tuple(context.material.page.pageId for context in contexts)
+                    }),
+                    ensure_ascii=False,
+                )
+                + "\n仅为 fieldMappings 引用 forms 与 apiFacts；"
+                "请先检索 category=form 与 category=apiFact 所需事实，再输出映射 JSON。",
+                tools=[EVIDENCE_TOOL], executor=mapping_search.execute,
+                max_tool_calls=max(1, max_calls * 2),
+            )
+            mappings_parsed = parse_json(mappings_text)
+            mappings_warning = None
+        except LLMCallError as error:
+            mappings_parsed = None
+            mappings_warning = RequirementWarning(
+                code=getattr(error, "code", "llm_unavailable"),
+                severity=Severity.warning,
+                message="字段映射按需证据检索失败或预算耗尽，字段映射章节已留空。",
+            )
+        for context in contexts:
+            context.ledger = mappings_ledger
+            context.texts_by_node = mappings_ledger.texts_by_node()
+        mappings, dropped, warnings = await _infer_mappings(
+            requirement, contexts, llm, max_calls, "", parsed_override=mappings_parsed,
+            available=not any(
+                code in evidence_pack.prompt_warnings
+                for code in ("evidence_forms_truncated", "evidence_api_facts_truncated")
+            ),
+        ) if mappings_parsed is not None else ([], [], [_unavailable_warning("字段映射推断")])
+        if mappings_warning is not None:
+            warnings = [*(warnings or []), mappings_warning]
+    else:
+        mappings, dropped, warnings = await _infer_mappings(
+            requirement, contexts, llm, max_calls, evidence_json,
+            available=not any(
+                code in evidence_pack.prompt_warnings
+                for code in ("evidence_forms_truncated", "evidence_api_facts_truncated")
+            ),
+        )
     outcome.field_mappings.extend(mappings)
     outcome.dropped.extend(dropped)
     outcome.warnings.extend(warnings or [])
@@ -328,24 +459,33 @@ def _page_contexts(materials: Materials) -> list[_PageContext]:
                 )
         for api_id, api_node in material.api_nodes.items():
             request_body = api_node.attrs.get("requestBody")
-            request_texts = (
-                [request_body]
-                if isinstance(request_body, str)
-                else [f"{key}: {value}" for key, value in sorted(request_body.items())]
-                if isinstance(request_body, dict)
-                else []
-            )
+            if isinstance(request_body, str):
+                request_texts = [request_body]
+            elif isinstance(request_body, dict):
+                request_texts = [
+                    f"{key}: {value}" for key, value in sorted(request_body.items())
+                ]
+            else:
+                request_texts = []
             for text in request_texts:
-                if text.strip():
-                    evidence_by_text.setdefault(text, _evidence_from_step(api_id, text, None))
+                if isinstance(text, str) and text.strip():
+                    evidence_by_text.setdefault(
+                        text, _evidence_from_step(api_id, text, None)
+                    )
         contexts.append(
             _PageContext(
                 material=material,
                 evidence_by_text=evidence_by_text,
-                api_urls=tuple(
-                    (str(method or ""), str(url or ""))
-                    for method, url in all_api_steps(material.chains)
-                ),
+                api_urls=tuple(dict.fromkeys(
+                    [
+                        (str(method or ""), str(url or ""))
+                        for method, url in all_api_steps(material.chains)
+                    ]
+                    + [
+                        (str(api.attrs.get("method") or ""), str(api.attrs.get("url") or ""))
+                        for api in material.api_nodes.values()
+                    ]
+                )),
             )
         )
     return contexts
@@ -439,6 +579,7 @@ def _verified(
     quote: str, context: _PageContext, *, node_id: str | None = None,
     chain_id: str | None = None, element_id: str | None = None,
     ui_text_only: bool = False,
+    required_category: str | None = None,
 ) -> VerifiedEvidence | None:
     """逐字校验引文，并在提供引用锚点时限制到对应节点/链路。"""
     if node_id is not None and node_id not in context.texts_by_node:
@@ -480,10 +621,38 @@ def _verified(
     if match is None:
         return None
     evidence = evidence_index.get(match.corpus_text)
-    if allowed_nodes is not None:
-        for current in sorted(allowed_nodes):
-            if match.corpus_text not in context.texts_by_node.get(current, ()):
-                continue
+    if context.ledger is not None:
+        ledger_fact = next(
+            (
+                fact for fact in context.ledger.facts.values()
+                if fact.page_id == context.material.page.pageId
+                and fact.text == match.corpus_text
+                and (allowed_nodes is None or fact.node_id in allowed_nodes)
+                and (chain_id is None or fact.chain_id == chain_id)
+                and (node_id is None or fact.node_id == node_id)
+                and (element_id is None or fact.node_id == element_id)
+                and (required_category is None or fact.category == required_category)
+            ),
+            None,
+        )
+        if ledger_fact is None:
+            return None
+        step = next(
+            (
+                step for chain in context.material.chains
+                if chain.id == ledger_fact.chain_id
+                for step in chain.steps if step.node_id == ledger_fact.node_id
+            ),
+            None,
+        )
+        evidence = _evidence_from_step(ledger_fact.node_id, match.corpus_text, step)
+    elif allowed_nodes is not None:
+        current = next(
+            (item for item in sorted(allowed_nodes)
+             if match.corpus_text in context.texts_by_node.get(item, ())),
+            None,
+        )
+        if current is not None:
             step = next(
                 (
                     step for chain in context.material.chains
@@ -492,7 +661,6 @@ def _verified(
                 None,
             )
             evidence = _evidence_from_step(current, match.corpus_text, step)
-            break
     if evidence is None:
         return None
     confidence = capped_confidence(1.0, quote_ambiguous=match.partial)
@@ -507,18 +675,22 @@ async def _infer_steps(
     llm: LLMClient,
     max_calls: int,
     evidence_json: str,
+    *,
+    parsed_override: dict[str, object] | None = None,
 ) -> tuple[list[Step], list[Dropped], list[RequirementWarning] | None]:
     if not features:
         return [], [], []
-    parsed = await _call_json(
-        llm,
-        _STEPS_SYSTEM,
-        _user_prompt(
-            requirement, features, contexts, with_features=True,
-            evidence_json=evidence_json,
-        ),
-        max_calls,
-    )
+    parsed = parsed_override
+    if parsed is None:
+        parsed = await _call_json(
+            llm,
+            _STEPS_SYSTEM,
+            _user_prompt(
+                requirement, features, contexts, with_features=True,
+                evidence_json=evidence_json,
+            ),
+            max_calls,
+        )
     if parsed is None:
         return [], [], [_unavailable_warning("步骤推断")]
     context_by_page = {ctx.material.page.pageId: ctx for ctx in contexts}
@@ -644,8 +816,10 @@ async def _infer_rules(
     llm: LLMClient,
     max_calls: int,
     evidence_json: str,
+    *,
+    parsed_override: dict[str, object] | None = None,
 ) -> tuple[list[Rule], list[Dropped], list[RequirementWarning] | None]:
-    parsed = await _call_json(
+    parsed = parsed_override if parsed_override is not None else await _call_json(
         llm,
         _RULES_SYSTEM,
         _user_prompt(
@@ -870,6 +1044,7 @@ async def _infer_mappings(
     evidence_json: str,
     *,
     available: bool = True,
+    parsed_override: dict[str, object] | None = None,
 ) -> tuple[list[FieldMapping], list[Dropped], list[RequirementWarning] | None]:
     if not available:
         return [], [], [
@@ -879,7 +1054,7 @@ async def _infer_mappings(
                 message="字段映射推断已跳过：证据预算裁剪后 forms 或 apiFacts 不完整。",
             )
         ]
-    parsed = await _call_json(
+    parsed = parsed_override if parsed_override is not None else await _call_json(
         llm,
         _MAPPING_SYSTEM,
         _user_prompt(requirement, [], contexts, with_features=False, evidence_json=evidence_json),
@@ -915,7 +1090,8 @@ async def _infer_mappings(
             evidence, page_id = None, None
         else:
             evidence, page_id = _locate_mapping_quote_tolerant(
-                api, quote, contexts, element_id=element_id
+                api, quote, contexts, element_id=element_id,
+                ledger_only=any(context.ledger is not None for context in contexts),
             )
         if evidence is None:
             dropped.append(Dropped(reason=Reason.quote_not_found, quote=quote))
@@ -953,20 +1129,24 @@ def _mapping_quote_candidates(quote: str | None) -> list[str]:
 
 
 def _locate_mapping_quote_tolerant(
-    api: str, quote: str | None, contexts: list[_PageContext], *, element_id: str | None
+    api: str, quote: str | None, contexts: list[_PageContext], *, element_id: str | None,
+    ledger_only: bool = False,
 ) -> tuple[VerifiedEvidence | None, str | None]:
     """逐个候选引文尝试定位，且限制到模型声明的表单元素。"""
     if element_id is None:
         return None, None
     for candidate in _mapping_quote_candidates(quote):
-        evidence, page_id = _locate_mapping_quote(api, candidate, contexts, element_id=element_id)
+        evidence, page_id = _locate_mapping_quote(
+            api, candidate, contexts, element_id=element_id, ledger_only=ledger_only
+        )
         if evidence is not None:
             return evidence, page_id
     return None, None
 
 
 def _locate_mapping_quote(
-    api: str, quote: str | None, contexts: list[_PageContext], *, element_id: str
+    api: str, quote: str | None, contexts: list[_PageContext], *, element_id: str,
+    ledger_only: bool = False,
 ) -> tuple[VerifiedEvidence | None, str | None]:
     """按 api 反查页面，再在该页语料里校验引文。
 
@@ -987,12 +1167,26 @@ def _locate_mapping_quote(
             if api_node.attrs.get("url") == url
         ]
         # 表单字段引文必须归属于模型声明的元素节点。
-        evidence = _verified(quote, context, node_id=element_id)
+        evidence = _verified(
+            quote, context, node_id=element_id,
+            required_category="form" if ledger_only else None,
+        )
         if evidence is not None:
             return evidence, context.material.page.pageId
         # requestBody / API 文本必须归属于该 URL 对应的 API 节点。
+        if ledger_only and not any(
+            fact.page_id == context.material.page.pageId
+            and fact.node_id in api_node_ids
+            and fact.category == "apiFact"
+            and fact.text == quote
+            for fact in context.ledger.facts.values()
+        ) if context.ledger is not None else False:
+            continue
         for api_node_id in api_node_ids:
-            evidence = _verified(quote, context, node_id=api_node_id)
+            evidence = _verified(
+                quote, context, node_id=api_node_id,
+                required_category="apiFact" if ledger_only else None,
+            )
             if evidence is not None:
                 return evidence, context.material.page.pageId
     return None, None

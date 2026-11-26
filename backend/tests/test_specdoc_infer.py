@@ -86,6 +86,40 @@ def _llm_with(steps=_VALID_STEPS, rules=_VALID_RULES, mappings=_VALID_MAPPINGS) 
     )
 
 
+async def test_tool_steps_only_validate_quotes_returned_by_retrieval() -> None:
+    graph_ = spec_graph()
+    requirement_map = spec_requirement_map(graph_)
+    materials = collect_materials(requirement_map, graph_)
+    chain_id = next(
+        chain.id for chain in materials.pages[0].chains
+        if chain.element.node_id.endswith("jsx:button")
+    )
+
+    class ToolFake:
+        async def chat_with_tools(self, system, user, *, tools, executor, max_tool_calls):
+            result = await executor("search_evidence", {
+                "pageId": PAGE_ID, "chainId": chain_id, "category": "chain"
+            })
+            quote = result["facts"][0]["text"]
+            return json.dumps({"steps": [{
+                "featureId": "f1", "chainId": chain_id,
+                "nodeId": result["facts"][0]["nodeId"],
+                "actions": ["点击按钮"], "quote": quote, "confidence": 0.8,
+            }]}, ensure_ascii=False)
+
+        async def chat(self, system, user):
+            if "规则" in system:
+                return json.dumps({"rules": []})
+            return json.dumps({"fieldMappings": []})
+
+    outcome = await infer_sections(
+        "转账", requirement_map, materials, ToolFake(), max_calls=2  # type: ignore[arg-type]
+    )
+
+    assert len(outcome.steps) == 1
+    assert outcome.steps[0].quote in outcome.steps[0].evidence[0].quote
+
+
 def _multi_page_inputs():
     graph_ = spec_graph()
     second_id = "src/pages/TransferReview.tsx#TransferReview"
