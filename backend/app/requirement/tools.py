@@ -2,10 +2,12 @@
 
 from __future__ import annotations
 
+import logging
 from pathlib import Path
 from typing import Any
 
 from app.contracts import IRGraph, IRNode, NodeKind
+from app.core.tracing import log_event
 from app.requirement.chains import ActionChain, derive_chains
 from app.requirement.features import decompose
 from app.requirement.llm import LLMCallError
@@ -14,6 +16,8 @@ from app.requirement.recall import page_nodes, recall
 MAX_TOOL_RESULTS = 5
 MAX_SOURCE_LINES = 120
 MAX_SOURCE_CHARS = 20_000
+
+logger = logging.getLogger(__name__)
 
 
 class RequirementToolError(LLMCallError):
@@ -108,16 +112,32 @@ class RequirementAnalysisTools:
                     "工具参数必须是 JSON 对象", code="invalid_tool_arguments"
                 )
             if name == "search_pages":
-                return self._search_pages(arguments)
-            if name == "search_interactions":
-                return self._search_interactions(arguments)
-            if name == "get_interaction_chain":
-                return self._get_chain(arguments)
-            if name == "read_source_range":
-                return self._read_source(arguments)
-            raise RequirementToolError("未知的需求分析工具", code="unknown_tool")
+                result = self._search_pages(arguments)
+            elif name == "search_interactions":
+                result = self._search_interactions(arguments)
+            elif name == "get_interaction_chain":
+                result = self._get_chain(arguments)
+            elif name == "read_source_range":
+                result = self._read_source(arguments)
+            else:
+                raise RequirementToolError("未知的需求分析工具", code="unknown_tool")
         except RequirementToolError as error:
+            log_event(
+                logger,
+                logging.DEBUG,
+                "requirement_tool_error",
+                tool=name,
+                code=error.code,
+            )
             return {"status": "error", "code": error.code, "message": error.message}
+        log_event(
+            logger,
+            logging.DEBUG,
+            "requirement_tool_done",
+            tool=name,
+            status=result.get("status") if isinstance(result, dict) else None,
+        )
+        return result
 
     @staticmethod
     def _keys(arguments: dict[str, Any], required: set[str], allowed: set[str]) -> None:

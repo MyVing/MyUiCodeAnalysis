@@ -30,6 +30,7 @@ _graph_dump.json
 Thumbs.db
 *.tgz
 *.whl
+*.zip
 
 # 注意：参考项目 reactgraph/ 与 ReactION/ 位于本仓库的父目录，不属于本仓库，
 # 天然不会被提交。若将来把它们移入本目录，务必在此添加忽略规则。

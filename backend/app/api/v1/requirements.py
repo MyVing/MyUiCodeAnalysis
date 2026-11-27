@@ -7,6 +7,8 @@
 这样前端「发起 → 轮询 taskId → 取 map」不需要回填项目 id。
 """
 
+import logging
+import time
 from datetime import UTC, datetime
 from uuid import uuid4
 
@@ -21,6 +23,7 @@ from app.api.deps import (
 )
 from app.api.v1.projects import require_project
 from app.contracts import RequirementMap
+from app.core.tracing import elapsed_ms, log_event
 from app.requirement.chat import RequirementChatPreconditionError
 from app.requirement.llm import LLMCallError
 from app.requirement.service import RequirementPreconditionError
@@ -38,6 +41,7 @@ from app.schemas import (
 )
 
 router = APIRouter(tags=["requirements"])
+logger = logging.getLogger(__name__)
 
 _PRECONDITION_STATUS: dict[str, int] = {
     "graph_missing": status.HTTP_409_CONFLICT,
@@ -77,9 +81,7 @@ async def start_requirement_locate(
         return await locate_service.start(project, payload)
     except RequirementPreconditionError as error:
         raise HTTPException(
-            status_code=_PRECONDITION_STATUS.get(
-                error.code, status.HTTP_409_CONFLICT
-            ),
+            status_code=_PRECONDITION_STATUS.get(error.code, status.HTTP_409_CONFLICT),
             detail=error.message,
         ) from None
 
@@ -100,30 +102,69 @@ async def requirement_chat(
     chat_service: RequirementChatServiceDep,
     analyses: AnalysisRepositoryDep,
 ) -> RequirementChatResult:
-    """同步需求对话：一次请求一次模型调用，会话历史由前端全量回传。
+    """需求对话：澄清需求、查询交互文档或基于只读工具分析业务逻辑。
 
-    项目已有解析产物时，先做意图判定：用户在「问某个功能的前端交互视图」
-    则基于锚点反向召回定位页面并就地生成规格文档（不落库）；否则走澄清。
-    图缺失不拦请求——退化为纯澄清对话。
+    项目已有解析产物时先做意图判定；图缺失则退化为纯澄清对话。
     """
     project = await require_project(project_id, service)
     graph = await analyses.get_latest_graph(project_id)
     messages = [{"role": item.role, "content": item.content} for item in payload.messages]
+    started = time.perf_counter()
+    checkpoint_meta: dict[str, object] = {}
+    log_event(
+        logger,
+        logging.INFO,
+        "request_start",
+        project_id=project_id,
+        route_path=payload.route_path,
+        message_count=len(messages),
+        message_characters=sum(len(message["content"]) for message in messages),
+        graph_loaded=graph is not None,
+    )
     try:
         reply, draft, doc_markdown, doc_page = await chat_service.chat(
             messages,
             project=project,
             graph=graph,
             route_path=payload.route_path,
+            checkpoint_meta=checkpoint_meta,
         )
     except RequirementChatPreconditionError as error:
+        log_event(
+            logger,
+            logging.WARNING,
+            "request_failed",
+            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+            code=error.code,
+            elapsed_ms=elapsed_ms(started),
+        )
         raise HTTPException(
             status_code=status.HTTP_503_SERVICE_UNAVAILABLE, detail=error.message
         ) from None
     except LLMCallError as error:
-        raise HTTPException(
-            status_code=status.HTTP_502_BAD_GATEWAY, detail=error.message
-        ) from None
+        log_event(
+            logger,
+            logging.WARNING,
+            "request_failed",
+            status_code=status.HTTP_502_BAD_GATEWAY,
+            code=error.code,
+            retryable=error.retryable,
+            elapsed_ms=elapsed_ms(started),
+            job_id=checkpoint_meta.get("job_id"),
+        )
+        raise HTTPException(status_code=status.HTTP_502_BAD_GATEWAY, detail=error.message) from None
+    log_event(
+        logger,
+        logging.INFO,
+        "request_done",
+        elapsed_ms=elapsed_ms(started),
+        reply_characters=len(reply),
+        has_draft=draft is not None,
+        has_doc=doc_markdown is not None,
+        doc_page=doc_page,
+        job_id=checkpoint_meta.get("job_id"),
+        resumed_sections=checkpoint_meta.get("resumed_sections"),
+    )
     return RequirementChatResult(
         reply=reply,
         draft_requirement=draft,
@@ -266,9 +307,7 @@ async def list_chat_sessions(
     response_model=ChatSession,
     responses={404: {"description": "会话不存在"}},
 )
-async def get_chat_session(
-    session_id: str, sessions: ChatSessionRepositoryDep
-) -> ChatSession:
+async def get_chat_session(session_id: str, sessions: ChatSessionRepositoryDep) -> ChatSession:
     session = await sessions.get(session_id)
     if session is None:
         raise HTTPException(
@@ -283,9 +322,7 @@ async def get_chat_session(
     status_code=status.HTTP_204_NO_CONTENT,
     responses={404: {"description": "会话不存在"}},
 )
-async def delete_chat_session(
-    session_id: str, sessions: ChatSessionRepositoryDep
-) -> None:
+async def delete_chat_session(session_id: str, sessions: ChatSessionRepositoryDep) -> None:
     deleted = await sessions.delete(session_id)
     if not deleted:
         raise HTTPException(

@@ -11,14 +11,19 @@
 
 from __future__ import annotations
 
+import logging
+from typing import Any
+
 from app.contracts import IRGraph
 from app.core.config import Settings
-from app.requirement.chat_doc import build_chat_doc, decide_intent
+from app.core.tracing import log_event
+from app.requirement.chat_doc import ChatDocOutcome, build_chat_doc, decide_intent
 from app.requirement.judge import parse_json
 from app.requirement.llm import LLMClient
 from app.requirement.tools import REQUIREMENT_TOOLS, RequirementAnalysisTools
 from app.schemas import Project
 from app.specdoc.llm import OpenAICompatibleToolLLM
+from app.storage.chatdoc_checkpoint import ChatDocCheckpointRepository
 
 CHAT_SYSTEM_PROMPT = """你是前端需求澄清助手，帮用户把模糊的功能想法聊成一段清晰的功能需求描述。
 
@@ -35,6 +40,8 @@ CHAT_SYSTEM_PROMPT = """你是前端需求澄清助手，帮用户把模糊的�
 
 _CHAT_TEMPERATURE = 0.7
 _TOOL_CHAT_TEMPERATURE = 0.2
+
+logger = logging.getLogger(__name__)
 
 BUSINESS_ANALYSIS_SYSTEM_PROMPT = (
     "你是当前项目代码的业务逻辑分析助手。你必须先使用提供的只读工具查找页面和交互，"
@@ -65,10 +72,12 @@ class RequirementChatService:
         settings: Settings | None = None,
         *,
         specdoc_llm: OpenAICompatibleToolLLM | None = None,
+        checkpoints: ChatDocCheckpointRepository | None = None,
     ) -> None:
         self._llm = llm
         self._settings = settings
         self._specdoc_llm = specdoc_llm
+        self._checkpoints = checkpoints
 
     async def chat(
         self,
@@ -77,6 +86,7 @@ class RequirementChatService:
         project: Project | None = None,
         graph: IRGraph | None = None,
         route_path: str | None = None,
+        checkpoint_meta: dict[str, Any] | None = None,
     ) -> tuple[str, str | None, str | None, str | None]:
         """返回 (reply, draft_requirement, doc_markdown, doc_page)。
 
@@ -95,6 +105,13 @@ class RequirementChatService:
                 "",
             )
             if route_path:
+                log_event(
+                    logger,
+                    logging.INFO,
+                    "branch",
+                    branch="route_locating",
+                    route_path=route_path,
+                )
                 outcome = await build_chat_doc(
                     project,
                     latest_user_text or route_path,
@@ -103,9 +120,18 @@ class RequirementChatService:
                     self._settings,
                     specdoc_llm=self._specdoc_llm,
                     route_path=route_path,
+                    checkpoints=self._checkpoints,
                 )
+                _record_checkpoint_meta(checkpoint_meta, outcome)
                 return outcome.reply, None, outcome.doc_markdown, outcome.page_name
             intent = await decide_intent(self._llm, messages)
+            log_event(
+                logger,
+                logging.INFO,
+                "intent_decided",
+                intent=intent.intent,
+                has_feature=intent.feature_text is not None,
+            )
             if intent.intent == "business_analysis" and intent.feature_text:
                 if self._specdoc_llm is None:
                     raise RequirementChatPreconditionError(
@@ -138,7 +164,9 @@ class RequirementChatService:
                     self._settings,
                     specdoc_llm=self._specdoc_llm,
                     fallback_text=latest_user_text,
+                    checkpoints=self._checkpoints,
                 )
+                _record_checkpoint_meta(checkpoint_meta, outcome)
                 return outcome.reply, None, outcome.doc_markdown, outcome.page_name
         content = await self._llm.chat_messages(
             CHAT_SYSTEM_PROMPT, messages, temperature=_CHAT_TEMPERATURE
@@ -156,3 +184,13 @@ class RequirementChatService:
         reply_text = reply.strip() if isinstance(reply, str) and reply.strip() else content.strip()
         draft_text = draft.strip() if isinstance(draft, str) and draft.strip() else None
         return reply_text, draft_text
+
+
+def _record_checkpoint_meta(
+    target: dict[str, Any] | None, outcome: ChatDocOutcome
+) -> None:
+    if target is not None:
+        target.update(
+            job_id=outcome.job_id,
+            resumed_sections=list(outcome.resumed_sections),
+        )

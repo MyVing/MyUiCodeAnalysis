@@ -22,14 +22,19 @@ from __future__ import annotations
 
 import hashlib
 import json
+import logging
+import time
 from typing import Any
 
 from sqlalchemy import bindparam, text
 from sqlalchemy.exc import SQLAlchemyError
 from sqlalchemy.ext.asyncio import AsyncEngine
 
+from app.core.tracing import elapsed_ms, log_event, tool_args_summary
 from app.specdoc.llm import SpecDocToolError
 from app.specdoc.retrieval import EvidenceFact, EvidenceLedger, QueryCache
+
+logger = logging.getLogger(__name__)
 
 MAX_FACTS_PER_QUERY = 24  # 原来 EvidenceSearch 是 12；SQL 查询更可控，放宽一倍
 MAX_TEXT_CHARS_PER_FACT = 2_000
@@ -175,6 +180,16 @@ class EvidenceQuery:
         self, name: str, arguments: dict[str, Any]
     ) -> dict[str, Any]:
         """与 EvidenceSearch.execute 同签名、同返回格式。"""
+        started = time.perf_counter()
+        summary = tool_args_summary(arguments)
+        log_event(
+            logger,
+            logging.DEBUG,
+            "evidence_query_start",
+            backend="sql",
+            tool=name,
+            **summary,
+        )
         if set(arguments) - {"pageId", "chainId", "nodeId", "category"}:
             raise SpecDocToolError(
                 "证据检索参数包含未允许字段", code="invalid_tool_arguments"
@@ -197,6 +212,18 @@ class EvidenceQuery:
         )
         matched = facts[:MAX_FACTS_PER_QUERY]
         accepted = self.ledger.record(matched)
+        log_event(
+            logger,
+            logging.INFO,
+            "evidence_query_done",
+            backend="sql",
+            tool=name,
+            **summary,
+            matched=len(matched),
+            accepted=len(accepted),
+            status="budget_exhausted" if len(accepted) < len(matched) else "ok",
+            elapsed_ms=elapsed_ms(started),
+        )
         if len(accepted) < len(matched):
             return {
                 "status": "budget_exhausted",

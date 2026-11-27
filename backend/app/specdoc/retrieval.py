@@ -4,10 +4,15 @@ from __future__ import annotations
 
 import hashlib
 import json
+import logging
+import time
 from dataclasses import dataclass, field
 from typing import Any
 
+from app.core.tracing import elapsed_ms, log_event, tool_args_summary
 from app.specdoc.llm import SpecDocToolError
+
+logger = logging.getLogger(__name__)
 
 MAX_FACTS_PER_QUERY = 12
 MAX_TEXT_CHARS_PER_FACT = 2_000
@@ -84,6 +89,28 @@ class EvidenceLedger:
             self.chars_used += len(fact.text)
             accepted.append(fact)
         return accepted
+
+    def restore(self, items: object) -> None:
+        """从 checkpoint 恢复已接纳的事实；重复记录按 evidence_id 去重。"""
+        if not isinstance(items, list):
+            return
+        for item in items:
+            if not isinstance(item, dict):
+                continue
+            try:
+                fact = EvidenceFact(
+                    evidence_id=item["evidenceId"],
+                    page_id=item["pageId"],
+                    node_id=item["nodeId"],
+                    category=item["category"],
+                    text=item["text"],
+                    chain_id=item.get("chainId"),
+                    file=item.get("file"),
+                    line=item.get("line"),
+                )
+            except KeyError:
+                continue
+            self.record([fact])
 
     def texts_by_node(self) -> dict[str, tuple[str, ...]]:
         values: dict[str, list[str]] = {}
@@ -257,6 +284,16 @@ class EvidenceSearch:
         }
 
     async def execute(self, name: str, arguments: dict[str, Any]) -> dict[str, Any]:
+        started = time.perf_counter()
+        summary = tool_args_summary(arguments)
+        log_event(
+            logger,
+            logging.DEBUG,
+            "evidence_query_start",
+            backend="memory",
+            tool=name,
+            **summary,
+        )
         if set(arguments) - {"pageId", "chainId", "nodeId", "category"}:
             raise SpecDocToolError("证据检索参数包含未允许字段", code="invalid_tool_arguments")
         if name != "search_evidence":
@@ -287,6 +324,18 @@ class EvidenceSearch:
             raise SpecDocToolError("链路不在本次证据范围内", code="evidence_out_of_scope")
         matched = facts[:MAX_FACTS_PER_QUERY]
         accepted = self.ledger.record(matched)
+        log_event(
+            logger,
+            logging.INFO,
+            "evidence_query_done",
+            backend="memory",
+            tool=name,
+            **summary,
+            matched=len(matched),
+            accepted=len(accepted),
+            status="budget_exhausted" if len(accepted) < len(matched) else "ok",
+            elapsed_ms=elapsed_ms(started),
+        )
         if len(accepted) < len(matched):
             return {"status": "budget_exhausted", "facts": [item.as_dict() for item in accepted]}
         return {"status": "ok", "facts": [item.as_dict() for item in accepted]}

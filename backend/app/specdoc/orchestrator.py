@@ -12,6 +12,7 @@
 from __future__ import annotations
 
 import logging
+import time
 from collections import Counter, defaultdict
 from datetime import UTC, datetime
 
@@ -34,8 +35,10 @@ from app.contracts.specdoc import (
 )
 from app.contracts.specdoc import RequirementWarning as DocWarning
 from app.core.config import Settings
+from app.core.tracing import elapsed_ms, log_event
 from app.schemas import Project, SpecDocTask
 from app.specdoc.apimap import build_api_mappings
+from app.specdoc.checkpoint import ChatDocRun
 from app.specdoc.collect import Materials, collect_materials, deterministic_field_mappings
 from app.specdoc.elements import build_elements
 from app.specdoc.events import build_events
@@ -63,9 +66,21 @@ class SpecDocOrchestrator:
         task: SpecDocTask,
         requirement_map: RequirementMap,
         graph: IRGraph,
+        *,
+        run: ChatDocRun | None = None,
     ) -> SpecDocMap:
         """跑一次装配。素材解析失败（无命中页面）时返回只带告警的空产物。"""
+        started = time.perf_counter()
         materials = collect_materials(requirement_map, graph)
+        log_event(
+            logger,
+            logging.INFO,
+            "specdoc_collect",
+            task_id=task.id,
+            page_count=len(materials.pages),
+            warning_count=len(materials.warnings),
+            dry_run=task.dry_run,
+        )
         requirement_warnings: list[RequirementWarning] = materials.warnings
         warnings: list[DocWarning] = _convert_warnings(requirement_warnings)
 
@@ -80,6 +95,20 @@ class SpecDocOrchestrator:
             events_by_page,
             project_id=project.id,
             analysis_id=graph.analysisId,
+            run=run,
+            resume_attempts=self._settings.chatdoc_resume_attempts,
+            max_model_requests=self._settings.chatdoc_max_model_requests,
+            max_tool_calls=self._settings.chatdoc_max_tool_calls,
+        )
+        log_event(
+            logger,
+            logging.INFO,
+            "specdoc_infer_done",
+            task_id=task.id,
+            steps=len(infer_outcome.steps or []),
+            rules=len(infer_outcome.rules or []),
+            field_mappings=len(infer_outcome.field_mappings or []),
+            elapsed_ms=elapsed_ms(started),
         )
         warnings.extend(_convert_warnings(infer_outcome.warnings or []))
         shadow_counts = getattr(infer_outcome, "shadow_counts", {})
@@ -157,9 +186,14 @@ class SpecDocOrchestrator:
         *,
         project_id: str | None = None,
         analysis_id: str | None = None,
+        run: ChatDocRun | None = None,
+        resume_attempts: int = 2,
+        max_model_requests: int | None = None,
+        max_tool_calls: int | None = None,
     ) -> InferOutcome | _SkippedOutcome:
         """三个推断章节。dry-run / 无模型时留空 + 显式告警，不静默。"""
         if task.dry_run:
+            log_event(logger, logging.INFO, "specdoc_skip", reason="dry_run", task_id=task.id)
             return _SkippedOutcome(
                 warnings=_skipped_warning(
                     "dry_run_skipped_llm_sections",
@@ -168,6 +202,9 @@ class SpecDocOrchestrator:
                 )
             )
         if self._llm is None:
+            log_event(
+                logger, logging.INFO, "specdoc_skip", reason="llm_unavailable", task_id=task.id
+            )
             return _SkippedOutcome(
                 warnings=_skipped_warning(
                     "llm_unavailable",
@@ -175,6 +212,7 @@ class SpecDocOrchestrator:
                 )
             )
         if not materials.pages:
+            log_event(logger, logging.INFO, "specdoc_skip", reason="no_pages", task_id=task.id)
             return _SkippedOutcome()
         return await infer_sections(
             requirement,
@@ -186,6 +224,10 @@ class SpecDocOrchestrator:
             engine=self._engine,
             project_id=project_id,
             analysis_id=analysis_id,
+            run=run,
+            resume_attempts=resume_attempts,
+            max_model_requests=max_model_requests,
+            max_tool_calls=max_tool_calls,
         )
 
     def _number_steps(self, steps: list[Step]) -> list[Step]:

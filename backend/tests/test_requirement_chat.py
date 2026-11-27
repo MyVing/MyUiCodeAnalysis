@@ -30,8 +30,9 @@ def _post(client: TestClient, project_id: str, messages: list[dict[str, str]]) -
 
 
 def test_chat_returns_reply_and_draft(
-    client: TestClient, project: dict[str, object], fake_llm: FakeLLMClient
+    client: TestClient, project: dict[str, object], fake_llm: FakeLLMClient, caplog
 ) -> None:
+    user_secret = "private-user-message-123"
     fake_llm.responses = [
         json.dumps(
             {
@@ -40,6 +41,36 @@ def test_chat_returns_reply_and_draft(
             }
         )
     ]
+    response = client.post(
+        f"/api/v1/projects/{project['id']}/requirement-chat",
+        json={"messages": [{"role": "user", "content": user_secret}]},
+    )
+    assert response.status_code == 200, response.text
+    body = response.json()
+    assert response.headers.get("X-Request-ID")
+    assert body["reply"] == "信息够了，草稿已生成"
+    assert body["draftRequirement"] == "在用户列表页增加按状态筛选…"
+    assert body["docMarkdown"] is None and body["docPage"] is None
+    assert "request_start" in caplog.text and "request_done" in caplog.text
+    assert response.headers["X-Request-ID"] in caplog.text
+    assert f"message_characters={len(user_secret)}" in caplog.text
+    assert user_secret not in caplog.text
+
+    # 全量历史透传给模型；对话走 chat_messages（温度 0.7、系统提示词就位）
+    assert len(fake_llm.message_calls) == 1
+    system, messages, temperature = fake_llm.message_calls[0]
+    assert system == CHAT_SYSTEM_PROMPT
+    assert [item["role"] for item in messages] == ["user"]
+    assert messages[-1]["content"] == user_secret
+    assert temperature == pytest.approx(0.7)
+
+
+# keep the original multi-turn behavior covered in the follow-up test
+
+def test_chat_preserves_full_history(
+    client: TestClient, project: dict[str, object], fake_llm: FakeLLMClient
+) -> None:
+    fake_llm.responses = [json.dumps({"reply": "继续说说", "draftRequirement": None})]
     body = _post(
         client,
         str(project["id"]),
@@ -49,17 +80,11 @@ def test_chat_returns_reply_and_draft(
             {"role": "user", "content": "用户列表页按状态筛"},
         ],
     )
-    assert body["reply"] == "信息够了，草稿已生成"
-    assert body["draftRequirement"] == "在用户列表页增加按状态筛选…"
-    assert body["docMarkdown"] is None and body["docPage"] is None
-
-    # 全量历史透传给模型；对话走 chat_messages（温度 0.7、系统提示词就位）
-    assert len(fake_llm.message_calls) == 1
-    system, messages, temperature = fake_llm.message_calls[0]
+    assert body["reply"] == "继续说说"
+    system, messages, _temperature = fake_llm.message_calls[0]
     assert system == CHAT_SYSTEM_PROMPT
     assert [item["role"] for item in messages] == ["user", "assistant", "user"]
     assert messages[-1]["content"] == "用户列表页按状态筛"
-    assert temperature == pytest.approx(0.7)
 
 
 def test_non_json_output_falls_back_to_plain_reply(

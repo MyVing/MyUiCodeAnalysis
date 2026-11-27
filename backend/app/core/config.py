@@ -89,6 +89,15 @@ class Settings(BaseSettings):
     # 一个中型 SPA 有几十上百个路由，全量进 prompt 会挤掉链路细节。
     # 设 0 表示不预筛。
     llm_max_pages: int = 60
+    # 对话文档（/requirement-chat 查文档）的推断续跑参数。单章工具循环在
+    # 传输层重试耗尽后，会带着 checkpoint 重新进入循环；这里的次数与预算
+    # 都是「单章」口径，超出则该章留空 + warning，与旧行为一致。
+    chatdoc_resume_attempts: int = 2
+    chatdoc_max_model_requests: int | None = 12
+    chatdoc_max_tool_calls: int | None = 40
+    # chat_doc_jobs / chat_doc_checkpoints 的保留时长：过期的 job 启动时清理
+    # （级联删 checkpoint），不引入定时器。
+    chatdoc_checkpoint_ttl_minutes: int = 60
 
     # 分析成功后是否异步生成页面画像（每页一句业务描述，缓存给在线定位用）。
     # 默认关：打开意味着「每次分析多一次模型调用」，不该是隐式行为。

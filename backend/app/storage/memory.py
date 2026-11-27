@@ -7,6 +7,7 @@
 import asyncio
 import json
 from collections import deque
+from datetime import UTC, datetime
 from typing import Any
 
 from app.contracts import IRGraph, RequirementMap, RuntimeTrace, SpecDocMap
@@ -21,6 +22,7 @@ from app.schemas import (
     SpecDocTask,
 )
 from app.storage.chat import MAX_CHAT_SESSIONS_PER_PROJECT
+from app.storage.chatdoc_checkpoint import ChatDocJob
 from app.storage.repositories import DuplicateRemoteUrlError
 
 MAX_GRAPHS_PER_PROJECT = 5
@@ -537,3 +539,77 @@ class InMemoryChatSessionRepository:
 
 def create_chat_session_repository() -> InMemoryChatSessionRepository:
     return InMemoryChatSessionRepository()
+
+
+class InMemoryChatDocCheckpointRepository:
+    """Process-local checkpoint store for deployments without MySQL."""
+
+    def __init__(self) -> None:
+        self._jobs: dict[str, ChatDocJob] = {}
+        self._jobs_by_key: dict[str, str] = {}
+        self._scopes: dict[tuple[str, str], dict[str, Any]] = {}
+        self._lock = asyncio.Lock()
+
+    async def get_or_create_job(self, job: ChatDocJob) -> ChatDocJob:
+        async with self._lock:
+            existing_id = self._jobs_by_key.get(job.idempotency_key)
+            if existing_id is not None:
+                existing = self._jobs[existing_id]
+                if (
+                    existing.input_hash != job.input_hash
+                    or existing.pipeline_version != job.pipeline_version
+                ):
+                    raise ValueError("idempotency key conflicts with a different chat doc input")
+                # 同一请求重跑：续期到本次请求的 TTL，避免长会话里 checkpoint 提前过期
+                if job.expires_at > existing.expires_at:
+                    refreshed = ChatDocJob(
+                        **{**existing.__dict__, "expires_at": job.expires_at}
+                    )
+                    self._jobs[existing_id] = refreshed
+                    return refreshed
+                return existing
+            self._jobs[job.job_id] = job
+            self._jobs_by_key[job.idempotency_key] = job.job_id
+            return job
+
+    async def load_job(self, job_id: str) -> ChatDocJob | None:
+        async with self._lock:
+            return self._jobs.get(job_id)
+
+    async def load_scope(self, job_id: str, scope: str) -> dict[str, Any] | None:
+        async with self._lock:
+            value = self._scopes.get((job_id, scope))
+            return json.loads(json.dumps(value)) if value is not None else None
+
+    async def save_scope(
+        self, job_id: str, scope: str, payload: dict[str, Any], *, phase: str
+    ) -> None:
+        async with self._lock:
+            if job_id not in self._jobs:
+                raise KeyError(f"unknown chat doc job: {job_id}")
+            self._scopes[(job_id, scope)] = json.loads(json.dumps(payload))
+            job = self._jobs[job_id]
+            self._jobs[job_id] = ChatDocJob(
+                **{**job.__dict__, "current_phase": phase, "status": "running"}
+            )
+
+    async def finish_job(self, job_id: str, status: str) -> None:
+        async with self._lock:
+            job = self._jobs.get(job_id)
+            if job is not None:
+                self._jobs[job_id] = ChatDocJob(**{**job.__dict__, "status": status})
+
+    async def purge_expired(self) -> int:
+        now = datetime.now(UTC)
+        async with self._lock:
+            expired = [job_id for job_id, job in self._jobs.items() if job.expires_at <= now]
+            for job_id in expired:
+                job = self._jobs.pop(job_id)
+                self._jobs_by_key.pop(job.idempotency_key, None)
+                for key in [key for key in self._scopes if key[0] == job_id]:
+                    del self._scopes[key]
+            return len(expired)
+
+
+def create_chatdoc_checkpoint_repository() -> InMemoryChatDocCheckpointRepository:
+    return InMemoryChatDocCheckpointRepository()

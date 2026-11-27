@@ -35,6 +35,7 @@ from app.schemas import (
     SpecDocTask,
 )
 from app.storage.chat import MAX_CHAT_SESSIONS_PER_PROJECT
+from app.storage.chatdoc_checkpoint import ChatDocJob
 from app.storage.checkpoint import CHECKPOINT_DDL_STATEMENTS
 from app.storage.repositories import DuplicateRemoteUrlError
 
@@ -349,6 +350,37 @@ DDL_STATEMENTS: tuple[str, ...] = (
       CONSTRAINT fk_chat_sessions_project FOREIGN KEY (project_id)
         REFERENCES projects(id) ON DELETE CASCADE,
       KEY idx_chat_sessions_project (project_id, updated_at)
+    ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4
+    """,
+    # 对话文档的请求内断点：只覆盖 requirement-chat 的 route_locating 链路，
+    # 与正式 specdoc 任务表分开——语义是「一次同步请求可恢复」，不是可轮询任务。
+    """
+    CREATE TABLE IF NOT EXISTS chat_doc_jobs (
+      job_id VARCHAR(64) PRIMARY KEY,
+      idempotency_key CHAR(64) NOT NULL,
+      project_id VARCHAR(32) NOT NULL,
+      analysis_id VARCHAR(32) NULL,
+      input_hash CHAR(64) NOT NULL,
+      pipeline_version VARCHAR(32) NOT NULL,
+      status ENUM('running','succeeded','failed') NOT NULL,
+      current_phase VARCHAR(32) NOT NULL,
+      created_at DATETIME(6) NOT NULL,
+      updated_at DATETIME(6) NOT NULL,
+      expires_at DATETIME(6) NOT NULL,
+      CONSTRAINT uq_chat_doc_idem UNIQUE (idempotency_key),
+      KEY idx_chat_doc_expires (expires_at)
+    ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4
+    """,
+    """
+    CREATE TABLE IF NOT EXISTS chat_doc_checkpoints (
+      job_id VARCHAR(64) NOT NULL,
+      scope VARCHAR(32) NOT NULL,
+      version INT NOT NULL,
+      payload JSON NOT NULL,
+      updated_at DATETIME(6) NOT NULL,
+      PRIMARY KEY (job_id, scope),
+      CONSTRAINT fk_chat_doc_cp_job FOREIGN KEY (job_id)
+        REFERENCES chat_doc_jobs(job_id) ON DELETE CASCADE
     ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4
     """,
 )
@@ -2001,3 +2033,128 @@ class MySqlChatSessionRepository:
         async with self._engine.begin() as conn:
             result = await conn.execute(query, {"id": session_id})
         return result.rowcount > 0
+
+
+class MySqlChatDocCheckpointRepository:
+    """MySQL repository for resumable chat-generated spec documents."""
+
+    def __init__(self, engine: AsyncEngine) -> None:
+        self._engine = engine
+
+    @staticmethod
+    def _job(row: Row[Any]) -> ChatDocJob:
+        return ChatDocJob(
+            job_id=row.job_id,
+            idempotency_key=row.idempotency_key,
+            project_id=row.project_id,
+            analysis_id=row.analysis_id,
+            input_hash=row.input_hash,
+            pipeline_version=row.pipeline_version,
+            status=row.status,
+            current_phase=row.current_phase,
+            created_at=_from_db(row.created_at),
+            expires_at=_from_db(row.expires_at),
+        )
+
+    async def get_or_create_job(self, job: ChatDocJob) -> ChatDocJob:
+        async with self._engine.begin() as conn:
+            await conn.execute(
+                text(
+                    """
+                    INSERT INTO chat_doc_jobs
+                      (job_id, idempotency_key, project_id, analysis_id, input_hash,
+                       pipeline_version, status, current_phase, created_at, updated_at, expires_at)
+                    VALUES (:job_id, :idem, :pid, :aid, :input_hash, :version,
+                            'running', 'locating', :created, :created, :expires)
+                    ON DUPLICATE KEY UPDATE
+                      updated_at = VALUES(updated_at),
+                      expires_at = GREATEST(expires_at, VALUES(expires_at))
+                    """
+                ),
+                {
+                    "job_id": job.job_id,
+                    "idem": job.idempotency_key,
+                    "pid": job.project_id,
+                    "aid": job.analysis_id,
+                    "input_hash": job.input_hash,
+                    "version": job.pipeline_version,
+                    "created": _to_db(job.created_at),
+                    "expires": _to_db(job.expires_at),
+                },
+            )
+            row = (
+                await conn.execute(
+                    text("SELECT * FROM chat_doc_jobs WHERE idempotency_key = :idem FOR UPDATE"),
+                    {"idem": job.idempotency_key},
+                )
+            ).first()
+        if row is None:
+            raise RuntimeError("chat doc job insert did not return a row")
+        existing = self._job(row)
+        if (
+            existing.input_hash != job.input_hash
+            or existing.pipeline_version != job.pipeline_version
+        ):
+            raise ValueError("idempotency key conflicts with a different chat doc input")
+        return existing
+
+    async def load_job(self, job_id: str) -> ChatDocJob | None:
+        async with self._engine.connect() as conn:
+            row = (await conn.execute(
+                text("SELECT * FROM chat_doc_jobs WHERE job_id = :id"), {"id": job_id}
+            )).first()
+        return self._job(row) if row else None
+
+    async def load_scope(self, job_id: str, scope: str) -> dict[str, Any] | None:
+        async with self._engine.connect() as conn:
+            row = (
+                await conn.execute(
+                    text(
+                        "SELECT payload FROM chat_doc_checkpoints "
+                        "WHERE job_id = :id AND scope = :scope"
+                    ),
+                    {"id": job_id, "scope": scope},
+                )
+            ).first()
+        if row is None:
+            return None
+        return json.loads(row.payload) if isinstance(row.payload, str) else dict(row.payload)
+
+    async def save_scope(
+        self, job_id: str, scope: str, payload: dict[str, Any], *, phase: str
+    ) -> None:
+        async with self._engine.begin() as conn:
+            await conn.execute(
+                text(
+                    """
+                    INSERT INTO chat_doc_checkpoints (job_id, scope, version, payload, updated_at)
+                    VALUES (:id, :scope, :version, :payload, NOW(6))
+                    ON DUPLICATE KEY UPDATE version = VALUES(version),
+                      payload = VALUES(payload), updated_at = VALUES(updated_at)
+                    """
+                ),
+                {"id": job_id, "scope": scope, "version": 1,
+                 "payload": json.dumps(payload, ensure_ascii=False)},
+            )
+            await conn.execute(
+                text(
+                    "UPDATE chat_doc_jobs SET current_phase = :phase, "
+                    "updated_at = NOW(6) WHERE job_id = :id"
+                ),
+                {"phase": phase, "id": job_id},
+            )
+
+    async def finish_job(self, job_id: str, status: str) -> None:
+        async with self._engine.begin() as conn:
+            await conn.execute(
+                text(
+                    "UPDATE chat_doc_jobs SET status = :status, "
+                    "updated_at = NOW(6) WHERE job_id = :id"
+                ),
+                {"status": status, "id": job_id},
+            )
+
+    async def purge_expired(self) -> int:
+        async with self._engine.begin() as conn:
+            result = await conn.execute(text("DELETE FROM chat_doc_jobs WHERE expires_at < NOW(6)"))
+        return result.rowcount

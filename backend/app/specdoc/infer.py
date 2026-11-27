@@ -15,6 +15,7 @@ from __future__ import annotations
 import json
 import logging
 import re
+import time
 from collections import Counter
 from dataclasses import dataclass, field
 
@@ -38,10 +39,12 @@ from app.contracts.specdoc import (
     Step,
     VerifiedEvidence,
 )
+from app.core.tracing import elapsed_ms, log_event
 from app.requirement.chains import ChainStep
 from app.requirement.judge import capped_confidence, match_quote, parse_json
 from app.requirement.llm import LLMCallError, LLMClient
 from app.specdoc.apimap import all_api_steps
+from app.specdoc.checkpoint import ChatDocRun
 from app.specdoc.collect import Materials, PageMaterial
 from app.specdoc.evidence import (
     build_evidence_pack,
@@ -49,10 +52,62 @@ from app.specdoc.evidence import (
     build_skeleton_from_pages,
 )
 from app.specdoc.evidence_query import EvidenceQuery, graph_rows_exist
-from app.specdoc.llm import OpenAICompatibleToolLLM
+from app.specdoc.llm import OpenAICompatibleToolLLM, restore_ledger
 from app.specdoc.retrieval import EVIDENCE_TOOL, EvidenceLedger, EvidenceSearch, QueryCache
 
 logger = logging.getLogger(__name__)
+
+
+async def _chat_with_tools_resume(
+    llm: OpenAICompatibleToolLLM,
+    system: str,
+    user: str,
+    *,
+    tools: list[dict],
+    executor,
+    run: ChatDocRun | None,
+    scope: str,
+    resume_attempts: int = 2,
+    max_model_requests: int | None = None,
+    max_tool_calls: int | None = None,
+) -> str:
+    """请求内续跑已 checkpoint 的工具循环；只重试可恢复的传输类错误。
+
+    每轮模型请求内部先由 `_request_with_retry` 做 3 次短退避重试；仍失败时
+    这里再做一层续跑（最多 resume_attempts 次外部尝试）。续跑进入
+    `chat_with_tools` 后会从 checkpoint 恢复消息历史与工具结果，因此重试
+    不会重复执行已完成的 `search_evidence` 调用。
+    """
+    attempts = max(1, resume_attempts) if run is not None else 1
+    for attempt in range(attempts):
+        try:
+            if run is None:
+                return await llm.chat_with_tools(
+                    system, user, tools=tools, executor=executor
+                )
+            return await llm.chat_with_tools(
+                system,
+                user,
+                tools=tools,
+                executor=executor,
+                checkpoint=run,
+                scope=scope,
+                max_model_requests=max_model_requests,
+                max_tool_calls=max_tool_calls,
+            )
+        except LLMCallError as error:
+            if not error.retryable or attempt >= attempts - 1:
+                raise
+            log_event(
+                logger,
+                logging.WARNING,
+                "infer_section_resume",
+                section=scope,
+                attempt=attempt + 1,
+                code=getattr(error, "code", "llm_unavailable"),
+            )
+    raise AssertionError("unreachable")
+
 
 _STEPS_SYSTEM = """\
 你是资深前端规格分析师。根据给定的需求、功能点与页面语料（均为代码原文），\
@@ -158,6 +213,10 @@ async def infer_sections(
     engine: AsyncEngine | None = None,
     project_id: str | None = None,
     analysis_id: str | None = None,
+    run: ChatDocRun | None = None,
+    resume_attempts: int = 2,
+    max_model_requests: int | None = None,
+    max_tool_calls: int | None = None,
 ) -> InferOutcome:
     """跑三个推断章节。模型彻底不可用时不抛错：章节留空 + llm_unavailable 告警。
 
@@ -320,7 +379,7 @@ async def infer_sections(
     )
     if not tool_mode:
         logger.warning(
-            "specdoc 推断客户端不支持工具调用，回退到完整证据包提示：pages=%d chars=%d",
+            "specdoc 推断未注入工具客户端，回退到完整证据包提示：pages=%d chars=%d",
             len(evidence_pack.pages) if evidence_pack is not None else 0,
             len(evidence_json),
         )
@@ -328,24 +387,50 @@ async def infer_sections(
             RequirementWarning(
                 code="evidence_full_prompt_fallback",
                 severity=Severity.warning,
-                message="当前模型客户端不支持证据工具调用，推断使用兼容模式并将结构化证据包直接放入提示词。",
+                message="未注入工具客户端，推断使用兼容模式并将结构化证据包直接放入提示词。",
             )
         )
     if sql_fallback_warning is not None:
         outcome.warnings.append(sql_fallback_warning)
     try:
         if tool_mode:
-            parsed_text = await llm.chat_with_tools(
-                _STEPS_SYSTEM,
-                "需求：" + requirement + "\n功能点：\n"
-                + "\n".join(f"- {item.id}: {item.text}" for item in features)
-                + "\n页面与链路骨架：\n"
-                + skeleton_json
-                + "\n请先按需调用 search_evidence 获取引文，再输出步骤 JSON。",
-                tools=[EVIDENCE_TOOL],
-                executor=search.execute,
-            )
-            parsed = parse_json(parsed_text)
+            saved_steps = await run.load_parsed("steps") if run is not None else None
+            if saved_steps is not None:
+                parsed = saved_steps
+                tool_warning = None
+                restored = await run.load_scope("steps")
+                if restored is not None:
+                    restore_ledger(search.execute, restored.get("ledger"))
+            else:
+                steps_started = time.perf_counter()
+                log_event(logger, logging.INFO, "infer_section_start", section="steps")
+                parsed_text = await _chat_with_tools_resume(
+                    llm,
+                    _STEPS_SYSTEM,
+                    "需求：" + requirement + "\n功能点：\n"
+                    + "\n".join(f"- {item.id}: {item.text}" for item in features)
+                    + "\n页面与链路骨架：\n"
+                    + skeleton_json
+                    + "\n请先按需调用 search_evidence 获取引文，再输出步骤 JSON。",
+                    tools=[EVIDENCE_TOOL],
+                    executor=search.execute,
+                    run=run,
+                    scope="steps",
+                    resume_attempts=resume_attempts,
+                    max_model_requests=max_model_requests,
+                    max_tool_calls=max_tool_calls,
+                )
+                parsed = parse_json(parsed_text)
+                if run is not None and parsed is not None:
+                    await run.mark_parsed("steps", parsed)
+                log_event(
+                    logger,
+                    logging.INFO,
+                    "infer_section_done",
+                    section="steps",
+                    parsed=parsed is not None,
+                    elapsed_ms=elapsed_ms(steps_started),
+                )
         else:
             parsed = None
     except LLMCallError as error:
@@ -354,6 +439,13 @@ async def infer_sections(
             code=getattr(error, "code", "llm_unavailable"),
             severity=Severity.warning,
             message="步骤按需证据检索失败或预算耗尽，步骤章节已留空。",
+        )
+        log_event(
+            logger,
+            logging.WARNING,
+            "infer_section_failed",
+            section="steps",
+            code=tool_warning.code,
         )
     else:
         tool_warning = None
@@ -387,23 +479,54 @@ async def infer_sections(
             {context.material.page.pageId for context in contexts},
         )
         try:
-            rules_text = await llm.chat_with_tools(
-                _RULES_SYSTEM,
-                "需求：" + requirement + "\n功能点：\n"
-                + "\n".join(f"- {item.id}: {item.text}" for item in features)
-                + "\n页面与链路骨架：\n"
-                + skeleton_json
-                + "\n请按需检索链路、界面文本或事件事实，再输出规则 JSON。",
-                tools=[EVIDENCE_TOOL], executor=rules_search.execute,
-            )
-            rules_parsed = parse_json(rules_text)
+            rules_started = time.perf_counter()
+            log_event(logger, logging.INFO, "infer_section_start", section="rules")
+            saved_rules = await run.load_parsed("rules") if run is not None else None
+            if saved_rules is not None:
+                rules_parsed = saved_rules
+                restored = await run.load_scope("rules")
+                if restored is not None:
+                    restore_ledger(rules_search.execute, restored.get("ledger"))
+            else:
+                rules_text = await _chat_with_tools_resume(
+                    llm,
+                    _RULES_SYSTEM,
+                    "需求：" + requirement + "\n功能点：\n"
+                    + "\n".join(f"- {item.id}: {item.text}" for item in features)
+                    + "\n页面与链路骨架：\n"
+                    + skeleton_json
+                    + "\n请按需检索链路、界面文本或事件事实，再输出规则 JSON。",
+                    tools=[EVIDENCE_TOOL], executor=rules_search.execute,
+                    run=run, scope="rules",
+                    resume_attempts=resume_attempts,
+                    max_model_requests=max_model_requests,
+                    max_tool_calls=max_tool_calls,
+                )
+                rules_parsed = parse_json(rules_text)
+                if run is not None and rules_parsed is not None:
+                    await run.mark_parsed("rules", rules_parsed)
             rules_warning = None
+            log_event(
+                logger,
+                logging.INFO,
+                "infer_section_done",
+                section="rules",
+                parsed=rules_parsed is not None,
+                elapsed_ms=elapsed_ms(rules_started),
+            )
         except LLMCallError as error:
             rules_parsed = None
             rules_warning = RequirementWarning(
                 code=getattr(error, "code", "llm_unavailable"),
                 severity=Severity.warning,
                 message="业务规则按需证据检索失败或预算耗尽，规则章节已留空。",
+            )
+            log_event(
+                logger,
+                logging.WARNING,
+                "infer_section_failed",
+                section="rules",
+                code=rules_warning.code,
             )
         for context in contexts:
             context.ledger = rules_ledger
@@ -429,22 +552,53 @@ async def infer_sections(
             {context.material.page.pageId for context in contexts},
         )
         try:
-            mappings_text = await llm.chat_with_tools(
-                _MAPPING_SYSTEM,
-                "需求：" + requirement + "\n页面、表单与接口范围：\n"
-                + skeleton_json
-                + "\n仅为 fieldMappings 引用 forms 与 apiFacts；"
-                "请先检索 category=form 与 category=apiFact 所需事实，再输出映射 JSON。",
-                tools=[EVIDENCE_TOOL], executor=mapping_search.execute,
-            )
-            mappings_parsed = parse_json(mappings_text)
+            mappings_started = time.perf_counter()
+            log_event(logger, logging.INFO, "infer_section_start", section="field_mappings")
+            saved_mappings = await run.load_parsed("field_mappings") if run is not None else None
+            if saved_mappings is not None:
+                mappings_parsed = saved_mappings
+                restored = await run.load_scope("field_mappings")
+                if restored is not None:
+                    restore_ledger(mapping_search.execute, restored.get("ledger"))
+            else:
+                mappings_text = await _chat_with_tools_resume(
+                    llm,
+                    _MAPPING_SYSTEM,
+                    "需求：" + requirement + "\n页面、表单与接口范围：\n"
+                    + skeleton_json
+                    + "\n仅为 fieldMappings 引用 forms 与 apiFacts；"
+                    "请先检索 category=form 与 category=apiFact 所需事实，再输出映射 JSON。",
+                    tools=[EVIDENCE_TOOL], executor=mapping_search.execute,
+                    run=run, scope="field_mappings",
+                    resume_attempts=resume_attempts,
+                    max_model_requests=max_model_requests,
+                    max_tool_calls=max_tool_calls,
+                )
+                mappings_parsed = parse_json(mappings_text)
+                if run is not None and mappings_parsed is not None:
+                    await run.mark_parsed("field_mappings", mappings_parsed)
             mappings_warning = None
+            log_event(
+                logger,
+                logging.INFO,
+                "infer_section_done",
+                section="field_mappings",
+                parsed=mappings_parsed is not None,
+                elapsed_ms=elapsed_ms(mappings_started),
+            )
         except LLMCallError as error:
             mappings_parsed = None
             mappings_warning = RequirementWarning(
                 code=getattr(error, "code", "llm_unavailable"),
                 severity=Severity.warning,
                 message="字段映射按需证据检索失败或预算耗尽，字段映射章节已留空。",
+            )
+            log_event(
+                logger,
+                logging.WARNING,
+                "infer_section_failed",
+                section="field_mappings",
+                code=mappings_warning.code,
             )
         for context in contexts:
             context.ledger = mappings_ledger

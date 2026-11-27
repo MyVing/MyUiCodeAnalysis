@@ -220,6 +220,49 @@ def test_specdoc_factory_is_independent_and_honors_readiness() -> None:
     assert build_specdoc_llm_client(Settings(_env_file=None, llm_enabled=False)) is None
 
 
+async def test_request_logs_do_not_leak_credentials_or_content(
+    monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+) -> None:
+    caplog.set_level("DEBUG")
+    secret_key = "super-secret-key"
+    secret_prompt = "私有提示词正文"
+    client = OpenAICompatibleToolLLM(
+        Settings(
+            _env_file=None,
+            llm_enabled=True,
+            llm_api_key=secret_key,
+            llm_base_url="http://internal.example/v1",
+            llm_model="trace-model",
+        )
+    )
+    captured: dict[str, object] = {}
+
+    class HTTP:
+        async def post(self, url, *, headers, json):
+            captured["url"] = url
+            captured["headers"] = headers
+            captured["json"] = json
+            return httpx.Response(
+                200,
+                json={
+                    "choices": [{"message": {"content": "模型输出正文"}}],
+                    "usage": {"total_tokens": 42},
+                },
+            )
+
+    monkeypatch.setattr(client, "_http", lambda: HTTP())
+    await client.chat_messages("system", [{"role": "user", "content": secret_prompt}])
+
+    assert captured["url"] == "http://internal.example/v1/chat/completions"
+    assert captured["headers"] == {"Authorization": f"Bearer {secret_key}"}
+    assert "event=llm_request" in caplog.text
+    assert "event=llm_response" in caplog.text
+    assert "model=" in caplog.text and "trace-model" in caplog.text
+    assert "total_tokens=42" in caplog.text
+    for leaked in (secret_key, "Bearer", "internal.example", secret_prompt, "模型输出正文"):
+        assert leaked not in caplog.text
+
+
 async def test_tool_loop_retries_retryable_request_errors(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:

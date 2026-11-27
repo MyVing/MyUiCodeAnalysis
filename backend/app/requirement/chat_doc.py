@@ -14,6 +14,7 @@
 
 from __future__ import annotations
 
+import logging
 from dataclasses import dataclass
 from datetime import UTC, datetime
 
@@ -29,6 +30,7 @@ from app.contracts.requirement import (
     SubgraphCounts,
 )
 from app.core.config import Settings
+from app.core.tracing import log_event
 from app.requirement.features import decompose
 from app.requirement.judge import parse_json
 from app.requirement.llm import LLMClient
@@ -40,9 +42,11 @@ from app.requirement.recall import (
     route_target_pages,
 )
 from app.schemas import Project, SpecDocTask
+from app.specdoc.checkpoint import ChatDocRun, make_job
 from app.specdoc.llm import OpenAICompatibleToolLLM
 from app.specdoc.orchestrator import SpecDocOrchestrator
 from app.specdoc.render import render_markdown
+from app.storage.chatdoc_checkpoint import ChatDocCheckpointRepository
 
 INTENT_SYSTEM_PROMPT = """你是前端需求助手的意图判定器。根据对话历史与最新用户消息，\
 判断用户是想查看某个功能的前端交互文档、分析项目里实际的业务逻辑，还是继续澄清需求。
@@ -61,6 +65,8 @@ INTENT_SYSTEM_PROMPT = """你是前端需求助手的意图判定器。根据对
 
 _INTENT_TEMPERATURE = 0.2
 
+logger = logging.getLogger(__name__)
+
 _NO_MATCH_REPLY = (
     "在项目代码里没有定位到与这个描述相关的页面。可以换一种说法："
     "带上页面名称、界面文案或接口地址（如 GET /api/xxx）会更容易命中；"
@@ -74,11 +80,17 @@ _NO_ROUTE_REPLY = (
 
 @dataclass(frozen=True)
 class ChatDocOutcome:
-    """一次「查文档」对话的产物：导语 + markdown 文档 + 命中页面名。"""
+    """一次「查文档」对话的产物：导语 + markdown 文档 + 命中页面名。
+
+    `job_id` / `resumed_sections` 只用于日志排查：暴露 checkpoint 身份与本次
+    从断点恢复的章节，不进入 HTTP 契约。
+    """
 
     reply: str
     doc_markdown: str | None = None
     page_name: str | None = None
+    job_id: str | None = None
+    resumed_sections: tuple[str, ...] = ()
 
 
 @dataclass(frozen=True)
@@ -100,12 +112,20 @@ async def decide_intent(llm: LLMClient, messages: list[dict[str, str]]) -> _Inte
         return _Intent(intent="clarify", feature_text=None)
     intent = parsed.get("intent")
     feature_text = parsed.get("featureText")
-    return _Intent(
+    result = _Intent(
         intent=intent if intent in {"doc_query", "business_analysis"} else "clarify",
         feature_text=(
             feature_text.strip() if isinstance(feature_text, str) and feature_text.strip() else None
         ),
     )
+    log_event(
+        logger,
+        logging.DEBUG,
+        "intent_parse",
+        intent=result.intent,
+        has_feature=result.feature_text is not None,
+    )
+    return result
 
 
 def locate_route_feature(graph: IRGraph, route_path: str) -> CandidateDetail | None:
@@ -120,6 +140,7 @@ def locate_route_feature(graph: IRGraph, route_path: str) -> CandidateDetail | N
         if node.kind is NodeKind.route and _normalize_route(node.name) == route
     ]
     if not route_nodes:
+        log_event(logger, logging.DEBUG, "route_lookup", route_path=route, matched=False)
         return None
     targets = route_target_pages(graph, nodes)
     page_ids_for_route = [page_id for node in route_nodes for page_id in targets.get(node.id, [])]
@@ -127,10 +148,35 @@ def locate_route_feature(graph: IRGraph, route_path: str) -> CandidateDetail | N
         dict.fromkeys(page_id for page_id in page_ids_for_route if page_id in page_ids)
     )
     if not page_ids_for_route:
+        log_event(
+            logger,
+            logging.DEBUG,
+            "route_lookup",
+            route_path=route,
+            matched=False,
+            reason="route_has_no_page",
+        )
         return None
     page = nodes.get(page_ids_for_route[0])
     if page is None:
+        log_event(
+            logger,
+            logging.DEBUG,
+            "route_lookup",
+            route_path=route,
+            matched=False,
+            reason="page_missing",
+        )
         return None
+    log_event(
+        logger,
+        logging.DEBUG,
+        "route_lookup",
+        route_path=route,
+        matched=True,
+        page_id=page.id,
+        candidate_pages=len(page_ids_for_route),
+    )
     evidence = collect_page_evidences(graph, [page], set()).get(page.id, [])
     route_node = route_nodes[0]
     candidate = Candidate(
@@ -189,6 +235,7 @@ async def build_chat_doc(
     specdoc_llm: OpenAICompatibleToolLLM | None = None,
     route_path: str | None = None,
     fallback_text: str | None = None,
+    checkpoints: ChatDocCheckpointRepository | None = None,
 ) -> ChatDocOutcome:
     """定位 + 装配 + 渲染。路由直达优先，旧流程支持原文回退。"""
     best = (
@@ -199,13 +246,50 @@ async def build_chat_doc(
     if best is None and fallback_text and not route_path:
         best = locate_feature(graph, fallback_text)
     if best is None:
+        log_event(
+            logger,
+            logging.INFO,
+            "page_lookup_done",
+            route_path=route_path,
+            matched=False,
+            fallback_used=bool(fallback_text and not route_path),
+        )
         if route_path:
             return ChatDocOutcome(reply=_NO_ROUTE_REPLY.format(route=_normalize_route(route_path)))
         return ChatDocOutcome(reply=_NO_MATCH_REPLY)
 
+    log_event(
+        logger,
+        logging.INFO,
+        "page_lookup_done",
+        route_path=route_path,
+        matched=True,
+        page_id=best.candidate.nodeId,
+        route_id=best.candidate.routeId,
+        score=round(best.candidate.score, 3),
+        evidence_count=len(best.evidence),
+    )
     requirement_map = _synthetic_requirement_map(project, best, feature_text, graph)
+    if checkpoints is not None:
+        job_id, job_result = make_job(
+            checkpoints,
+            project_id=project.id,
+            analysis_id=graph.analysisId,
+            feature_text=feature_text,
+            route_path=route_path,
+            ttl_minutes=settings.chatdoc_checkpoint_ttl_minutes,
+        )
+        job = await job_result
+        # 稳定 requirement/task id 保证同一请求重跑可复用章节结果；job key
+        # 包含输入与图版本，不会在输入或分析版本变化时串用旧 checkpoint。
+        requirement_map = requirement_map.model_copy(update={"requirementId": job.job_id})
+        task_id = job.job_id
+        run = ChatDocRun(checkpoints, job.job_id)
+    else:
+        task_id = f"chat-{requirement_map.requirementId}"
+        run = None
     task = SpecDocTask(
-        id=f"chat-{requirement_map.requirementId}",
+        id=task_id,
         project_id=project.id,
         requirement_id=requirement_map.requirementId,
         status="running",
@@ -213,7 +297,30 @@ async def build_chat_doc(
         created_at=datetime.now(UTC),
     )
     orchestrator = SpecDocOrchestrator(settings, specdoc_llm or llm)
-    doc = await orchestrator.run(project, task, requirement_map, graph)
+    try:
+        doc = await orchestrator.run(project, task, requirement_map, graph, run=run)
+    except Exception as error:
+        if run is not None:
+            log_event(
+                logger,
+                logging.WARNING,
+                "chat_doc_checkpoint_failed",
+                job_id=run.job_id,
+                resumed_sections=sorted(run.resumed_scopes),
+                error=type(error).__name__,
+            )
+            await run.finish("failed")
+        raise
+    if run is not None:
+        await run.finish("succeeded")
+        # checkpoint 身份与本次复用到的章节：排查「为什么这一章没调模型」时先看这行
+        log_event(
+            logger,
+            logging.INFO,
+            "chat_doc_checkpoint_done",
+            job_id=run.job_id,
+            resumed_sections=sorted(run.resumed_scopes),
+        )
     markdown = render_markdown(doc)
     page = best.candidate.name or best.candidate.nodeId
     return ChatDocOutcome(
@@ -223,6 +330,8 @@ async def build_chat_doc(
         ),
         doc_markdown=markdown,
         page_name=page,
+        job_id=task_id if run is not None else None,
+        resumed_sections=tuple(sorted(run.resumed_scopes)) if run is not None else (),
     )
 
 

@@ -9,6 +9,7 @@ from fastapi.middleware.cors import CORSMiddleware
 
 from app.api.v1.router import api_router
 from app.core.config import Settings, get_settings
+from app.core.tracing import RequirementChatTracingMiddleware
 from app.storage.factory import dispose_storage, init_storage
 
 
@@ -31,6 +32,7 @@ def create_app(settings: Settings | None = None) -> FastAPI:
         openapi_url=f"{settings.api_prefix}/openapi.json",
         lifespan=lifespan,
     )
+    app.add_middleware(RequirementChatTracingMiddleware, api_prefix=settings.api_prefix)
     app.add_middleware(
         CORSMiddleware,
         allow_origins=settings.cors_origins,
